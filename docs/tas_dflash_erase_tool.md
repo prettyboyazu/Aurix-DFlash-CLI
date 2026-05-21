@@ -173,26 +173,212 @@ The tool performs the following 8 steps for each erase operation:
 7. **Check error flags** - Reads `DMU_HF_STATUS` for PVER (bit 6), EVER (bit 7), PROER (bit 10), SEQER (bit 12)
 8. **Reset to read mode** - Writes `0xF0` to `0xAF005554`
 
-## Building
+## Build Environment Setup
 
-The tool is built as part of the TAS Client API project:
+### System Requirements
+
+| Component | Minimum Version | Notes |
+|-----------|----------------|-------|
+| C++ Compiler | C++17 support | MSVC 2019+, GCC 9+, MinGW GCC 9+ |
+| CMake | 3.23+ | 3.25+ recommended |
+| Python | 3.11+ | For Conan 2 package manager |
+| Conan | 2.x | C/C++ dependency manager |
+
+### Windows (MSVC / Visual Studio)
+
+1. Install [Visual Studio 2019 or later](https://visualstudio.microsoft.com/) with the "Desktop development with C++" workload
+2. Install [Python 3.11+](https://www.python.org/downloads/)
+3. Install [CMake 3.25+](https://cmake.org/download/) (or use the one bundled with Visual Studio)
+
+```powershell
+# Install Conan
+python -m pip install conan
+
+# Generate default Conan profile (auto-detects MSVC)
+conan profile detect
+```
+
+Edit the Conan profile at `%USERPROFILE%\.conan2\profiles\default` and ensure C++17 is set:
+```ini
+compiler.cppstd=17
+```
+
+### Windows (MinGW GCC)
+
+1. Install [MSYS2](https://www.msys2.org/) to `C:\msys64`
+2. Install the MinGW64 toolchain from an MSYS2 terminal:
 
 ```bash
-# Install dependencies
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-make
+```
+
+3. Install Python and Conan from a regular Windows terminal:
+
+```powershell
+python -m pip install conan
+```
+
+4. Generate and edit the Conan profile:
+
+```powershell
+conan profile detect
+```
+
+Edit `%USERPROFILE%\.conan2\profiles\default` to match MinGW:
+```ini
+[settings]
+arch=x86_64
+build_type=Release
+compiler=gcc
+compiler.version=15
+compiler.libcxx=libstdc++11
+compiler.cppstd=17
+os=Windows
+[conf]
+tools.cmake.cmaketoolchain:generator=MinGW Makefiles
+```
+
+> Set `compiler.version` to match your GCC version (`gcc --version`).
+
+### Linux (GCC)
+
+Install build tools:
+```bash
+# Debian/Ubuntu
+sudo apt install build-essential cmake python3 python3-pip
+
+# Fedora
+sudo dnf install gcc gcc-c++ cmake python3 python3-pip
+```
+
+Install Conan and generate profile:
+```bash
+python3 -m pip install conan
+conan profile detect
+```
+
+Edit `~/.conan2/profiles/default`:
+```ini
+compiler.cppstd=17
+```
+
+## Building
+
+All commands must be run from the **root of the repository**.
+
+### Method 1: Manual Step-by-Step
+
+#### Step 1: Install Dependencies (Conan)
+
+```bash
+# Release build
 conan install .
 
-# Configure and build
+# Debug build (optional)
+conan install . -s build_type=Debug --build=missing
+
+# With optional components
+conan install . -o "&:python=True" -o "&:docs=True" -o "&:tests=True"
+```
+
+Conan downloads all build dependencies and generates CMake toolchain files under `build/`.
+
+#### Step 2: Configure CMake
+
+**Windows (MSVC)**
+```powershell
 cmake --preset conan-default
+```
+
+**Windows (MinGW)**
+```powershell
+set PATH=C:\msys64\mingw64\bin;%PATH%
+cmake --preset conan-release
+```
+
+**Linux**
+```bash
+cmake --preset conan-release
+# or for debug:
+cmake --preset conan-debug
+```
+
+#### Step 3: Build
+
+**Windows (MSVC)**
+```powershell
 cmake --build --preset conan-release
 ```
 
-The executable is located at:
+**Windows (MinGW)**
+```powershell
+set PATH=C:\msys64\mingw64\bin;%PATH%
+cmake --build --preset conan-release
+```
+
+**Linux**
+```bash
+cmake --build --preset conan-release
+```
+
+### Method 2: Build Script
+
+```powershell
+# Windows
+python tools\build.py
+
+# Linux
+python3 tools/build.py
+```
+
+Options:
+```
+-c release|debug|all    Build configuration (default: release)
+-p, --python            Build Python wrapper
+-d, --docs              Build API documentation
+-t, --tests             Build test executables
+```
+
+### Build Output
+
+The compiled executable is located at:
+
 ```
 build/Release/apps/tas_dflash_erase/tas_dflash_erase.exe   (Windows)
 build/Release/apps/tas_dflash_erase/tas_dflash_erase       (Linux)
 ```
 
-The Windows build uses static linking (`-static -static-libgcc -static-libstdc++`) to eliminate runtime DLL dependencies.
+Other build artifacts:
+```
+build/Release/apps/tas_rw_api_demo/tas_rw_api_demo.exe     # RW API demo
+build/Release/apps/tas_chl_api_demo/tas_chl_api_demo.exe   # Channel API demo
+build/Release/src/tas_client/libtas_client.a                # Static library
+build/Release/src/tas_socket/libtas_socket.a                # Socket library
+```
+
+### Static Linking (Windows MinGW)
+
+The tool uses static linking to eliminate DLL dependencies, so the `.exe` can run standalone on any Windows machine without requiring MinGW runtime DLLs (`libwinpthread-1.dll`, `libgcc_s_seh-1.dll`, `libstdc++-6.dll`).
+
+This is configured in `apps/tas_dflash_erase/CMakeLists.txt`:
+```cmake
+if (MINGW)
+    target_link_options(${EXE_NAME} PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+```
+
+### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `conan: command not found` | Run `python -m pip install conan` and restart terminal |
+| `CMake Error: No CMAKE_CXX_COMPILER` | Ensure compiler is installed and in PATH. For MinGW: add `C:\msys64\mingw64\bin` to PATH |
+| `mingw32-make: not found` | Install `mingw-w64-x86_64-make` via `pacman -S mingw-w64-x86_64-make` |
+| `libwinpthread-1.dll not found` at runtime | Build with MinGW (static linking) or copy DLLs to exe folder |
+| `compiler.version` Conan error | Edit `~/.conan2/profiles/default` and add `compiler.version=<your_gcc_version>` |
+| `compiler.libcxx` Conan error | Add `compiler.libcxx=libstdc++11` to Conan profile |
+| `pacman db.lck` error in MSYS2 | Delete `/var/lib/pacman/db.lck` and retry |
+| Conan preset not found | Run `conan install .` first to generate presets |
 
 ## Notes
 
