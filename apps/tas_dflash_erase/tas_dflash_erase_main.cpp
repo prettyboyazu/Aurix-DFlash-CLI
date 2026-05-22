@@ -22,6 +22,9 @@
 //  Subcommands: erase, read, list
 //********************************************************************************************************************
 
+// Prevent Windows min/max macros from interfering with std::min/std::max
+#define NOMINMAX
+
 #include "tas_client_rw.h"
 #include "tas_utils.h"
 #include "tas_device_family.h"
@@ -84,14 +87,6 @@ static bool getDFlashConfig(uint32_t deviceType, DFlashConfig& cfg)
 //  AURIX Register Addresses and Constants
 //********************************************************************************************************************
 
-// SCU_WDTS_CON0: [31:16]=REL, [15:2]=PW, [1]=LCK, [0]=ENDINIT
-static constexpr uint64_t SCU_WDTS_CON0_ADDR    = 0xF00362A8ULL;
-static constexpr uint32_t CON0_ENDINIT_BIT       = (1u << 0);
-static constexpr uint32_t CON0_LCK_BIT           = (1u << 1);
-static constexpr uint32_t CON0_PW_SHIFT          = 2;
-static constexpr uint32_t CON0_PW_MASK           = 0x3FFFu;
-static constexpr uint32_t CON0_REL_SHIFT         = 16;
-static constexpr uint32_t CON0_PW_INVERT_MASK    = 0x003Fu;
 
 // TC3x: DMU_HF_STATUS (busy flags) at 0xF8040010
 static constexpr uint64_t DMU_HF_STATUS_ADDR     = 0xF8040010ULL;
@@ -148,64 +143,33 @@ static tas_return_et writeReg32(CTasClientRw& client, uint64_t addr, uint32_t va
 }
 
 //********************************************************************************************************************
-//  Safety Watchdog Password
+//  Session start with auto-reconnect to existing session
 //********************************************************************************************************************
 
-static bool getSafetyWatchdogPassword(CTasClientRw& client, uint16_t& password, uint16_t& relValue)
+static tas_return_et startSession(CTasClientRw& client, const char* targetId, const char* defaultSessionName)
 {
-    uint32_t con0;
-    if (readReg32(client, SCU_WDTS_CON0_ADDR, con0) != TAS_ERR_NONE) return false;
-    uint16_t pwField = static_cast<uint16_t>((con0 >> CON0_PW_SHIFT) & CON0_PW_MASK);
-    password = pwField ^ CON0_PW_INVERT_MASK;
-    relValue = static_cast<uint16_t>((con0 >> CON0_REL_SHIFT) & 0xFFFFu);
-    return true;
-}
+    std::string sessionName = std::string(defaultSessionName) + "_" + std::to_string(GetCurrentProcessId());
 
-//********************************************************************************************************************
-//  Clear/Set Safety EndInit
-//********************************************************************************************************************
+    // Try with our own session name first
+    tas_return_et ret = client.session_start(targetId, sessionName.c_str());
+    if (ret == TAS_ERR_NONE) return TAS_ERR_NONE;
 
-static bool clearSafetyEndInit(CTasClientRw& client, uint16_t password, uint16_t relValue)
-{
-    uint32_t con0;
-    uint32_t unlockVal = CON0_ENDINIT_BIT
-                       | (static_cast<uint32_t>(password) << CON0_PW_SHIFT)
-                       | (static_cast<uint32_t>(relValue) << CON0_REL_SHIFT);
-    if (writeReg32(client, SCU_WDTS_CON0_ADDR, unlockVal) != TAS_ERR_NONE) return false;
-
-    uint32_t clearVal = CON0_LCK_BIT
-                      | (static_cast<uint32_t>(password) << CON0_PW_SHIFT)
-                      | (static_cast<uint32_t>(relValue) << CON0_REL_SHIFT);
-    if (writeReg32(client, SCU_WDTS_CON0_ADDR, clearVal) != TAS_ERR_NONE) return false;
-
-    for (int i = 0; i < 100; i++) {
-        if (readReg32(client, SCU_WDTS_CON0_ADDR, con0) != TAS_ERR_NONE) return false;
-        if (!(con0 & CON0_ENDINIT_BIT)) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Failed — check if an existing session is running and reconnect with its name
+    const char* existingSessionName = nullptr;
+    uint64_t sessionStartTime = 0;
+    const tas_target_client_info_st* clientInfo = nullptr;
+    uint32_t numClients = 0;
+    tas_return_et qr = client.get_target_clients(targetId, &existingSessionName, &sessionStartTime, &clientInfo, &numClients);
+    if (qr == TAS_ERR_NONE && existingSessionName && existingSessionName[0] != '\0') {
+        printf("  Reconnecting to existing session '%s'...\n", existingSessionName);
+        return client.session_start(targetId, existingSessionName);
     }
-    return false;
-}
 
-static bool setSafetyEndInit(CTasClientRw& client, uint16_t password, uint16_t relValue)
-{
-    uint32_t con0;
-    uint32_t unlockVal = CON0_ENDINIT_BIT
-                       | (static_cast<uint32_t>(password) << CON0_PW_SHIFT)
-                       | (static_cast<uint32_t>(relValue) << CON0_REL_SHIFT);
-    if (writeReg32(client, SCU_WDTS_CON0_ADDR, unlockVal) != TAS_ERR_NONE) return false;
+    // Last resort: try with empty session name (join any existing session)
+    ret = client.session_start(targetId, "");
+    if (ret == TAS_ERR_NONE) return TAS_ERR_NONE;
 
-    uint32_t setVal = CON0_ENDINIT_BIT
-                    | CON0_LCK_BIT
-                    | (static_cast<uint32_t>(password) << CON0_PW_SHIFT)
-                    | (static_cast<uint32_t>(relValue) << CON0_REL_SHIFT);
-    if (writeReg32(client, SCU_WDTS_CON0_ADDR, setVal) != TAS_ERR_NONE) return false;
-
-    for (int i = 0; i < 100; i++) {
-        if (readReg32(client, SCU_WDTS_CON0_ADDR, con0) != TAS_ERR_NONE) return false;
-        if (con0 & CON0_ENDINIT_BIT) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return false;
+    return ret;
 }
 
 //********************************************************************************************************************
@@ -226,10 +190,10 @@ static bool eraseMultipleSectors(CTasClientRw& client, uint32_t sectorAddr, uint
     uint32_t valCmd2  = FLASH_VAL_ERASE_CMD2;
 
     tas_rw_trans_st trans[4] = {
-        { FLASH_CMD_SECTOR_ADDR,  4, 0, TAS_AM0, TAS_RW_TT_WR, .wdata = &valAddr  },
-        { FLASH_CMD_SECTOR_COUNT, 4, 0, TAS_AM0, TAS_RW_TT_WR, .wdata = &valCount },
-        { FLASH_CMD_EXECUTE,      4, 0, TAS_AM0, TAS_RW_TT_WR, .wdata = &valCmd1  },
-        { FLASH_CMD_EXECUTE,      4, 0, TAS_AM0, TAS_RW_TT_WR, .wdata = &valCmd2  },
+        { FLASH_CMD_SECTOR_ADDR,  4, 0, TAS_AM0, TAS_RW_TT_WR, &valAddr  },
+        { FLASH_CMD_SECTOR_COUNT, 4, 0, TAS_AM0, TAS_RW_TT_WR, &valCount },
+        { FLASH_CMD_EXECUTE,      4, 0, TAS_AM0, TAS_RW_TT_WR, &valCmd1  },
+        { FLASH_CMD_EXECUTE,      4, 0, TAS_AM0, TAS_RW_TT_WR, &valCmd2  },
     };
 
     return client.execute_trans(trans, 4) == TAS_ERR_NONE;
@@ -462,7 +426,27 @@ static bool parseHexAddr(const char* s, uint32_t& val)
 struct CommonArgs {
     const char* serverIp = "localhost";
     const char* targetId = nullptr;
+    const char* deviceName = nullptr;
 };
+
+static bool parseDeviceName(const char* name, uint32_t& deviceType)
+{
+    struct DeviceEntry { const char* name; uint32_t type; };
+    static const DeviceEntry devices[] = {
+        {"TC23x", TAS_DT_TC23X}, {"TC26x", TAS_DT_TC26X}, {"TC27x", TAS_DT_TC27X},
+        {"TC33x", TAS_DT_TC33X}, {"TC35x", TAS_DT_TC35X}, {"TC36x", TAS_DT_TC36X},
+        {"TC37x", TAS_DT_TC37X}, {"TC38x", TAS_DT_TC38X}, {"TC39x", TAS_DT_TC39X},
+    };
+    for (const auto& d : devices) {
+        if (_stricmp(name, d.name) == 0) { deviceType = d.type; return true; }
+    }
+    return false;
+}
+
+static void printSupportedDevices()
+{
+    fprintf(stderr, "  Supported: TC23x, TC26x, TC27x, TC33x, TC35x, TC36x, TC37x, TC38x, TC39x\n");
+}
 
 // Returns: 1 = consumed 1 arg, 2 = consumed 2 args (option + value), 0 = not recognized
 static int parseCommonOption(int argc, char** argv, int idx, CommonArgs& args)
@@ -473,6 +457,10 @@ static int parseCommonOption(int argc, char** argv, int idx, CommonArgs& args)
     }
     if (strcmp(argv[idx], "--target") == 0 && idx + 1 < argc) {
         args.targetId = argv[idx + 1];
+        return 2;
+    }
+    if (strcmp(argv[idx], "--device") == 0 && idx + 1 < argc) {
+        args.deviceName = argv[idx + 1];
         return 2;
     }
     return 0;
@@ -489,7 +477,9 @@ static int doList(int argc, char** argv)
         int consumed = parseCommonOption(argc, argv, i, args);
         if (consumed > 0) { i += consumed; continue; }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: tas_dflash_erase list [--server <ip>]\n");
+            printf("Usage: tas_dflash_erase list [options]\n"
+                   "  --server <ip>       TAS server IP (default: localhost)\n"
+                   "  --target <id>       Target identifier\n");
             return 0;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
@@ -550,12 +540,19 @@ static int doRead(int argc, char** argv)
             outputFile = argv[++i]; i++; continue;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: tas_dflash_erase read --addr <hex> --length <hex> [options]\n"
+            printf("Usage: tas_dflash_erase read --addr <hex> --length <hex> [options]\n\n"
+                   "Options:\n"
                    "  --addr/-a <hex>     Start address (required)\n"
                    "  --length/-l <hex>   Length in bytes (required)\n"
                    "  --output/-o <file>  Output file (.bin or .hex, default: hex dump)\n"
                    "  --server <ip>       TAS server IP (default: localhost)\n"
-                   "  --target <id>       Target identifier\n");
+                   "  --target <id>       Target identifier\n"
+                   "  --device <name>     Override device type (skip auto-detect)\n\n"
+                   "Examples:\n"
+                   "  tas_dflash_erase read -a AF000000 -l 100\n"
+                   "  tas_dflash_erase read -a AF000000 -l 1000 -o dump.hex\n"
+                   "  tas_dflash_erase read -a AF000000 -l 400 --device TC27x\n\n"
+                   "Supported devices: TC23x, TC26x, TC27x, TC33x, TC35x, TC36x, TC37x, TC38x, TC39x\n");
             return 0;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
@@ -585,7 +582,7 @@ static int doRead(int argc, char** argv)
     if (!selectedTargetId) { fprintf(stderr, "ERROR: No targets\n"); return 4; }
     if (args.targetId == nullptr) printf("  Auto-selected target [0]\n");
 
-    ret = client.session_start(selectedTargetId, "DFlashReadSession");
+    ret = startSession(client, selectedTargetId, "DFlashRead");
     if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 5; }
 
     ret = client.device_connect(TAS_CLNT_DCO_RESET_AND_HALT);
@@ -593,8 +590,23 @@ static int doRead(int argc, char** argv)
 
     const tas_con_info_st* conInfo = client.get_con_info();
     DFlashConfig flashCfg;
-    if (!getDFlashConfig(conInfo->device_type, flashCfg)) {
-        fprintf(stderr, "ERROR: Unsupported device '%s'\n", tas_get_device_name_str(conInfo->device_type));
+    uint32_t effectiveDeviceType;
+
+    if (args.deviceName != nullptr) {
+        if (!parseDeviceName(args.deviceName, effectiveDeviceType)) {
+            fprintf(stderr, "ERROR: Unknown device '%s'\n", args.deviceName);
+            printSupportedDevices();
+            return 7;
+        }
+        printf("  Device (manual): %s\n", args.deviceName);
+    } else {
+        effectiveDeviceType = conInfo->device_type;
+    }
+
+    if (!getDFlashConfig(effectiveDeviceType, flashCfg)) {
+        fprintf(stderr, "ERROR: Unsupported device '%s'\n",
+               args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type));
+        printSupportedDevices();
         return 7;
     }
 
@@ -609,7 +621,7 @@ static int doRead(int argc, char** argv)
     }
 
     printf("  Device: %s (%s), DFlash: %u KB\n",
-           tas_get_device_name_str(conInfo->device_type), flashCfg.family, flashCfg.totalSize / 1024);
+           args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type), flashCfg.family, flashCfg.totalSize / 1024);
     printf("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
 
     // Read in sector-sized chunks
@@ -716,17 +728,25 @@ static int doErase(int argc, char** argv, bool legacyMode)
                 i++; continue;
             }
             if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-                printf("Usage: tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]\n"
+                printf("Usage: tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]\n\n"
+                       "Options:\n"
                        "  --addr <hex>       DFlash start address, auto-aligned to sector\n"
                        "  --sectors <n>      Number of sectors to erase\n"
-                       "  --all              Erase entire DFlash (requires confirmation)\n"
+                       "  --all              Erase entire DFlash\n"
                        "  --info             Show device info only, no erase\n"
                        "  --verify           Verify erase by reading back\n"
                        "  --backup <file>    Backup DFlash before erasing\n"
                        "  --reset            Reset MCU after erase\n"
                        "  --no-reset         Hot attach (no device reset)\n"
                        "  --server <ip>      TAS server IP (default: localhost)\n"
-                       "  --target <id>      Target identifier\n");
+                       "  --target <id>      Target identifier\n"
+                       "  --device <name>    Override device type (skip auto-detect)\n\n"
+                       "Examples:\n"
+                       "  tas_dflash_erase erase --addr AF000000 --sectors 1\n"
+                       "  tas_dflash_erase erase --addr AF000000 --sectors 4 --verify\n"
+                       "  tas_dflash_erase erase --all --backup backup.hex\n"
+                       "  tas_dflash_erase erase --info --device TC27x\n\n"
+                       "Supported devices: TC23x, TC26x, TC27x, TC33x, TC35x, TC36x, TC37x, TC38x, TC39x\n");
                 return 0;
             }
             fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
@@ -774,7 +794,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
     if (args.targetId == nullptr) printf("  Auto-selected target [0]\n");
 
     printf("\nStarting session...\n");
-    ret = client.session_start(selectedTargetId, "DFlashEraseSession");
+    ret = startSession(client, selectedTargetId, "DFlashErase");
     if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 5; }
 
     // ---- Connect to device ----
@@ -786,17 +806,31 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // ---- Detect MCU ----
     const tas_con_info_st* conInfo = client.get_con_info();
     DFlashConfig flashCfg;
-    if (!getDFlashConfig(conInfo->device_type, flashCfg)) {
-        fprintf(stderr, "ERROR: Unsupported device '%s'. Supported: TC23x, TC26x, TC27x, TC3x.\n",
-               tas_get_device_name_str(conInfo->device_type));
+    uint32_t effectiveDeviceType;
+
+    if (args.deviceName != nullptr) {
+        if (!parseDeviceName(args.deviceName, effectiveDeviceType)) {
+            fprintf(stderr, "ERROR: Unknown device '%s'\n", args.deviceName);
+            printSupportedDevices();
+            return 7;
+        }
+        printf("  Device (manual): %s\n", args.deviceName);
+    } else {
+        effectiveDeviceType = conInfo->device_type;
+    }
+
+    if (!getDFlashConfig(effectiveDeviceType, flashCfg)) {
+        fprintf(stderr, "ERROR: Unsupported device '%s'.\n",
+               args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type));
+        printSupportedDevices();
         return 7;
     }
 
-    const char* deviceName = tas_get_device_name_str(conInfo->device_type);
+    const char* displayName = args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type);
     uint32_t dflashEndAddr = DFLASH_START_ADDR + flashCfg.totalSize - 1;
     uint32_t totalSectors = flashCfg.totalSize / flashCfg.sectorSize;
 
-    printf("  Device: %s (%s)\n", deviceName, flashCfg.family);
+    printf("  Device: %s (%s)\n", displayName, flashCfg.family);
     printf("  DFlash: %u KB total, %u sectors, sector size %u KB\n",
            flashCfg.totalSize / 1024, totalSectors, flashCfg.sectorSize / 1024);
     printf("  Range:  0x%08X - 0x%08X\n", DFLASH_START_ADDR, dflashEndAddr);
@@ -811,17 +845,6 @@ static int doErase(int argc, char** argv, bool legacyMode)
     if (eraseAll) {
         sectorAddr = DFLASH_START_ADDR;
         numSectors = totalSectors;
-
-        printf("\n  *** WARNING: Will erase ENTIRE DFlash (%u KB, %u sectors) ***\n",
-               flashCfg.totalSize / 1024, numSectors);
-        printf("  Type 'yes' to confirm: ");
-        fflush(stdout);
-
-        char confirm[16] = {0};
-        if (fgets(confirm, sizeof(confirm), stdin) == nullptr || strncmp(confirm, "yes", 3) != 0) {
-            printf("  Aborted.\n");
-            return 0;
-        }
     }
 
     // ---- Auto-align address ----
@@ -854,56 +877,33 @@ static int doErase(int argc, char** argv, bool legacyMode)
     printf("  Address:  0x%08X\n", sectorAddr);
     printf("  Sectors:  %u (%u KB)\n\n", numSectors, numSectors * flashCfg.sectorSize / 1024);
 
-    // ---- Step 1: Read password ----
-    printf("Step 1/8: Reading Safety Watchdog password...     ");
-    uint16_t password, relValue;
-    if (!getSafetyWatchdogPassword(client, password, relValue)) { printf("FAILED\n"); return 9; }
-    printf("OK\n");
-
-    // ---- Step 2: Clear EndInit ----
-    printf("Step 2/8: Clearing Safety EndInit...              ");
-    if (!clearSafetyEndInit(client, password, relValue)) { printf("FAILED\n"); return 10; }
-    printf("OK\n");
-
-    // ---- Step 3: Clear status ----
-    printf("Step 3/8: Clearing flash status...                ");
+    // ---- Step 1: Clear status ----
+    printf("Step 1/5: Clearing flash status...                ");
     if (!clearFlashStatus(client)) {
-        printf("FAILED\n");
-        getSafetyWatchdogPassword(client, password, relValue);
-        setSafetyEndInit(client, password, relValue);
-        return 11;
+        printf("FAILED\n"); return 11;
     }
     printf("OK\n");
 
-    // ---- Step 4: Erase (atomic) ----
-    printf("Step 4/8: Executing erase command...              ");
+    // ---- Step 2: Erase (atomic) ----
+    printf("Step 2/5: Executing erase command...              ");
     if (!eraseMultipleSectors(client, sectorAddr, numSectors)) {
-        printf("FAILED\n");
-        getSafetyWatchdogPassword(client, password, relValue);
-        setSafetyEndInit(client, password, relValue);
-        return 12;
+        printf("FAILED\n"); return 12;
     }
     printf("OK\n");
 
-    // ---- Step 5: Restore EndInit ----
-    printf("Step 5/8: Restoring Safety EndInit...             ");
-    getSafetyWatchdogPassword(client, password, relValue);
-    if (!setSafetyEndInit(client, password, relValue)) { printf("FAILED\n"); return 13; }
-    printf("OK\n");
-
-    // ---- Step 6: Wait unbusy ----
-    printf("Step 6/8: Waiting for erase to complete...        ");
+    // ---- Step 3: Wait unbusy ----
+    printf("Step 3/5: Waiting for erase to complete...        ");
     uint32_t elapsedMs = 0;
     if (!waitUnbusyD0(client, flashCfg.isTc3x, elapsedMs)) { printf("TIMEOUT\n"); return 14; }
     printf("OK (%u ms)\n", elapsedMs);
 
-    // ---- Step 7: Check error flags ----
-    printf("Step 7/8: Checking error flags...                 ");
+    // ---- Step 4: Check error flags ----
+    printf("Step 4/5: Checking error flags...                 ");
     if (!checkEraseErrors(client, flashCfg.isTc3x)) { return 15; }
     printf("OK\n");
 
-    // ---- Step 8: Reset to read ----
-    printf("Step 8/8: Reset to read mode...                   ");
+    // ---- Step 5: Reset to read ----
+    printf("Step 5/5: Reset to read mode...                   ");
     if (!resetToRead(client)) { printf("FAILED\n"); return 16; }
     printf("OK\n");
 
@@ -937,18 +937,29 @@ static int doErase(int argc, char** argv, bool legacyMode)
 
 static void printUsage(const char* progName)
 {
+    // Show only filename, not full path
+    const char* base = strrchr(progName, '\\');
+    if (!base) base = strrchr(progName, '/');
+    if (!base) base = progName; else base++;
+
     printf("TAS DFlash Tool for AURIX TC23x/TC26x/TC27x/TC3x\n\n");
     printf("Usage:\n");
-    printf("  %s <subcommand> [options]\n\n", progName);
+    printf("  %s <subcommand> [options]\n\n", base);
     printf("Subcommands:\n");
     printf("  erase    Erase DFlash sectors\n");
     printf("  read     Read DFlash content\n");
     printf("  list     List connected TAS targets\n\n");
     printf("Legacy (backward compatible):\n");
-    printf("  %s <addr> <num_sectors> [options]\n", progName);
-    printf("  %s --all [options]\n", progName);
-    printf("  %s --info [options]\n\n", progName);
-    printf("Run '%s <subcommand> --help' for details.\n\n", progName);
+    printf("  %s <addr> <num_sectors> [options]\n", base);
+    printf("  %s --all [options]\n", base);
+    printf("  %s --info [options]\n\n", base);
+    printf("Run '%s <subcommand> --help' for details.\n\n", base);
+    printf("Examples:\n");
+    printf("  %s list\n", base);
+    printf("  %s erase --info\n", base);
+    printf("  %s erase --addr AF000000 --sectors 1\n", base);
+    printf("  %s erase --all --verify\n", base);
+    printf("  %s read -a AF000000 -l 1000 -o dump.hex\n\n", base);
     printf("Supported devices:\n");
     printf("  TC23x/TC26x:  sector=8KB, total=128KB | TC27x: sector=8KB, total=256KB\n");
     printf("  TC33x/TC35x/TC36x: 4KB/128KB | TC37x: 4KB/256KB | TC38x: 4KB/512KB | TC39x: 4KB/1MB\n");

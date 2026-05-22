@@ -22,6 +22,7 @@
 
 // Standard includes
 #include <string>
+#include <thread>
 
 CTasConnSocket::CTasConnSocket(int type, int protocol) : CTasSocket(type, protocol) {};
 
