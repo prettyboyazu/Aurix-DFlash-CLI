@@ -16,11 +16,17 @@
  See the License for the specific language governing permissions and
  limitations under the License.
  ****************************************************************************************************************-->
-# TAS DFlash Erase Tool {#tas_dflash_erase_tool}
+# TAS DFlash Tool {#tas_dflash_erase_tool}
 
 ## Overview
 
-`tas_dflash_erase` is a command-line tool that erases DFlash sectors on Infineon AURIX microcontrollers via the TAS Client API. It connects to a TAS server, detects the connected MCU, and performs the AURIX-compliant DFlash erase sequence including Safety EndInit control, flash command dispatch, busy polling, and error flag verification.
+`tas_dflash_erase` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports three subcommands:
+
+- **erase** - Erase DFlash sectors with AURIX-compliant sequence
+- **read** - Read DFlash content and output as hex dump, binary, or Intel HEX
+- **list** - List connected TAS targets and device info
+
+The tool connects to a TAS server, auto-detects the connected MCU, and performs device-specific register access (TC2x uses PMU `FLASH0_FSR`, TC3x uses DMU `DMU_HF_STATUS`/`DMU_HF_ERRSR`).
 
 ## Supported Devices
 
@@ -44,36 +50,137 @@ DFlash base address for all supported devices: `0xAF000000`. AURIX DFlash erased
 ## Usage
 
 ```
+tas_dflash_erase <subcommand> [options]
+```
+
+### Subcommands
+
+| Subcommand | Shortcut | Description |
+|------------|----------|-------------|
+| `erase` | `e` | Erase DFlash sectors |
+| `read` | `r` | Read DFlash content |
+| `list` | `l` | List connected TAS targets |
+
+### Legacy Mode (backward compatible)
+
+The tool supports the original positional-argument syntax, automatically routed to `erase`:
+
+```
 tas_dflash_erase <addr> <num_sectors> [options]
 tas_dflash_erase --all [options]
 tas_dflash_erase --info [options]
 ```
 
-### Arguments
+---
 
-| Argument | Description |
-|----------|-------------|
-| `addr` | DFlash start address in hex (e.g. `0xAF000000`). Auto-aligned to sector boundary. |
-| `num_sectors` | Number of sectors to erase (decimal). |
+## `erase` Subcommand
 
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `--info` | Show connected device info and DFlash parameters without performing erase. |
-| `--all` | Erase entire DFlash. Requires typing `yes` to confirm. |
+```
+tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]
+```
 
 ### Options
 
 | Option | Description |
 |--------|-------------|
+| `--addr <hex>` | DFlash start address (e.g. `0xAF000000`). Auto-aligned to sector boundary. |
+| `--sectors <n>` | Number of sectors to erase (decimal). |
+| `--all` | Erase entire DFlash. Requires typing `yes` to confirm. |
+| `--info` | Show device info and DFlash parameters without erasing. |
+| `--verify` | Read back all erased bytes and verify they are `0x00`. |
+| `--backup <file>` | Save DFlash content to a binary file before erasing. |
+| `--reset` | Reset MCU after successful erase (device resumes normal execution). |
+| `--no-reset` | Hot-attach to device without reset (default: reset and halt). |
 | `--server <ip>` | TAS server IP address. Default: `localhost` |
 | `--target <id>` | Target identifier string. Default: first available target |
-| `--verify` | Verify erase by reading back all erased bytes and checking they are `0x00` |
-| `--backup <file>` | Save DFlash content to a binary file before erasing |
-| `--no-reset` | Hot-attach to device without reset (default: reset and halt) |
 
-### Exit Codes
+### Examples
+
+Show device info:
+```
+tas_dflash_erase erase --info
+```
+
+Erase a single sector with verification:
+```
+tas_dflash_erase erase --addr 0xAF000000 --sectors 1 --verify
+```
+
+Erase entire DFlash with backup, verify, and MCU reset:
+```
+tas_dflash_erase erase --all --backup dump.bin --verify --reset
+```
+
+Legacy syntax (still supported):
+```
+tas_dflash_erase 0xAF000000 1 --verify
+tas_dflash_erase --all --verify
+```
+
+---
+
+## `read` Subcommand
+
+```
+tas_dflash_erase read --addr <hex> --length <hex> [--output <file>] [options]
+```
+
+### Options
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--addr <hex>` | `-a` | DFlash start address (required). |
+| `--length <hex>` | `-l` | Number of bytes to read (required). |
+| `--output <file>` | `-o` | Output file. Extension determines format: `.bin` = raw binary, `.hex` = Intel HEX. Default: xxd-style hex dump to terminal. |
+| `--server <ip>` | | TAS server IP address. Default: `localhost` |
+| `--target <id>` | | Target identifier string. Default: first available target |
+
+### Examples
+
+Hex dump to terminal:
+```
+tas_dflash_erase read --addr 0xAF000000 --length 0x1000
+```
+
+Save as raw binary:
+```
+tas_dflash_erase read --addr 0xAF000000 --length 0x20000 --output dump.bin
+```
+
+Save as Intel HEX:
+```
+tas_dflash_erase read --addr 0xAF000000 --length 0x20000 --output dump.hex
+```
+
+---
+
+## `list` Subcommand
+
+```
+tas_dflash_erase list [--server <ip>]
+```
+
+Lists all targets connected to the TAS server, showing device type and identifier string. Does not require session start or device connect.
+
+### Example
+
+```
+tas_dflash_erase list
+```
+
+Output:
+```
+TAS DFlash Tool - Device List
+=============================
+Connecting to TAS server at localhost...
+  Server: TasServer V2.0 (Aug  7 2025)
+  Targets (1):
+  [0] TC36x          Application Kit TC367 V2.0
+```
+
+---
+
+## Exit Codes
 
 | Code | Meaning |
 |------|---------|
@@ -92,69 +199,10 @@ tas_dflash_erase --info [options]
 | 12 | Erase command failed |
 | 13 | Restore Safety EndInit failed |
 | 14 | Erase timeout (device still busy) |
-| 15 | Error flags detected (PVER/EVER/PROER/SEQER) |
+| 15 | Error flags detected (PVER/EVER/PROER/SQER/OPER) |
 | 16 | Reset to read mode failed |
 | 17 | Verification failed (bytes not erased) |
-
-## Examples
-
-### Show device info
-```
-tas_dflash_erase --info
-```
-Output example:
-```
-TAS DFlash Erase Tool
-=====================
-
-Connecting to TAS server at localhost...
-  Server: TasServer V2.0 (Aug  7 2025)
-  Targets: 1
-  [0] TC36x (Application Kit TC367 V2.0)
-  Auto-selected target [0]
-
-Starting session...
-Connecting to device (reset and halt)...
-  Device: TC36x (TC3x)
-  DFlash: 128 KB total, 32 sectors, sector size 4 KB
-  Range:  0xAF000000 - 0xAF01FFFF
-
-Device info displayed. No erase performed.
-```
-
-### Erase a single sector with verification
-```
-tas_dflash_erase 0xAF000000 1 --verify
-```
-Erases one sector (4 KB on TC3x, 8 KB on TC2x) starting at `0xAF000000`, then reads back to confirm all bytes are `0x00`.
-
-### Erase with non-aligned address
-```
-tas_dflash_erase 0xAF000F10 1
-```
-The address `0xAF000F10` is automatically aligned down to `0xAF000000` (4 KB boundary on TC3x).
-
-### Erase multiple sectors with backup and verify
-```
-tas_dflash_erase 0xAF000000 4 --backup dump.bin --verify
-```
-Backs up 16 KB of DFlash data to `dump.bin`, then erases 4 sectors and verifies.
-
-### Erase entire DFlash
-```
-tas_dflash_erase --all --verify
-```
-Prompts for confirmation:
-```
-  *** WARNING: Will erase ENTIRE DFlash (128 KB, 32 sectors) ***
-  Type 'yes' to confirm: yes
-```
-Erases all DFlash sectors and verifies. Use `--backup` to save contents first.
-
-### Connect to remote TAS server
-```
-tas_dflash_erase 0xAF000000 1 --server 192.168.1.100
-```
+| 18 | Read failed (read subcommand) |
 
 ## Erase Sequence
 
@@ -163,15 +211,51 @@ The tool performs the following 8 steps for each erase operation:
 1. **Read Safety Watchdog password** - Reads `SCU_WDTS_CON0` (`0xF00362A8`) and extracts the 14-bit password
 2. **Clear Safety EndInit** - Unlocks and clears EndInit protection to allow flash modifications
 3. **Clear flash status** - Writes `0xFA` to flash status register (`0xAF005554`)
-4. **Execute erase command** - Sends 4-word erase sequence to flash command registers:
+4. **Execute erase command** - Sends 4-word erase sequence **atomically** via `execute_trans()`:
    - Write sector address to `0xAF00AA50`
    - Write sector count to `0xAF00AA58`
    - Write `0x80` to `0xAF00AAA8` (erase trigger)
    - Write `0x50` to `0xAF00AAA8` (confirm)
+   - All 4 writes are sent as a single atomic transaction to prevent CSI sequence interruption
 5. **Restore Safety EndInit** - Re-enables EndInit protection (always executed even if previous steps fail)
-6. **Wait for completion** - Polls `DMU_HF_STATUS` (`0xF8040010`) D0BUSY bit until clear (timeout: 10 s)
-7. **Check error flags** - Reads `DMU_HF_STATUS` for PVER (bit 6), EVER (bit 7), PROER (bit 10), SEQER (bit 12)
+6. **Wait for completion** - Polls busy bit until clear (timeout: 10 s):
+   - TC3x: `DMU_HF_STATUS` (`0xF8040010`) bit D0 (D0BUSY)
+   - TC2x: `FLASH0_FSR` (`0xF8002010`) bit D1 (D0BUSY)
+7. **Check error flags** - Reads device-specific error register:
+   - TC3x: `DMU_HF_ERRSR` (`0xF8040034`) — OPER(D0), SQER(D1), PROER(D2), PVER(D3), EVER(D4)
+   - TC2x: `FLASH0_FSR` (`0xF8002010`) — OPER(D11), SQER(D12), PROER(D13), PVER(D25), EVER(D26)
 8. **Reset to read mode** - Writes `0xF0` to `0xAF005554`
+
+## Register Architecture
+
+### TC3x (DMU Module)
+
+TC3x devices use separate DMU registers for status and error:
+
+| Register | Address | Purpose |
+|----------|---------|---------|
+| `DMU_HF_STATUS` | `0xF8040010` | Busy flags: D0BUSY(D0), D1BUSY(D1) |
+| `DMU_HF_ERRSR` | `0xF8040034` | Error flags: OPER(D0), SQER(D1), PROER(D2), PVER(D3), EVER(D4) |
+| `DMU_HF_CLRE` | `0xF8040038` | Clear error bits by writing 1 |
+
+### TC2x (PMU Module)
+
+TC2x devices use a single `FLASH0_FSR` register for both status and errors:
+
+| Register | Address | Purpose |
+|----------|---------|---------|
+| `FLASH0_FSR` | `0xF8002010` | Combined status + error: D0BUSY(D1), OPER(D11), SQER(D12), PROER(D13), PVER(D25), EVER(D26) |
+
+Error bits are `rwh` type (read/write, cleared by hardware on write of 1).
+
+## ECC Error Tolerance
+
+After erasing DFlash, the ECC (Error Correction Code) state becomes invalid because erased data no longer matches stored ECC checksums. Reading such sectors may return `TAS_ERR_RW_READ` (0x0600) from the TAS Client, but the read data is still valid.
+
+The tool treats `TAS_ERR_RW_READ` as a successful read in the following operations:
+- **Verify erase** (`--verify`) - ECC errors are expected; erased data is still checked as `0x00`
+- **Backup** (`--backup <file>`) - ECC errors are tolerated; data is saved to file
+- **Read subcommand** - ECC errors are tolerated for post-erase DFlash reads
 
 ## Build Environment Setup
 
@@ -382,8 +466,12 @@ endif()
 
 ## Notes
 
-- The tool auto-detects the connected MCU type and configures sector size and DFlash range accordingly
+- The tool auto-detects the connected MCU type and configures sector size, DFlash range, and register addresses accordingly
+- TC2x and TC3x have different Flash controller architectures: TC2x uses PMU with `FLASH0_FSR`, TC3x uses DMU with separate `DMU_HF_STATUS` and `DMU_HF_ERRSR` registers
 - Address alignment is performed automatically (4 KB for TC3x, 8 KB for TC2x)
-- Safety EndInit is always restored (Step 5) even if the erase operation fails, using a goto-cleanup pattern
+- The erase command is sent as an atomic 4-write transaction via `execute_trans()` to ensure CSI sequence integrity
+- Safety EndInit is always restored (Step 5) even if the erase operation fails
 - The Safety Watchdog password is re-read before each EndInit operation (hardware may auto-increment)
-- Verification reads DFlash in sector-sized chunks to handle large DFlash sizes
+- `--reset` option calls `device_connect(TAS_CLNT_DCO_RESET)` to resume normal MCU execution after erase
+- `--no-reset` option uses `TAS_CLNT_DCO_HOT_ATTACH` to connect without resetting the MCU
+- ECC errors (`TAS_ERR_RW_READ = 0x0600`) after erase are expected and tolerated during verification and read operations
