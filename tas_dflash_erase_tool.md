@@ -30,16 +30,27 @@ The tool connects to a TAS server, auto-detects the connected MCU, and performs 
 
 ## Supported Devices
 
+The tool supports **all TC2x/TC3x AURIX devices whose configuration files are present in the `DeviceConfigs/` directory**. Device parameters (DFlash base address, total size, sector size) are loaded from the JSON configuration files at runtime — no device-specific values are hard-coded.
+
+Currently shipped device configurations:
+
+`TC21x`, `TC22x`, `TC23x`, `TC26x`, `TC27x`, `TC29x`, `TC33x`, `TC35x`, `TC36x`, `TC37x`, `TC38x`, `TC39x`, `TC3Ex`
+
+Typical DFlash parameters (loaded from JSON, sample values):
+
 | Device | DFlash Sector Size | DFlash Total Size |
 |--------|--------------------|-------------------|
-| TC23x, TC26x | 8 KB | 128 KB |
-| TC27x | 8 KB | 256 KB |
-| TC33x, TC33xE, TC35x, TC36x | 4 KB | 128 KB |
-| TC37x, TC37xE | 4 KB | 256 KB |
+| TC21x, TC22x, TC23x, TC26x | 8 KB | 128 KB |
+| TC27x | 8 KB | 384 KB |
+| TC29x | 8 KB | 512 KB |
+| TC33x, TC35x, TC36x | 4 KB | 128 KB |
+| TC37x, TC3Ex | 4 KB | 256 KB |
 | TC38x | 4 KB | 512 KB |
 | TC39x | 4 KB | 1 MB |
 
-DFlash base address for all supported devices: `0xAF000000`. AURIX DFlash erased state is `0x00` (all bits zero).
+DFlash base address for TC2x/TC3x is `0xAF000000` (also loaded from the JSON files). AURIX DFlash erased state is `0x00` (all bits zero).
+
+To add support for an additional device, drop the corresponding `<Device>_<step>.json` file into the `DeviceConfigs/` directory — no source-code change or rebuild is required.
 
 ## Prerequisites
 
@@ -93,6 +104,7 @@ tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]
 | `--no-reset` | Hot-attach to device without reset (default: reset and halt). |
 | `--server <ip>` | TAS server IP address. Default: `localhost` |
 | `--target <id>` | Target identifier string. Default: first available target |
+| `--config-dir <path>` | Path to the `DeviceConfigs/` directory containing device JSON files. Overrides the default search paths (see [DeviceConfigs Configuration](#deviceconfigs-configuration)). |
 
 ### Examples
 
@@ -134,6 +146,7 @@ tas_dflash_erase read --addr <hex> --length <hex> [--output <file>] [options]
 | `--output <file>` | `-o` | Output file. Extension determines format: `.bin` = raw binary, `.hex` = Intel HEX. Default: xxd-style hex dump to terminal. |
 | `--server <ip>` | | TAS server IP address. Default: `localhost` |
 | `--target <id>` | | Target identifier string. Default: first available target |
+| `--config-dir <path>` | | Path to the `DeviceConfigs/` directory. See [DeviceConfigs Configuration](#deviceconfigs-configuration). |
 
 ### Examples
 
@@ -177,6 +190,37 @@ Connecting to TAS server at localhost...
   Targets (1):
   [0] TC36x          Application Kit TC367 V2.0
 ```
+
+---
+
+## DeviceConfigs Configuration
+
+The tool no longer hard-codes any device-specific memory parameters. On startup it automatically loads the device descriptions (DFlash base address, total size, sector size, etc.) from a directory of JSON files called `DeviceConfigs/`.
+
+### Search-path priority
+
+The `DeviceConfigs/` directory is resolved at runtime by trying the following locations **in order**, and the first hit wins:
+
+1. The path provided via the `--config-dir <path>` command-line option (highest priority).
+2. A `DeviceConfigs/` directory located **next to the executable** (typical install/deploy layout).
+3. `data/DeviceConfigs/` relative to the repository root (typical development layout).
+4. The path specified by the environment variable `TAS_DEVICE_CONFIGS` (lowest priority).
+
+If none of these locations contain a usable `DeviceConfigs/` directory, the tool reports a configuration error and exits.
+
+### JSON file source
+
+The shipped `*.json` files originate from Infineon's **AURIXFlasherSoftwareTool — DeviceConfigs**. They describe each MCU's memory map (DFlash, PFlash, SRAM …) as well as DFlash sector size and total size. The tool reads only the fields it needs (`memoryStartAddress`, `memorySize`, `sectorSize` of the DFlash region) and ignores everything else, so the upstream files can be used **as-is** without any modification.
+
+### Adding a new device
+
+To add support for a new TC2x/TC3x device:
+
+1. Obtain the device's JSON file from AURIXFlasherSoftwareTool's `DeviceConfigs/` directory (e.g. `TC4xx_A_step.json`).
+2. Drop the file into the `DeviceConfigs/` directory the tool is using (see search-path priority above).
+3. Re-run the tool — no rebuild and no source change is needed.
+
+The auto-detected device name (from the connected target) is matched against the JSON file name to pick the correct configuration.
 
 ---
 

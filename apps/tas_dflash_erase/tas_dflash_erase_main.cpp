@@ -18,8 +18,9 @@
  *  **************************************************************************************************************** */
 
 //********************************************************************************************************************
-//  TAS DFlash Tool for AURIX TC23x/TC26x/TC27x/TC3x
+//  TAS DFlash Tool for AURIX
 //  Subcommands: erase, read, list
+//  Device configurations are loaded at runtime from JSON files (DeviceConfigs/).
 //********************************************************************************************************************
 
 // Prevent Windows min/max macros from interfering with std::min/std::max
@@ -29,64 +30,27 @@
 #include "tas_utils.h"
 #include "tas_device_family.h"
 
+#include "device_config_loader.h"
+
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <chrono>
 #include <thread>
 #include <fstream>
 #include <algorithm>
+#include <filesystem>
 
-//********************************************************************************************************************
-//  DFlash configuration per device type
-//********************************************************************************************************************
-
-struct DFlashConfig {
-    uint32_t sectorSize;
-    uint32_t totalSize;
-    const char* family;
-    bool isTc3x;
-};
-
-static bool getDFlashConfig(uint32_t deviceType, DFlashConfig& cfg)
-{
-    uint32_t dt = deviceType & TAS_DT_VERSION_MASK_OUT;
-
-    // TC2x: TC23x, TC26x, TC27x - sector = 8 KB
-    cfg.sectorSize = 0x2000u;
-    cfg.family     = "TC2x";
-    cfg.isTc3x     = false;
-    switch (dt) {
-    case TAS_DT_TC23X: cfg.totalSize = 0x20000u; return true;
-    case TAS_DT_TC26X: cfg.totalSize = 0x20000u; return true;
-    case TAS_DT_TC27X: cfg.totalSize = 0x40000u; return true;
-    default: break;
-    }
-
-    // TC3x - sector = 4 KB
-    if (tas_df_check_if_tc3x(deviceType)) {
-        cfg.sectorSize = 0x1000u;
-        cfg.family     = "TC3x";
-        cfg.isTc3x     = true;
-        switch (dt) {
-        case TAS_DT_TC39X:  cfg.totalSize = 0x100000u; break;
-        case TAS_DT_TC38X:  cfg.totalSize = 0x80000u;  break;
-        case TAS_DT_TC37X:
-        case TAS_DT_TC37XE:  cfg.totalSize = 0x40000u;  break;
-        default:             cfg.totalSize = 0x20000u;  break;
-        }
-        return true;
-    }
-
-    return false;
-}
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 //********************************************************************************************************************
 //  AURIX Register Addresses and Constants
 //********************************************************************************************************************
-
 
 // TC3x: DMU_HF_STATUS (busy flags) at 0xF8040010
 static constexpr uint64_t DMU_HF_STATUS_ADDR     = 0xF8040010ULL;
@@ -109,20 +73,18 @@ static constexpr uint32_t TC2X_PROER_BIT          = (1u << 13);
 static constexpr uint32_t TC2X_PVER_BIT           = (1u << 25);
 static constexpr uint32_t TC2X_EVER_BIT           = (1u << 26);
 
-// Flash command registers (iLLD offsets)
-static constexpr uint64_t FLASH_CMD_BASE          = 0xAF000000ULL;
-static constexpr uint64_t FLASH_CMD_CLEAR_STATUS  = FLASH_CMD_BASE | 0x5554;
-static constexpr uint64_t FLASH_CMD_SECTOR_ADDR   = FLASH_CMD_BASE | 0xAA50;
-static constexpr uint64_t FLASH_CMD_SECTOR_COUNT  = FLASH_CMD_BASE | 0xAA58;
-static constexpr uint64_t FLASH_CMD_EXECUTE       = FLASH_CMD_BASE | 0xAAA8;
-static constexpr uint64_t FLASH_CMD_RESET_READ    = FLASH_CMD_BASE | 0x5554;
+// Flash command register offsets (relative to DFlash base address - same for TC2x/TC3x).
+static constexpr uint64_t FLASH_CMD_OFFSET_CLEAR_STATUS  = 0x5554;
+static constexpr uint64_t FLASH_CMD_OFFSET_SECTOR_ADDR   = 0xAA50;
+static constexpr uint64_t FLASH_CMD_OFFSET_SECTOR_COUNT  = 0xAA58;
+static constexpr uint64_t FLASH_CMD_OFFSET_EXECUTE       = 0xAAA8;
+static constexpr uint64_t FLASH_CMD_OFFSET_RESET_READ    = 0x5554;
 
 static constexpr uint32_t FLASH_VAL_CLEAR_STATUS  = 0xFA;
 static constexpr uint32_t FLASH_VAL_ERASE_CMD1    = 0x80;
 static constexpr uint32_t FLASH_VAL_ERASE_CMD2    = 0x50;
 static constexpr uint32_t FLASH_VAL_RESET_READ    = 0xF0;
 
-static constexpr uint32_t DFLASH_START_ADDR       = 0xAF000000u;
 static constexpr uint32_t DFLASH_ERASED_BYTE      = 0x00u;
 
 static constexpr uint32_t WAIT_UNBUSY_TIMEOUT_MS  = 10000;
@@ -140,6 +102,62 @@ static tas_return_et readReg32(CTasClientRw& client, uint64_t addr, uint32_t& va
 static tas_return_et writeReg32(CTasClientRw& client, uint64_t addr, uint32_t value)
 {
     return client.write32(addr, value);
+}
+
+//********************************************************************************************************************
+//  DeviceConfigs directory resolution
+//********************************************************************************************************************
+
+static std::string findConfigDir(const char* userSpecified)
+{
+    namespace fs = std::filesystem;
+
+    // 1. User specified via --config-dir
+    if (userSpecified && userSpecified[0]) {
+        std::error_code ec;
+        if (fs::is_directory(userSpecified, ec)) return userSpecified;
+        // Even if it doesn't exist, return it so the caller can report a clear error.
+        return userSpecified;
+    }
+
+#ifdef _WIN32
+    // 2. exe-side DeviceConfigs/
+    char exePath[MAX_PATH] = {0};
+    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        fs::path exeDir = fs::path(exePath).parent_path();
+
+        std::error_code ec;
+        // 2a. exe/DeviceConfigs/
+        fs::path candidate = exeDir / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return candidate.string();
+
+        // 2b. exe/../data/DeviceConfigs/  (developer layout)
+        candidate = exeDir / ".." / "data" / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return fs::weakly_canonical(candidate, ec).string();
+
+        // 2c. exe/../../../data/DeviceConfigs/  (build/<cfg>/<arch>/ layout)
+        candidate = exeDir / ".." / ".." / ".." / "data" / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return fs::weakly_canonical(candidate, ec).string();
+
+        // 2d. exe/../../../../data/DeviceConfigs/  (extra-deep build layouts)
+        candidate = exeDir / ".." / ".." / ".." / ".." / "data" / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return fs::weakly_canonical(candidate, ec).string();
+    }
+#endif
+
+    // 3. Environment variable TAS_DEVICE_CONFIGS
+    const char* envDir = std::getenv("TAS_DEVICE_CONFIGS");
+    if (envDir && envDir[0]) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(envDir, ec)) return envDir;
+    }
+
+    // 4. Current working directory fallback
+    std::error_code ec;
+    if (std::filesystem::is_directory("DeviceConfigs", ec)) return "DeviceConfigs";
+
+    return "";
 }
 
 //********************************************************************************************************************
@@ -173,27 +191,33 @@ static tas_return_et startSession(CTasClientRw& client, const char* targetId, co
 }
 
 //********************************************************************************************************************
-//  Flash operations
+//  Flash operations (parametrised on DFlash base address)
 //********************************************************************************************************************
 
-static bool clearFlashStatus(CTasClientRw& client)
+static bool clearFlashStatus(CTasClientRw& client, uint64_t flashCmdBase)
 {
-    return writeReg32(client, FLASH_CMD_CLEAR_STATUS, FLASH_VAL_CLEAR_STATUS) == TAS_ERR_NONE;
+    return writeReg32(client, flashCmdBase | FLASH_CMD_OFFSET_CLEAR_STATUS,
+                      FLASH_VAL_CLEAR_STATUS) == TAS_ERR_NONE;
 }
 
 // Atomic erase via execute_trans -- CSI requires continuous 4-write sequence
-static bool eraseMultipleSectors(CTasClientRw& client, uint32_t sectorAddr, uint32_t numSectors)
+static bool eraseMultipleSectors(CTasClientRw& client, uint64_t flashCmdBase,
+                                 uint32_t sectorAddr, uint32_t numSectors)
 {
     uint32_t valAddr  = sectorAddr;
     uint32_t valCount = numSectors;
     uint32_t valCmd1  = FLASH_VAL_ERASE_CMD1;
     uint32_t valCmd2  = FLASH_VAL_ERASE_CMD2;
 
+    const uint64_t addrSectorAddr  = flashCmdBase | FLASH_CMD_OFFSET_SECTOR_ADDR;
+    const uint64_t addrSectorCount = flashCmdBase | FLASH_CMD_OFFSET_SECTOR_COUNT;
+    const uint64_t addrExecute     = flashCmdBase | FLASH_CMD_OFFSET_EXECUTE;
+
     tas_rw_trans_st trans[4] = {
-        { FLASH_CMD_SECTOR_ADDR,  4, 0, TAS_AM0, TAS_RW_TT_WR, &valAddr  },
-        { FLASH_CMD_SECTOR_COUNT, 4, 0, TAS_AM0, TAS_RW_TT_WR, &valCount },
-        { FLASH_CMD_EXECUTE,      4, 0, TAS_AM0, TAS_RW_TT_WR, &valCmd1  },
-        { FLASH_CMD_EXECUTE,      4, 0, TAS_AM0, TAS_RW_TT_WR, &valCmd2  },
+        { addrSectorAddr,  4, 0, TAS_AM0, TAS_RW_TT_WR, &valAddr  },
+        { addrSectorCount, 4, 0, TAS_AM0, TAS_RW_TT_WR, &valCount },
+        { addrExecute,     4, 0, TAS_AM0, TAS_RW_TT_WR, &valCmd1  },
+        { addrExecute,     4, 0, TAS_AM0, TAS_RW_TT_WR, &valCmd2  },
     };
 
     return client.execute_trans(trans, 4) == TAS_ERR_NONE;
@@ -219,9 +243,10 @@ static bool waitUnbusyD0(CTasClientRw& client, bool isTc3x, uint32_t& elapsedMs)
     }
 }
 
-static bool resetToRead(CTasClientRw& client)
+static bool resetToRead(CTasClientRw& client, uint64_t flashCmdBase)
 {
-    return writeReg32(client, FLASH_CMD_RESET_READ, FLASH_VAL_RESET_READ) == TAS_ERR_NONE;
+    return writeReg32(client, flashCmdBase | FLASH_CMD_OFFSET_RESET_READ,
+                      FLASH_VAL_RESET_READ) == TAS_ERR_NONE;
 }
 
 //********************************************************************************************************************
@@ -427,26 +452,8 @@ struct CommonArgs {
     const char* serverIp = "localhost";
     const char* targetId = nullptr;
     const char* deviceName = nullptr;
+    const char* configDir = nullptr;
 };
-
-static bool parseDeviceName(const char* name, uint32_t& deviceType)
-{
-    struct DeviceEntry { const char* name; uint32_t type; };
-    static const DeviceEntry devices[] = {
-        {"TC23x", TAS_DT_TC23X}, {"TC26x", TAS_DT_TC26X}, {"TC27x", TAS_DT_TC27X},
-        {"TC33x", TAS_DT_TC33X}, {"TC35x", TAS_DT_TC35X}, {"TC36x", TAS_DT_TC36X},
-        {"TC37x", TAS_DT_TC37X}, {"TC38x", TAS_DT_TC38X}, {"TC39x", TAS_DT_TC39X},
-    };
-    for (const auto& d : devices) {
-        if (_stricmp(name, d.name) == 0) { deviceType = d.type; return true; }
-    }
-    return false;
-}
-
-static void printSupportedDevices()
-{
-    fprintf(stderr, "  Supported: TC23x, TC26x, TC27x, TC33x, TC35x, TC36x, TC37x, TC38x, TC39x\n");
-}
 
 // Returns: 1 = consumed 1 arg, 2 = consumed 2 args (option + value), 0 = not recognized
 static int parseCommonOption(int argc, char** argv, int idx, CommonArgs& args)
@@ -463,7 +470,51 @@ static int parseCommonOption(int argc, char** argv, int idx, CommonArgs& args)
         args.deviceName = argv[idx + 1];
         return 2;
     }
+    if (strcmp(argv[idx], "--config-dir") == 0 && idx + 1 < argc) {
+        args.configDir = argv[idx + 1];
+        return 2;
+    }
     return 0;
+}
+
+//********************************************************************************************************************
+//  Helper: print supported devices loaded from config
+//********************************************************************************************************************
+
+static void printSupportedDevices(const DeviceConfigLoader& loader)
+{
+    auto names = loader.getSupportedDeviceNames();
+    if (names.empty()) {
+        fprintf(stderr, "  (no device configurations loaded)\n");
+        return;
+    }
+    fprintf(stderr, "  Supported: ");
+    for (size_t i = 0; i < names.size(); i++) {
+        fprintf(stderr, "%s", names[i].c_str());
+        if (i + 1 < names.size()) fprintf(stderr, ", ");
+    }
+    fprintf(stderr, "\n");
+}
+
+//********************************************************************************************************************
+//  Helper: load device configs (with consistent error reporting)
+//********************************************************************************************************************
+
+static bool loadDeviceConfigs(const CommonArgs& args, DeviceConfigLoader& loader, std::string& outDir)
+{
+    outDir = findConfigDir(args.configDir);
+    if (outDir.empty()) {
+        fprintf(stderr, "ERROR: DeviceConfigs directory not found.\n");
+        fprintf(stderr, "  Use --config-dir <path> or set TAS_DEVICE_CONFIGS env var.\n");
+        return false;
+    }
+    if (!loader.loadFromDirectory(outDir)) {
+        fprintf(stderr, "ERROR: Failed to load device configs from '%s'\n", outDir.c_str());
+        return false;
+    }
+    printf("  Loaded %zu device configurations from %s\n",
+           loader.getDeviceCount(), outDir.c_str());
+    return true;
 }
 
 //********************************************************************************************************************
@@ -547,12 +598,13 @@ static int doRead(int argc, char** argv)
                    "  --output/-o <file>  Output file (.bin or .hex, default: hex dump)\n"
                    "  --server <ip>       TAS server IP (default: localhost)\n"
                    "  --target <id>       Target identifier\n"
-                   "  --device <name>     Override device type (skip auto-detect)\n\n"
+                   "  --device <name>     Override device type (skip auto-detect)\n"
+                   "  --config-dir <path> DeviceConfigs JSON directory\n\n"
                    "Examples:\n"
                    "  tas_dflash_erase read -a AF000000 -l 100\n"
                    "  tas_dflash_erase read -a AF000000 -l 1000 -o dump.hex\n"
                    "  tas_dflash_erase read -a AF000000 -l 400 --device TC27x\n\n"
-                   "Supported devices: TC23x, TC26x, TC27x, TC33x, TC35x, TC36x, TC37x, TC38x, TC39x\n");
+                   "Run 'tas_dflash_erase erase --info' to see supported devices.\n");
             return 0;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
@@ -566,6 +618,12 @@ static int doRead(int argc, char** argv)
 
     printf("TAS DFlash Read Tool\n");
     printf("====================\n");
+
+    // ---- Load device configs ----
+    DeviceConfigLoader configLoader;
+    std::string configDirPath;
+    if (!loadDeviceConfigs(args, configLoader, configDirPath)) return 1;
+
     printf("Connecting to TAS server at %s...\n", args.serverIp);
 
     CTasClientRw client("DFlashRead");
@@ -590,38 +648,37 @@ static int doRead(int argc, char** argv)
 
     const tas_con_info_st* conInfo = client.get_con_info();
     DFlashConfig flashCfg;
-    uint32_t effectiveDeviceType;
 
     if (args.deviceName != nullptr) {
-        if (!parseDeviceName(args.deviceName, effectiveDeviceType)) {
+        if (!configLoader.findByName(args.deviceName, flashCfg)) {
             fprintf(stderr, "ERROR: Unknown device '%s'\n", args.deviceName);
-            printSupportedDevices();
+            printSupportedDevices(configLoader);
             return 7;
         }
         printf("  Device (manual): %s\n", args.deviceName);
     } else {
-        effectiveDeviceType = conInfo->device_type;
+        if (!configLoader.findByJtagId(conInfo->device_type, flashCfg)) {
+            fprintf(stderr, "ERROR: Unsupported device '%s' (jtag_id=0x%08X)\n",
+                   tas_get_device_name_str(conInfo->device_type), conInfo->device_type);
+            printSupportedDevices(configLoader);
+            return 7;
+        }
     }
 
-    if (!getDFlashConfig(effectiveDeviceType, flashCfg)) {
-        fprintf(stderr, "ERROR: Unsupported device '%s'\n",
-               args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type));
-        printSupportedDevices();
-        return 7;
-    }
-
-    uint32_t dflashEndAddr = DFLASH_START_ADDR + flashCfg.totalSize - 1;
-    if (readAddr < DFLASH_START_ADDR || readAddr > dflashEndAddr) {
-        fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range\n", readAddr);
+    uint32_t dflashEndAddr = flashCfg.baseAddress + flashCfg.totalSize - 1;
+    if (readAddr < flashCfg.baseAddress || readAddr > dflashEndAddr) {
+        fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range (0x%08X - 0x%08X)\n",
+                readAddr, flashCfg.baseAddress, dflashEndAddr);
         return 1;
     }
     if (readAddr + readLength - 1 > dflashEndAddr) {
-        fprintf(stderr, "ERROR: Range exceeds DFlash boundary\n");
+        fprintf(stderr, "ERROR: Range exceeds DFlash boundary (max 0x%08X)\n", dflashEndAddr);
         return 1;
     }
 
+    const char* displayName = args.deviceName ? args.deviceName : flashCfg.deviceName.c_str();
     printf("  Device: %s (%s), DFlash: %u KB\n",
-           args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type), flashCfg.family, flashCfg.totalSize / 1024);
+           displayName, flashCfg.family.c_str(), flashCfg.totalSize / 1024);
     printf("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
 
     // Read in sector-sized chunks
@@ -740,13 +797,14 @@ static int doErase(int argc, char** argv, bool legacyMode)
                        "  --no-reset         Hot attach (no device reset)\n"
                        "  --server <ip>      TAS server IP (default: localhost)\n"
                        "  --target <id>      Target identifier\n"
-                       "  --device <name>    Override device type (skip auto-detect)\n\n"
+                       "  --device <name>    Override device type (skip auto-detect)\n"
+                       "  --config-dir <path> DeviceConfigs JSON directory\n\n"
                        "Examples:\n"
                        "  tas_dflash_erase erase --addr AF000000 --sectors 1\n"
                        "  tas_dflash_erase erase --addr AF000000 --sectors 4 --verify\n"
                        "  tas_dflash_erase erase --all --backup backup.hex\n"
                        "  tas_dflash_erase erase --info --device TC27x\n\n"
-                       "Supported devices: TC23x, TC26x, TC27x, TC33x, TC35x, TC36x, TC37x, TC38x, TC39x\n");
+                       "Run with --info to see supported devices.\n");
                 return 0;
             }
             fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
@@ -758,13 +816,14 @@ static int doErase(int argc, char** argv, bool legacyMode)
         fprintf(stderr, "ERROR: Specify --addr + --sectors, --all, or --info\n");
         return 1;
     }
-    if (hasAddr && (sectorAddr < DFLASH_START_ADDR || sectorAddr > 0xAF0FFFFFu)) {
-        fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range\n", sectorAddr);
-        return 1;
-    }
 
     printf("TAS DFlash Erase Tool\n");
     printf("=====================\n\n");
+
+    // ---- Load device configs ----
+    DeviceConfigLoader configLoader;
+    std::string configDirPath;
+    if (!loadDeviceConfigs(args, configLoader, configDirPath)) return 1;
 
     // ---- Connect to server ----
     printf("Connecting to TAS server at %s...\n", args.serverIp);
@@ -806,34 +865,31 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // ---- Detect MCU ----
     const tas_con_info_st* conInfo = client.get_con_info();
     DFlashConfig flashCfg;
-    uint32_t effectiveDeviceType;
 
     if (args.deviceName != nullptr) {
-        if (!parseDeviceName(args.deviceName, effectiveDeviceType)) {
+        if (!configLoader.findByName(args.deviceName, flashCfg)) {
             fprintf(stderr, "ERROR: Unknown device '%s'\n", args.deviceName);
-            printSupportedDevices();
+            printSupportedDevices(configLoader);
             return 7;
         }
         printf("  Device (manual): %s\n", args.deviceName);
     } else {
-        effectiveDeviceType = conInfo->device_type;
+        if (!configLoader.findByJtagId(conInfo->device_type, flashCfg)) {
+            fprintf(stderr, "ERROR: Unsupported device '%s' (jtag_id=0x%08X)\n",
+                   tas_get_device_name_str(conInfo->device_type), conInfo->device_type);
+            printSupportedDevices(configLoader);
+            return 7;
+        }
     }
 
-    if (!getDFlashConfig(effectiveDeviceType, flashCfg)) {
-        fprintf(stderr, "ERROR: Unsupported device '%s'.\n",
-               args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type));
-        printSupportedDevices();
-        return 7;
-    }
+    const char* displayName = args.deviceName ? args.deviceName : flashCfg.deviceName.c_str();
+    uint32_t dflashEndAddr = flashCfg.baseAddress + flashCfg.totalSize - 1;
+    uint32_t totalSectors = flashCfg.numSectors;
 
-    const char* displayName = args.deviceName ? args.deviceName : tas_get_device_name_str(conInfo->device_type);
-    uint32_t dflashEndAddr = DFLASH_START_ADDR + flashCfg.totalSize - 1;
-    uint32_t totalSectors = flashCfg.totalSize / flashCfg.sectorSize;
-
-    printf("  Device: %s (%s)\n", displayName, flashCfg.family);
+    printf("  Device: %s (%s)\n", displayName, flashCfg.family.c_str());
     printf("  DFlash: %u KB total, %u sectors, sector size %u KB\n",
            flashCfg.totalSize / 1024, totalSectors, flashCfg.sectorSize / 1024);
-    printf("  Range:  0x%08X - 0x%08X\n", DFLASH_START_ADDR, dflashEndAddr);
+    printf("  Range:  0x%08X - 0x%08X\n", flashCfg.baseAddress, dflashEndAddr);
 
     // ---- --info mode: just print info and exit ----
     if (infoOnly) {
@@ -843,8 +899,8 @@ static int doErase(int argc, char** argv, bool legacyMode)
 
     // ---- --all mode ----
     if (eraseAll) {
-        sectorAddr = DFLASH_START_ADDR;
-        numSectors = totalSectors;
+        sectorAddr = flashCfg.baseAddress;
+        numSectors = flashCfg.numSectors;
     }
 
     // ---- Auto-align address ----
@@ -856,9 +912,9 @@ static int doErase(int argc, char** argv, bool legacyMode)
     }
 
     // ---- Validate range ----
-    if (sectorAddr < DFLASH_START_ADDR || sectorAddr > dflashEndAddr) {
+    if (sectorAddr < flashCfg.baseAddress || sectorAddr >= flashCfg.baseAddress + flashCfg.totalSize) {
         fprintf(stderr, "ERROR: Address 0x%08X out of range (0x%08X - 0x%08X)\n",
-               sectorAddr, DFLASH_START_ADDR, dflashEndAddr);
+               sectorAddr, flashCfg.baseAddress, dflashEndAddr);
         return 1;
     }
     if (sectorAddr + numSectors * flashCfg.sectorSize - 1 > dflashEndAddr) {
@@ -877,16 +933,19 @@ static int doErase(int argc, char** argv, bool legacyMode)
     printf("  Address:  0x%08X\n", sectorAddr);
     printf("  Sectors:  %u (%u KB)\n\n", numSectors, numSectors * flashCfg.sectorSize / 1024);
 
+    // ---- Flash command base = DFlash base address (TC2x/TC3x convention) ----
+    const uint64_t flashCmdBase = static_cast<uint64_t>(flashCfg.baseAddress);
+
     // ---- Step 1: Clear status ----
     printf("Step 1/5: Clearing flash status...                ");
-    if (!clearFlashStatus(client)) {
+    if (!clearFlashStatus(client, flashCmdBase)) {
         printf("FAILED\n"); return 11;
     }
     printf("OK\n");
 
     // ---- Step 2: Erase (atomic) ----
     printf("Step 2/5: Executing erase command...              ");
-    if (!eraseMultipleSectors(client, sectorAddr, numSectors)) {
+    if (!eraseMultipleSectors(client, flashCmdBase, sectorAddr, numSectors)) {
         printf("FAILED\n"); return 12;
     }
     printf("OK\n");
@@ -904,7 +963,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
 
     // ---- Step 5: Reset to read ----
     printf("Step 5/5: Reset to read mode...                   ");
-    if (!resetToRead(client)) { printf("FAILED\n"); return 16; }
+    if (!resetToRead(client, flashCmdBase)) { printf("FAILED\n"); return 16; }
     printf("OK\n");
 
     // ---- Verify ----
@@ -935,14 +994,14 @@ static int doErase(int argc, char** argv, bool legacyMode)
 //  Usage
 //********************************************************************************************************************
 
-static void printUsage(const char* progName)
+static void printUsage(const char* progName, const DeviceConfigLoader* loader = nullptr)
 {
     // Show only filename, not full path
     const char* base = strrchr(progName, '\\');
     if (!base) base = strrchr(progName, '/');
     if (!base) base = progName; else base++;
 
-    printf("TAS DFlash Tool for AURIX TC23x/TC26x/TC27x/TC3x\n\n");
+    printf("TAS DFlash Tool for AURIX\n\n");
     printf("Usage:\n");
     printf("  %s <subcommand> [options]\n\n", base);
     printf("Subcommands:\n");
@@ -960,9 +1019,19 @@ static void printUsage(const char* progName)
     printf("  %s erase --addr AF000000 --sectors 1\n", base);
     printf("  %s erase --all --verify\n", base);
     printf("  %s read -a AF000000 -l 1000 -o dump.hex\n\n", base);
-    printf("Supported devices:\n");
-    printf("  TC23x/TC26x:  sector=8KB, total=128KB | TC27x: sector=8KB, total=256KB\n");
-    printf("  TC33x/TC35x/TC36x: 4KB/128KB | TC37x: 4KB/256KB | TC38x: 4KB/512KB | TC39x: 4KB/1MB\n");
+
+    if (loader && loader->getDeviceCount() > 0) {
+        printf("Supported devices (from DeviceConfigs):\n  ");
+        auto names = loader->getSupportedDeviceNames();
+        for (size_t i = 0; i < names.size(); i++) {
+            printf("%s", names[i].c_str());
+            if (i + 1 < names.size()) printf(", ");
+        }
+        printf("\n");
+    } else {
+        printf("Run with '--info' (or 'erase --info') to see supported devices.\n");
+        printf("Set DeviceConfigs directory via --config-dir <path> or TAS_DEVICE_CONFIGS env var.\n");
+    }
 }
 
 //********************************************************************************************************************

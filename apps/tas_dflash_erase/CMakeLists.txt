@@ -24,6 +24,8 @@ set(EXE_NAME tas_dflash_erase)
 
 set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/tas_dflash_erase_main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/device_config_loader.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/device_config_loader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/tas_dflash_erase.rc"
 )
 
@@ -34,6 +36,9 @@ add_executable(${EXE_NAME}
 )
 
 target_link_libraries(${EXE_NAME} tas_client)
+
+# Include path for third-party headers (nlohmann/json)
+target_include_directories(${EXE_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/src/third_party")
 
 if (MSVC)
     target_compile_definitions(${EXE_NAME} PRIVATE
