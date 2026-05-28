@@ -28,6 +28,7 @@
 - **restore** - Restore DFlash from a backup file (erase + write + verify)
 - **list** - List connected TAS targets and device info
 - **reset** - Reset the MCU (with optional halt)
+- **ucb** - Read, write, and erase UCB (User Configuration Block) on TC3x devices
 
 The tool connects to a TAS server, auto-detects the connected MCU, and performs device-specific register access (TC2x uses PMU `FLASH0_FSR`, TC3x uses DMU `DMU_HF_STATUS`/`DMU_HF_ERRSR`).
 
@@ -79,6 +80,7 @@ dflash <subcommand> [options]
 | `restore` | | Restore DFlash from backup |
 | `list` | `l` | List connected TAS targets |
 | `reset` | | Reset the MCU |
+| `ucb` | `u` | Read/write/erase UCB (TC3x only) |
 
 ### Legacy Mode (backward compatible)
 
@@ -308,6 +310,146 @@ dflash reset --halt
 
 ---
 
+## `ucb` Subcommand
+
+```
+dflash ucb <operation> [options]
+```
+
+Access the User Configuration Block (UCB) on TC3x AURIX devices. UCB stores critical boot configuration, security settings, and flash protection parameters.
+
+> **Note:** UCB operations are only supported on **TC3x** devices. TC2x devices do not have UCB support in this tool.
+
+### UCB Address Space
+
+| Region | Address Range | Size | Description |
+|--------|--------------|------|-------------|
+| Full UCB | `0xAF400000` - `0xAF405FFF` | 24 KB | 48 sectors × 512 bytes |
+| BMHD0-3 | `0xAF400000` - `0xAF4007FF` | 2 KB | Boot Mode Headers |
+| Security | `0xAF400800` - `0xAF400FFF` | 2 KB | OTP/DFLASH/DBG/HSM |
+| BMHD COPY | `0xAF401000` - `0xAF4017FF` | 2 KB | BMHD backup |
+| Security COPY | `0xAF401800` - `0xAF401FFF` | 2 KB | Security backup |
+| PFLASH | `0xAF402000` - `0xAF4027FF` | 2 KB | PFlash protection + backup |
+| SWAP | `0xAF402800` - `0xAF4037FF` | 4 KB | Flash swap + backup |
+| LBIST | `0xAF403800` - `0xAF4047FF` | 4 KB | Logic BIST + backup |
+| SSW | `0xAF404800` - `0xAF4057FF` | 4 KB | Startup SW + backup |
+| Reserved | `0xAF405800` - `0xAF405FFF` | 2 KB | Reserved |
+
+### Operations
+
+| Operation | Shortcut | Description |
+|-----------|----------|-------------|
+| `read` | `r` | Read UCB content |
+| `write` | `w` | Write data to UCB |
+| `erase` | `e` | Erase UCB sectors |
+
+### `ucb read`
+
+```
+dflash ucb read [--addr <hex> --length <hex>] [--output <file>] [options]
+```
+
+Read UCB content. Without `--addr`/`--length`, reads the entire 24 KB UCB area.
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--addr <hex>` | `-a` | Start address within UCB range. Default: `0xAF400000`. |
+| `--length <hex>` | `-l` | Number of bytes to read. Default: entire UCB (0x6000). |
+| `--output <file>` | `-o` | Output file (`.hex` = Intel HEX, `.bin` = binary). Default: hex dump to terminal. |
+
+#### Examples
+
+Read entire UCB (24 KB hex dump):
+```
+dflash ucb read
+```
+
+Read BMHD area (first 4 sectors):
+```
+dflash ucb read --addr AF400000 --length 800
+```
+
+Save UCB to Intel HEX file:
+```
+dflash ucb read -a AF400000 -l 6000 -o ucb_backup.hex
+```
+
+### `ucb write`
+
+```
+dflash ucb write --file <path> [--addr <hex>] [--verify] [options]
+```
+
+Write data to UCB from a HEX or binary file.
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--file <path>` | `-f` | Input file (`.hex` or `.bin`). Required. |
+| `--addr <hex>` | `-a` | Base address for binary files. Default: `0xAF400000`. |
+| `--verify` | `-v` | Verify written data by read-back comparison. |
+
+#### Examples
+
+Write Intel HEX file to UCB:
+```
+dflash ucb write --file bmhd_config.hex --verify
+```
+
+Write binary file to specific UCB address:
+```
+dflash ucb write --file data.bin --addr AF400000 --verify
+```
+
+### `ucb erase`
+
+```
+dflash ucb erase --addr <hex> --sectors <n> [--verify] [options]
+```
+
+Erase UCB sectors. **High-risk operation** — requires user confirmation.
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--addr <hex>` | `-a` | Start address (must be within UCB range). Required. |
+| `--sectors <n>` | `-s` | Number of sectors to erase (decimal). Required. |
+| `--verify` | `-v` | Verify erased sectors are all `0x00`. |
+
+#### Locked Regions (Protected)
+
+The following regions cannot be erased (CONFIRMED state):
+- `0xAF400800` - `0xAF400FFF` (sectors 4-7: OTP/DFLASH/DBG/HSM)
+- `0xAF401800` - `0xAF401FFF` (sectors 12-15: Security COPY)
+
+If the specified range overlaps a locked region, the tool will report an error and abort.
+
+#### Examples
+
+Erase BMHD sectors (0-3):
+```
+dflash ucb erase --addr AF400000 --sectors 4 --verify
+```
+
+Erase BMHD COPY sectors (8-11):
+```
+dflash ucb erase --addr AF401000 --sectors 4 --verify
+```
+
+### Common Options (all UCB operations)
+
+| Option | Description |
+|--------|-------------|
+| `--server <ip>` | TAS server IP address. Default: `localhost` |
+| `--target <id>` | Target identifier string. Default: first available target |
+| `--config-dir <path>` | Path to `DeviceConfigs/` directory. |
+
+### Parameter Format
+
+- `--addr` and `--length` values are **hexadecimal** (0x prefix optional)
+- `--sectors` is **decimal**
+- All addresses must fall within the UCB range (`0xAF400000` - `0xAF405FFF`)
+
+---
+
 ## DeviceConfigs Configuration
 
 The tool no longer hard-codes any device-specific memory parameters. On startup it automatically loads the device descriptions (DFlash base address, total size, sector size, etc.) from a directory of JSON files called `DeviceConfigs/`.
@@ -365,6 +507,8 @@ The auto-detected device name (from the connected target) is matched against the
 | 19 | Write failed |
 | 20 | File open/parse failed |
 | 21 | Restore failed |
+| 22 | UCB erase failed (locked region overlap) |
+| 23 | UCB operation on unsupported device (not TC3x) |
 
 ## Erase Sequence
 

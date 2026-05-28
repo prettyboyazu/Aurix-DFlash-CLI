@@ -19,7 +19,7 @@
 
 //********************************************************************************************************************
 //  TAS DFlash Tool for AURIX
-//  Subcommands: erase, read, list, reset
+//  Subcommands: erase, read, write, restore, list, reset, ucb
 //  Device configurations are loaded at runtime from JSON files (DeviceConfigs/).
 //********************************************************************************************************************
 
@@ -1526,6 +1526,537 @@ static int doRestore(int argc, char** argv)
 }
 
 //********************************************************************************************************************
+//  doUcbRead - read UCB (User Configuration Block) content (TC3XX only)
+//********************************************************************************************************************
+
+static int doUcbRead(int argc, char** argv)
+{
+    CommonArgs args;
+    uint32_t readAddr = 0;
+    uint32_t readLength = 0;
+    const char* outputFile = nullptr;
+    bool hasAddr = false;
+    bool hasLength = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if ((strcmp(argv[i], "--addr") == 0 || strcmp(argv[i], "-a") == 0) && i + 1 < argc) {
+            if (!parseHexAddr(argv[++i], readAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
+            hasAddr = true; i++; continue;
+        }
+        if ((strcmp(argv[i], "--length") == 0 || strcmp(argv[i], "-l") == 0) && i + 1 < argc) {
+            if (!parseHexAddr(argv[++i], readLength) || readLength == 0) { fprintf(stderr, "ERROR: Invalid length\n"); return EXIT_USAGE_ERROR; }
+            hasLength = true; i++; continue;
+        }
+        if ((strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
+            outputFile = argv[++i]; i++; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash ucb read [--addr <hex>] [--length <hex>] [--output <file>] [options]\n\n"
+                   "Read UCB (User Configuration Block) content (TC3XX only).\n\n"
+                   "Options:\n"
+                   "  --addr/-a <hex>     Start address (default: UCB base)\n"
+                   "  --length/-l <hex>   Length in bytes (default: entire UCB)\n"
+                   "  --output/-o <file>  Output file (.hex default, .bin for raw binary)\n"
+                   "  --server <ip>       TAS server IP (default: localhost)\n"
+                   "  --target <id>       Target identifier\n"
+                   "  --device <name>     Override device type (skip auto-detect)\n"
+                   "  --config-dir <path> DeviceConfigs JSON directory\n");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+
+    printf("TAS DFlash UCB Read Tool\n");
+    printf("========================\n");
+
+    ToolContext ctx("DFlashUcbRead");
+    int initResult = initTool(ctx, args, "DFlashUcbRead", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (initResult != EXIT_OK) return initResult;
+
+    // Reject TC2x
+    if (!ctx.flashCfg.isTc3x) {
+        fprintf(stderr, "ERROR: UCB commands only support TC3XX devices.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+
+    // Check UCB config valid
+    if (ctx.flashCfg.ucb.baseAddress == 0) {
+        fprintf(stderr, "ERROR: No UCB configuration found for this device.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+
+    const UCBConfig& ucb = ctx.flashCfg.ucb;
+
+    // Default: read entire UCB
+    if (!hasAddr) readAddr = ucb.baseAddress;
+    if (!hasLength) readLength = ucb.totalSize;
+
+    // Validate range within UCB
+    uint32_t ucbEndAddr = ucb.baseAddress + ucb.totalSize - 1;
+    if (readAddr < ucb.baseAddress || readAddr > ucbEndAddr) {
+        fprintf(stderr, "ERROR: Address 0x%08X out of UCB range (0x%08X - 0x%08X)\n",
+                readAddr, ucb.baseAddress, ucbEndAddr);
+        return EXIT_USAGE_ERROR;
+    }
+    if (static_cast<uint64_t>(readAddr) + readLength - 1 > ucbEndAddr) {
+        fprintf(stderr, "ERROR: Range exceeds UCB boundary (max 0x%08X)\n", ucbEndAddr);
+        return EXIT_USAGE_ERROR;
+    }
+
+    printf("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    printf("  UCB:    0x%08X - 0x%08X (%u bytes, %u sectors of %u bytes)\n",
+           ucb.baseAddress, ucbEndAddr, ucb.totalSize, ucb.numSectors, ucb.sectorSize);
+    printf("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
+
+    // Read in sector-sized chunks
+    const uint32_t chunkSize = ucb.sectorSize;
+    std::vector<uint8_t> allData(readLength, 0);
+    uint32_t totalRead = 0;
+
+    for (uint32_t offset = 0; offset < readLength; offset += chunkSize) {
+        uint32_t remaining = readLength - offset;
+        uint32_t thisChunk = std::min(remaining, chunkSize);
+        uint32_t bytesRead = 0;
+        tas_return_et r = ctx.client.read(readAddr + offset, allData.data() + offset, thisChunk, &bytesRead);
+        if (r != TAS_ERR_NONE && r != TAS_ERR_RW_READ) {
+            fprintf(stderr, "ERROR: Read failed at 0x%08X: %s\n", readAddr + offset, ctx.client.get_error_info());
+            return EXIT_IO_ERROR;
+        }
+        totalRead += bytesRead;
+        printf("  Read %u/%u bytes\r", totalRead, readLength);
+        fflush(stdout);
+    }
+    printf("\n  Read complete: %u bytes\n", totalRead);
+
+    // Output
+    if (outputFile != nullptr) {
+        std::string path(outputFile);
+        std::string ext;
+        size_t dotPos = path.find_last_of('.');
+        if (dotPos != std::string::npos && dotPos + 1 < path.size()) {
+            ext = path.substr(dotPos + 1);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        }
+
+        if (ext == "bin") {
+            std::ofstream ofs(outputFile, std::ios::binary);
+            if (!ofs) { fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile); return EXIT_IO_ERROR; }
+            ofs.write(reinterpret_cast<const char*>(allData.data()), totalRead);
+            printf("  Saved binary: %s (%u bytes)\n", outputFile, totalRead);
+        } else {
+            if (!saveToIntelHex(outputFile, readAddr, allData)) return EXIT_IO_ERROR;
+            printf("  Saved Intel HEX: %s\n", outputFile);
+        }
+    } else {
+        printf("\n");
+        hexDumpXxd(allData.data(), totalRead, readAddr);
+    }
+
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doUcbWrite - write data to UCB (no erase, TC3XX only)
+//********************************************************************************************************************
+
+static int doUcbWrite(int argc, char** argv)
+{
+    CommonArgs args;
+    const char* inputFile = nullptr;
+    uint32_t writeAddr = 0;
+    bool hasAddr = false;
+    bool doVerify = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if ((strcmp(argv[i], "--file") == 0 || strcmp(argv[i], "-f") == 0) && i + 1 < argc) {
+            inputFile = argv[++i]; i++; continue;
+        }
+        if ((strcmp(argv[i], "--addr") == 0 || strcmp(argv[i], "-a") == 0) && i + 1 < argc) {
+            if (!parseHexAddr(argv[++i], writeAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
+            hasAddr = true; i++; continue;
+        }
+        if (strcmp(argv[i], "--verify") == 0 || strcmp(argv[i], "-v") == 0) {
+            doVerify = true; i++; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash ucb write --file <hex/bin> [--addr <hex>] [--verify] [options]\n\n"
+                   "Write data to UCB (no erase, TC3XX only).\n\n"
+                   "WARNING: UCB write is a high-risk operation. Incorrect data may lock the device.\n\n"
+                   "Options:\n"
+                   "  --file, -f <path>     Input file (.hex or .bin)\n"
+                   "  --addr, -a <hex>      Start address (required for .bin, optional for .hex)\n"
+                   "  --verify, -v          Read back and verify after writing\n"
+                   "  --server <ip>         TAS server IP (default: localhost)\n"
+                   "  --target <id>         Target identifier\n"
+                   "  --device <name>       Override device type (skip auto-detect)\n"
+                   "  --config-dir <path>   DeviceConfigs directory\n");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+
+    if (!inputFile) { fprintf(stderr, "ERROR: --file is required\n"); return EXIT_USAGE_ERROR; }
+
+    printf("TAS DFlash UCB Write Tool\n");
+    printf("=========================\n");
+    printf("WARNING: UCB write is a high-risk operation. Incorrect data may lock the device.\n\n");
+
+    // Parse input file
+    std::string filePath(inputFile);
+    std::string ext;
+    size_t dotPos = filePath.find_last_of('.');
+    if (dotPos != std::string::npos && dotPos + 1 < filePath.size()) {
+        ext = filePath.substr(dotPos + 1);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    }
+
+    HexParseResult parseResult;
+    if (ext == "hex" || ext == "ihex") {
+        parseResult = parseIntelHex(filePath);
+    } else {
+        if (!hasAddr) {
+            fprintf(stderr, "ERROR: --addr is required for binary files\n");
+            return EXIT_USAGE_ERROR;
+        }
+        parseResult = loadBinaryFile(filePath, writeAddr);
+    }
+
+    if (!parseResult.success) {
+        fprintf(stderr, "ERROR: Failed to parse '%s': %s\n", inputFile, parseResult.errorMsg.c_str());
+        return EXIT_HEX_PARSE_ERROR;
+    }
+    if (parseResult.segments.empty()) {
+        fprintf(stderr, "ERROR: No data found in '%s'\n", inputFile);
+        return EXIT_HEX_PARSE_ERROR;
+    }
+
+    // For HEX files, use embedded address unless --addr overrides
+    if (hasAddr && (ext == "hex" || ext == "ihex")) {
+        uint32_t originalBase = parseResult.segments[0].baseAddress;
+        int32_t offset = static_cast<int32_t>(writeAddr) - static_cast<int32_t>(originalBase);
+        for (auto& seg : parseResult.segments) {
+            seg.baseAddress = static_cast<uint32_t>(static_cast<int32_t>(seg.baseAddress) + offset);
+        }
+    }
+
+    // --- Common initialization ---
+    ToolContext ctx("DFlashUcbWrite");
+    int initResult = initTool(ctx, args, "DFlashUcbWrite", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (initResult != EXIT_OK) return initResult;
+
+    // Reject TC2x
+    if (!ctx.flashCfg.isTc3x) {
+        fprintf(stderr, "ERROR: UCB commands only support TC3XX devices.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+
+    // Check UCB config valid
+    if (ctx.flashCfg.ucb.baseAddress == 0) {
+        fprintf(stderr, "ERROR: No UCB configuration found for this device.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+
+    const UCBConfig& ucb = ctx.flashCfg.ucb;
+    uint32_t ucbEndAddr = ucb.baseAddress + ucb.totalSize - 1;
+
+    // Validate all segments within UCB range
+    uint32_t totalWriteBytes = 0;
+    for (const auto& seg : parseResult.segments) {
+        if (seg.data.empty()) continue;
+        if (seg.baseAddress < ucb.baseAddress || seg.baseAddress > ucbEndAddr) {
+            fprintf(stderr, "ERROR: Segment address 0x%08X out of UCB range (0x%08X - 0x%08X)\n",
+                   seg.baseAddress, ucb.baseAddress, ucbEndAddr);
+            return EXIT_USAGE_ERROR;
+        }
+        uint32_t segEnd = seg.baseAddress + static_cast<uint32_t>(seg.data.size()) - 1;
+        if (segEnd > ucbEndAddr) {
+            fprintf(stderr, "ERROR: Segment exceeds UCB boundary (end=0x%08X, max=0x%08X)\n",
+                   segEnd, ucbEndAddr);
+            return EXIT_USAGE_ERROR;
+        }
+        totalWriteBytes += static_cast<uint32_t>(seg.data.size());
+    }
+
+    // Check page alignment
+    for (const auto& seg : parseResult.segments) {
+        if (seg.baseAddress % DFLASH_PAGE_SIZE != 0) {
+            fprintf(stderr, "ERROR: Address 0x%08X not aligned to %u-byte page boundary\n",
+                   seg.baseAddress, DFLASH_PAGE_SIZE);
+            return EXIT_USAGE_ERROR;
+        }
+    }
+
+    printf("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    printf("  UCB:    0x%08X - 0x%08X (%u bytes)\n", ucb.baseAddress, ucbEndAddr, ucb.totalSize);
+    printf("  Write:  %u bytes (%u pages) in %zu segment(s)\n\n",
+           totalWriteBytes, totalWriteBytes / DFLASH_PAGE_SIZE, parseResult.segments.size());
+
+    // --- Write loop (no erase, direct page programming) ---
+    const uint64_t flashCmdBase = static_cast<uint64_t>(ctx.flashCfg.baseAddress);
+    uint32_t totalPages = 0;
+    for (const auto& seg : parseResult.segments) {
+        size_t paddedSize = seg.data.size();
+        if (paddedSize % DFLASH_PAGE_SIZE != 0)
+            paddedSize += DFLASH_PAGE_SIZE - (paddedSize % DFLASH_PAGE_SIZE);
+        totalPages += static_cast<uint32_t>(paddedSize) / DFLASH_PAGE_SIZE;
+    }
+    uint32_t pagesWritten = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    printf("Writing UCB:\n");
+
+    for (const auto& seg : parseResult.segments) {
+        int writeResult = writeSegmentPages(ctx.client, ctx.flashCfg.isTc3x, flashCmdBase,
+                                            seg.data, seg.baseAddress,
+                                            pagesWritten, totalPages, startTime);
+        if (writeResult != EXIT_OK) return writeResult;
+    }
+
+    printf("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
+    auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    printf("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
+
+    // --- Verify ---
+    if (doVerify) {
+        printf("\nVerifying UCB write:\n");
+        uint32_t verifyErrors = 0;
+        for (const auto& seg : parseResult.segments) {
+            uint32_t segSize = static_cast<uint32_t>(seg.data.size());
+            const uint32_t verifyChunkSize = ucb.sectorSize;
+            std::vector<uint8_t> readBuf(verifyChunkSize, 0);
+            for (uint32_t offset = 0; offset < segSize; offset += verifyChunkSize) {
+                uint32_t chunkLen = std::min(verifyChunkSize, segSize - offset);
+                uint32_t bytesRead = 0;
+                tas_return_et vret = ctx.client.read(seg.baseAddress + offset, readBuf.data(),
+                                                chunkLen, &bytesRead);
+                if (vret != TAS_ERR_NONE && vret != TAS_ERR_RW_READ) {
+                    fprintf(stderr, "  ERROR: Read failed at 0x%08X\n", seg.baseAddress + offset);
+                    return EXIT_WRITE_VERIFY_ERROR;
+                }
+                for (uint32_t i = 0; i < bytesRead && i < chunkLen; i++) {
+                    if (readBuf[i] != seg.data[offset + i]) {
+                        if (verifyErrors < 10)
+                            printf("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
+                                   seg.baseAddress + offset + i, seg.data[offset + i], readBuf[i]);
+                        verifyErrors++;
+                    }
+                }
+            }
+        }
+        if (verifyErrors > 0) {
+            printf("  FAILED: %u bytes mismatch\n", verifyErrors);
+            return EXIT_WRITE_VERIFY_ERROR;
+        }
+        printf("  PASSED: all %u bytes verified\n", totalWriteBytes);
+    }
+
+    printf("\nUCB write completed successfully.\n");
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doUcbErase - erase UCB sectors (TC3XX only, HIGH RISK)
+//********************************************************************************************************************
+
+static int doUcbErase(int argc, char** argv)
+{
+    CommonArgs args;
+    uint32_t eraseAddr = 0;
+    uint32_t numSectors = 1;  // default: 1 sector
+    bool hasAddr = false;
+    bool doVerify = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if ((strcmp(argv[i], "--addr") == 0 || strcmp(argv[i], "-a") == 0) && i + 1 < argc) {
+            if (!parseHexAddr(argv[++i], eraseAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
+            hasAddr = true; i++; continue;
+        }
+        if ((strcmp(argv[i], "--sectors") == 0 || strcmp(argv[i], "-s") == 0) && i + 1 < argc) {
+            if (sscanf(argv[++i], "%u", &numSectors) != 1 || numSectors == 0) {
+                fprintf(stderr, "ERROR: Invalid sectors\n"); return EXIT_USAGE_ERROR;
+            }
+            i++; continue;
+        }
+        if (strcmp(argv[i], "--verify") == 0 || strcmp(argv[i], "-v") == 0) {
+            doVerify = true; i++; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash ucb erase [--addr <hex>] [--sectors <n>] [--verify] [options]\n\n"
+                   "Erase UCB sectors (TC3XX only, HIGH RISK).\n\n"
+                   "WARNING: Erasing security-related UCB sectors may permanently lock the chip.\n\n"
+                   "Options:\n"
+                   "  --addr, -a <hex>     Start address (default: UCB base, auto-aligned to sector)\n"
+                   "  --sectors, -s <n>    Number of sectors to erase (decimal, default: 1)\n"
+                   "  --verify, -v         Read back and verify all bytes are 0x00\n"
+                   "  --server <ip>        TAS server IP (default: localhost)\n"
+                   "  --target <id>        Target identifier\n"
+                   "  --device <name>      Override device type (skip auto-detect)\n"
+                   "  --config-dir <path>  DeviceConfigs JSON directory\n\n"
+                   "Note: Sectors 0xAF400800-0xAF400FFF and 0xAF401800-0xAF401FFF are chip-locked and cannot be erased.\n");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+
+    printf("TAS DFlash UCB Erase Tool\n");
+    printf("=========================\n");
+    printf("WARNING: UCB erase is a HIGH-RISK operation. May permanently lock the chip.\n\n");
+
+    // --- Common initialization ---
+    ToolContext ctx("DFlashUcbErase");
+    int initResult = initTool(ctx, args, "DFlashUcbErase", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (initResult != EXIT_OK) return initResult;
+
+    // Reject TC2x
+    if (!ctx.flashCfg.isTc3x) {
+        fprintf(stderr, "ERROR: UCB commands only support TC3XX devices.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+
+    // Check UCB config valid
+    if (ctx.flashCfg.ucb.baseAddress == 0) {
+        fprintf(stderr, "ERROR: No UCB configuration found for this device.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+
+    const UCBConfig& ucb = ctx.flashCfg.ucb;
+    uint32_t ucbEndAddr = ucb.baseAddress + ucb.totalSize - 1;
+
+    // Default: UCB base address
+    if (!hasAddr) eraseAddr = ucb.baseAddress;
+
+    // Validate address within UCB range
+    if (eraseAddr < ucb.baseAddress || eraseAddr > ucbEndAddr) {
+        fprintf(stderr, "ERROR: Address 0x%08X out of UCB range (0x%08X - 0x%08X)\n",
+                eraseAddr, ucb.baseAddress, ucbEndAddr);
+        return EXIT_USAGE_ERROR;
+    }
+
+    // Auto-align address to sector boundary (sectorSize must be power of 2)
+    uint32_t alignedAddr = eraseAddr & ~(ucb.sectorSize - 1);
+    if (alignedAddr != eraseAddr) {
+        printf("  Address aligned: 0x%08X -> 0x%08X (%u-byte sector boundary)\n",
+               eraseAddr, alignedAddr, ucb.sectorSize);
+        eraseAddr = alignedAddr;
+    }
+
+    // Range check
+    uint64_t eraseBytesU64 = static_cast<uint64_t>(numSectors) * ucb.sectorSize;
+    if (eraseBytesU64 > UINT32_MAX) {
+        fprintf(stderr, "ERROR: Erase size exceeds 4GB (overflow)\n");
+        return EXIT_USAGE_ERROR;
+    }
+    uint32_t eraseSize = static_cast<uint32_t>(eraseBytesU64);
+    if (static_cast<uint64_t>(eraseAddr) + eraseSize - 1 > ucbEndAddr) {
+        fprintf(stderr, "ERROR: Range exceeds UCB boundary (end=0x%08llX, max=0x%08X)\n",
+                static_cast<unsigned long long>(eraseAddr) + eraseSize - 1, ucbEndAddr);
+        return EXIT_USAGE_ERROR;
+    }
+
+    printf("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    printf("  UCB:    0x%08X - 0x%08X (%u bytes, %u sectors of %u bytes)\n",
+           ucb.baseAddress, ucbEndAddr, ucb.totalSize, ucb.numSectors, ucb.sectorSize);
+    printf("  Erase:  0x%08X, %u sector(s) (%u bytes)\n\n",
+           eraseAddr, numSectors, eraseSize);
+
+    // --- Locked UCB regions (cannot be erased - chip-level protection) ---
+    struct LockedRegion { uint32_t start; uint32_t end; const char* name; };
+    static const LockedRegion lockedRegions[] = {
+        { 0xAF400800, 0xAF400FFF, "UCB security (OTP/DFLASH/DBG/HSM)" },
+        { 0xAF401800, 0xAF401FFF, "UCB security (reserved)" },
+    };
+
+    // Check if requested erase range overlaps any locked region
+    uint32_t eraseEnd = eraseAddr + eraseSize - 1;
+    for (const auto& locked : lockedRegions) {
+        // Overlap check: !(eraseEnd < locked.start || eraseAddr > locked.end)
+        if (!(eraseEnd < locked.start || eraseAddr > locked.end)) {
+            fprintf(stderr, "ERROR: Erase range 0x%08X-0x%08X overlaps locked region 0x%08X-0x%08X (%s)\n",
+                    eraseAddr, eraseEnd, locked.start, locked.end, locked.name);
+            fprintf(stderr, "  These sectors are chip-level protected and cannot be erased.\n");
+            return EXIT_USAGE_ERROR;
+        }
+    }
+
+    // --- High-risk warning + confirmation ---
+    printf("WARNING: UCB erase is a HIGH-RISK operation!\n");
+    printf("  Erasing security-related UCB sectors may permanently lock the chip.\n");
+    printf("  Target: 0x%08X, %u sector(s)\n", eraseAddr, numSectors);
+    printf("Type 'yes' to continue: ");
+    fflush(stdout);
+
+    char confirm[16] = {0};
+    if (!fgets(confirm, sizeof(confirm), stdin)) {
+        printf("\nAborted (no input).\n");
+        return EXIT_USAGE_ERROR;
+    }
+    // Strip trailing newline/CR
+    size_t cl = strlen(confirm);
+    while (cl > 0 && (confirm[cl - 1] == '\n' || confirm[cl - 1] == '\r')) confirm[--cl] = '\0';
+    if (strcmp(confirm, "yes") != 0) {
+        printf("Aborted by user.\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    // --- Erase sequence ---
+    const uint64_t flashCmdBase = static_cast<uint64_t>(ctx.flashCfg.baseAddress);
+
+    printf("\nStep 1/5: Clearing flash status...                ");
+    if (!clearFlashStatus(ctx.client, flashCmdBase)) {
+        printf("FAILED\n"); return EXIT_FLASH_STATUS_ERROR;
+    }
+    printf("OK\n");
+
+    printf("Step 2/5: Executing erase command...              ");
+    if (!eraseMultipleSectors(ctx.client, flashCmdBase, eraseAddr, numSectors)) {
+        printf("FAILED\n"); return EXIT_ERASE_CMD_ERROR;
+    }
+    printf("OK\n");
+
+    printf("Step 3/5: Waiting for erase to complete...        ");
+    uint32_t elapsedMs = 0;
+    if (!waitUnbusyD0(ctx.client, ctx.flashCfg.isTc3x, elapsedMs)) {
+        printf("TIMEOUT\n"); return EXIT_ERASE_TIMEOUT;
+    }
+    printf("OK (%u ms)\n", elapsedMs);
+
+    printf("Step 4/5: Checking error flags...                 ");
+    if (!checkEraseErrors(ctx.client, ctx.flashCfg.isTc3x)) { return EXIT_ERASE_FLAGS; }
+    printf("OK\n");
+
+    printf("Step 5/5: Reset to read mode...                   ");
+    if (!resetToRead(ctx.client, flashCmdBase)) {
+        printf("FAILED\n"); return EXIT_FLASH_RESET_ERROR;
+    }
+    printf("OK\n");
+
+    printf("\nErase complete: %u sector(s) at 0x%08X (%u ms)\n",
+           numSectors, eraseAddr, elapsedMs);
+
+    // --- Verify ---
+    if (doVerify) {
+        printf("\nVerifying UCB erase:\n");
+        if (!verifyErase(ctx.client, eraseAddr, numSectors, ucb.sectorSize)) {
+            printf("\nUCB erase completed with verification ERRORS.\n");
+            return EXIT_VERIFY_ERROR;
+        }
+    }
+
+    printf("\nUCB erase completed successfully.\n");
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
 //  doErase - erase DFlash sectors
 //********************************************************************************************************************
 
@@ -1748,6 +2279,19 @@ static int doErase(int argc, char** argv, bool legacyMode)
 }
 
 //********************************************************************************************************************
+//  UCB Usage
+//********************************************************************************************************************
+
+static void printUcbUsage(const char* progName) {
+    printf("Usage: %s ucb <subcommand> [options]\n\n", progName);
+    printf("Subcommands:\n");
+    printf("  read     Read UCB (User Configuration Block) content\n");
+    printf("  write    Write data to UCB (no erase, TC3XX only)\n");
+    printf("  erase    Erase UCB sectors (TC3XX only, HIGH RISK)\n\n");
+    printf("Run '%s ucb <subcommand> --help' for details.\n", progName);
+}
+
+//********************************************************************************************************************
 //  Usage
 //********************************************************************************************************************
 
@@ -1766,7 +2310,8 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
     printf("  restore  Restore DFlash from backup (erase + write + verify)\n");
     printf("  read     Read DFlash content\n");
     printf("  list     List connected TAS targets\n");
-    printf("  reset    Reset the MCU\n\n");
+    printf("  reset    Reset the MCU\n");
+    printf("  ucb      UCB (User Configuration Block) read/write (TC3XX only)\n\n");
     printf("Legacy (backward compatible):\n");
     printf("  %s <addr> <num_sectors> [options]\n", base);
     printf("  %s --all [options]\n", base);
@@ -1815,6 +2360,18 @@ int main(int argc, char** argv)
     if (first == "read"  || first == "r") return doRead(argc - 2, argv + 2);
     if (first == "list"  || first == "l") return doList(argc - 2, argv + 2);
     if (first == "reset") return doReset(argc - 2, argv + 2);
+
+    if (first == "ucb") {
+        if (argc < 3) { printUcbUsage(argv[0]); return EXIT_USAGE_ERROR; }
+        std::string ucbSub(argv[2]);
+        if (ucbSub == "read"  || ucbSub == "r") return doUcbRead(argc - 3, argv + 3);
+        if (ucbSub == "write" || ucbSub == "w") return doUcbWrite(argc - 3, argv + 3);
+        if (ucbSub == "erase" || ucbSub == "e") return doUcbErase(argc - 3, argv + 3);
+        if (ucbSub == "--help" || ucbSub == "-h") { printUcbUsage(argv[0]); return EXIT_OK; }
+        fprintf(stderr, "ERROR: Unknown ucb subcommand '%s'\n", argv[2]);
+        printUcbUsage(argv[0]);
+        return EXIT_USAGE_ERROR;
+    }
 
     // Legacy backward compatibility: --all, --info, or hex address as first arg
     if (first == "--all" || first == "--info" ||

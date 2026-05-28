@@ -167,6 +167,9 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
     uint32_t baseAddress = 0;
     uint32_t totalSize = 0;
     uint32_t sectorSize = 0;
+    uint32_t ucbBaseAddress = 0;
+    uint32_t ucbSectorSize = 0;
+    uint32_t ucbNumSectors = 0;
     bool foundDFlash = false;
 
     if (root.contains("memory") && root["memory"].is_array()) {
@@ -194,6 +197,27 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
                     } else if (ss.is_number_unsigned()) {
                         sectorSize = ss.get<uint32_t>();
                     }
+                }
+            }
+
+            // Parse UCB array if present (inside the DataFlash memory entry)
+            if (mem.contains("UCB") && mem["UCB"].is_array()) {
+                const auto& ucbArray = mem["UCB"];
+                if (!ucbArray.empty()) {
+                    // Extract baseAddress from first sector's sectorStartAddress
+                    if (ucbArray[0].contains("sectorStartAddress") && ucbArray[0]["sectorStartAddress"].is_string()) {
+                        ucbBaseAddress = hexStringToUint32(ucbArray[0]["sectorStartAddress"].get<std::string>());
+                    }
+                    // Extract sectorSize from first sector
+                    if (ucbArray[0].contains("sectorSize")) {
+                        const auto& ss = ucbArray[0]["sectorSize"];
+                        if (ss.is_string()) {
+                            ucbSectorSize = hexStringToUint32(ss.get<std::string>());
+                        } else if (ss.is_number_unsigned()) {
+                            ucbSectorSize = ss.get<uint32_t>();
+                        }
+                    }
+                    ucbNumSectors = static_cast<uint32_t>(ucbArray.size());
                 }
             }
 
@@ -243,6 +267,11 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
     // This holds true for all current TC2x/TC3x DataFlash configurations.
     // ProgramFlash may have non-uniform sectors, but DataFlash does not.
     entry.dflash.numSectors = totalSize / sectorSize;
+    // Populate UCB config (remains default zeros if JSON has no UCB array)
+    entry.dflash.ucb.baseAddress = ucbBaseAddress;
+    entry.dflash.ucb.sectorSize = ucbSectorSize;
+    entry.dflash.ucb.numSectors = ucbNumSectors;
+    entry.dflash.ucb.totalSize = ucbNumSectors * ucbSectorSize;
     entry.jtagIds = jtagIds;
 
     devices_.push_back(std::move(entry));

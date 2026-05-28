@@ -4,6 +4,13 @@
 #include <vector>
 #include <cstdint>
 
+struct UCBConfig {
+    uint32_t baseAddress = 0;   // 0xAF400000
+    uint32_t sectorSize = 0;    // 0x200 (512B)
+    uint32_t numSectors = 0;    // from JSON UCB array length
+    uint32_t totalSize = 0;     // numSectors * sectorSize
+};
+
 struct DFlashConfig {
     std::string deviceName;   // e.g. "TC27x D step"
     std::string shortName;    // e.g. "TC27x" (used for CLI matching)
@@ -13,6 +20,7 @@ struct DFlashConfig {
     uint32_t totalSize;       // DFlash total bytes
     uint32_t sectorSize;      // logical sector size
     uint32_t numSectors;      // number of sectors
+    UCBConfig ucb;            // UCB (User Configuration Block) config
 };
 
 class DeviceConfigLoader {
