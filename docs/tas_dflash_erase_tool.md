@@ -20,10 +20,12 @@
 
 ## Overview
 
-`dflash` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports four subcommands:
+`dflash` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports the following subcommands:
 
 - **erase** - Erase DFlash sectors with AURIX-compliant sequence
 - **read** - Read DFlash content and output as hex dump, binary, or Intel HEX
+- **write** - Write data to DFlash from a HEX or binary file
+- **restore** - Restore DFlash from a backup file (erase + write + verify)
 - **list** - List connected TAS targets and device info
 - **reset** - Reset the MCU (with optional halt)
 
@@ -73,6 +75,8 @@ dflash <subcommand> [options]
 |------------|----------|-------------|
 | `erase` | `e` | Erase DFlash sectors |
 | `read` | `r` | Read DFlash content |
+| `write` | `w` | Write data to DFlash |
+| `restore` | | Restore DFlash from backup |
 | `list` | `l` | List connected TAS targets |
 | `reset` | | Reset the MCU |
 
@@ -167,6 +171,83 @@ dflash read --addr 0xAF000000 --length 0x20000 --output dump.bin
 Save as Intel HEX:
 ```
 dflash read --addr 0xAF000000 --length 0x20000 --output dump.hex
+```
+
+---
+
+## `write` Subcommand
+
+```
+dflash write --file <path> [--addr <address>] [--verify] [options]
+```
+
+Write data to DFlash from a HEX or binary file.
+
+### Options
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--file <path>` | `-f` | Input file (`.hex` or `.bin`). Required. |
+| `--addr <address>` | `-a` | Base address for binary files (default: DFlash start address). Ignored for HEX files. |
+| `--verify` | | Verify written data by read-back comparison. |
+| `--server <ip>` | `-s` | TAS server IP address. Default: `localhost` |
+| `--target <id>` | `-t` | Target identifier string. Default: first available target |
+| `--device <name>` | `-d` | Device name (overrides auto-detection). |
+| `--config-dir <path>` | | Path to the `DeviceConfigs/` directory. See [DeviceConfigs Configuration](#deviceconfigs-configuration). |
+
+### Examples
+
+Write a binary file to DFlash start address:
+```
+dflash write --file data.bin
+```
+
+Write a binary file to a specific address with verification:
+```
+dflash write --file data.bin --addr 0xAF001000 --verify
+```
+
+Write an Intel HEX file (addresses embedded in file):
+```
+dflash write --file firmware.hex --verify
+```
+
+---
+
+## `restore` Subcommand
+
+```
+dflash restore --file <path> [--no-verify] [options]
+```
+
+Restore DFlash from a backup file. This command performs erase + write + verify as a single operation, providing a convenient way to restore a previously saved DFlash image.
+
+### Options
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--file <path>` | `-f` | Backup file to restore (`.bin` or `.hex`). Required. |
+| `--no-verify` | | Skip verification after restore. |
+| `--server <ip>` | `-s` | TAS server IP address. Default: `localhost` |
+| `--target <id>` | `-t` | Target identifier string. Default: first available target |
+| `--device <name>` | `-d` | Device name (overrides auto-detection). |
+| `--config-dir <path>` | | Path to the `DeviceConfigs/` directory. See [DeviceConfigs Configuration](#deviceconfigs-configuration). |
+
+### Examples
+
+Restore DFlash from a binary backup:
+```
+dflash restore --file dump.bin
+```
+
+Restore from a HEX file without verification:
+```
+dflash restore --file backup.hex --no-verify
+```
+
+Restore to a remote target:
+```
+dflash restore --file dump.bin --server 192.168.1.100
 ```
 
 ---
@@ -281,6 +362,9 @@ The auto-detected device name (from the connected target) is matched against the
 | 16 | Reset to read mode failed |
 | 17 | Verification failed (bytes not erased) |
 | 18 | Read failed (read subcommand) |
+| 19 | Write failed |
+| 20 | File open/parse failed |
+| 21 | Restore failed |
 
 ## Erase Sequence
 
@@ -334,6 +418,8 @@ The tool treats `TAS_ERR_RW_READ` as a successful read in the following operatio
 - **Verify erase** (`--verify`) - ECC errors are expected; erased data is still checked as `0x00`
 - **Backup** (`--backup <file>`) - ECC errors are tolerated; data is saved to file
 - **Read subcommand** - ECC errors are tolerated for post-erase DFlash reads
+- **Write verify** (`write --verify`) - ECC errors are tolerated during read-back verification
+- **Restore verify** - ECC errors are tolerated during post-restore verification
 
 ## Build Environment Setup
 
@@ -502,8 +588,8 @@ The build script uses CMake directly with MSVC, automatically sets C++17 and sta
 The compiled executable is located at:
 
 ```
-build/apps/tas_dflash_erase/Release/dflash.exe   (Windows, build.bat)
-build/Release/apps/tas_dflash_erase/dflash        (Linux, Conan)
+build/apps/dflash/Release/dflash.exe   (Windows, build.bat)
+build/Release/apps/dflash/dflash        (Linux, Conan)
 ```
 
 Deployed (with `build.bat --deploy`):
@@ -524,7 +610,7 @@ if (MSVC)
 endif()
 ```
 
-**MinGW** — Static libgcc/libstdc++, configured in `apps/tas_dflash_erase/CMakeLists.txt`:
+**MinGW** — Static libgcc/libstdc++, configured in `apps/dflash/CMakeLists.txt`:
 ```cmake
 if (MINGW)
     target_link_options(${EXE_NAME} PRIVATE -static -static-libgcc -static-libstdc++)

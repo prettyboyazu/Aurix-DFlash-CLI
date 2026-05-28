@@ -7,17 +7,24 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <climits>
 
 #include "nlohmann/json.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// Helper: convert hex string (e.g. "0xAF000000") to uint32_t
+// Helper: convert hex string (e.g. "0xAF000000") to uint32_t.
+// NOTE: Known limitation - values exceeding UINT32_MAX are truncated with a WARNING.
+// This is acceptable because all AURIX DFlash addresses fit in 32 bits.
 static uint32_t hexStringToUint32(const std::string& s) {
     if (s.empty()) return 0;
     try {
-        return static_cast<uint32_t>(std::stoul(s, nullptr, 0));
+        unsigned long long val = std::stoull(s, nullptr, 0);
+        if (val > UINT32_MAX) {
+            fprintf(stderr, "WARNING: hex value '%s' exceeds UINT32_MAX, truncated\n", s.c_str());
+        }
+        return static_cast<uint32_t>(val);
     } catch (const std::exception& e) {
         fprintf(stderr, "WARNING: Failed to parse hex value '%s': %s\n", s.c_str(), e.what());
         return 0;

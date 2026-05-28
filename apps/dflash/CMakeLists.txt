@@ -23,10 +23,12 @@
 set(EXE_NAME dflash)
 
 set(NO_GROUP_SRCS
-    "${CMAKE_CURRENT_SOURCE_DIR}/tas_dflash_erase_main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/dflash_main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_config_loader.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_config_loader.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tas_dflash_erase.rc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hex_parser.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hex_parser.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/dflash.rc"
 )
 
 source_group("" FILES ${NO_GROUP_SRCS})
@@ -49,7 +51,6 @@ if (MSVC)
             "NDEBUG"
         ">"
         "_CRT_SECURE_NO_WARNINGS"
-        "_WIN32"
     )
 elseif (UNIX)
     target_compile_definitions(${EXE_NAME} PRIVATE

@@ -20,7 +20,40 @@
 [![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/Infineon/tas_client_api/commits/master/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/Infineon/tas_client_api/pulls)
 
-This readme file gives an overview how to build and run the code. 
+This repository contains the TAS Client API source code and the **`dflash`** command-line tool for accessing DFlash on Infineon AURIX microcontrollers.
+
+## dflash Tool
+
+`dflash` provides the following operations on TC2x/TC3x AURIX DFlash memory:
+
+| Command | Description |
+|---------|-------------|
+| `dflash erase` | Erase DFlash sectors with AURIX-compliant sequence |
+| `dflash read` | Read DFlash content (hex dump, binary, or Intel HEX output) |
+| `dflash write` | Write data to DFlash from a HEX or binary file |
+| `dflash restore` | Restore DFlash from a backup file (erase + write + verify) |
+| `dflash reset` | Reset the MCU (with optional halt) |
+
+For full documentation see [docs/tas_dflash_erase_tool.md](docs/tas_dflash_erase_tool.md).
+
+### Quick Examples
+
+```bash
+# Erase entire DFlash with backup and verification
+dflash erase --all --backup dump.bin --verify
+
+# Read DFlash content to a binary file
+dflash read --addr 0xAF000000 --length 0x20000 --output dump.bin
+
+# Write a binary file to DFlash
+dflash write --file data.bin --verify
+
+# Restore DFlash from a backup
+dflash restore --file dump.bin
+
+# Reset the MCU
+dflash reset
+```
 
 ## Prerequisite for building locally
 This project uses [conan](https://conan.io) as dependency manager and consequently CMake as the build environment.
@@ -59,7 +92,7 @@ First generate the build environment by invoking conan **from the root of this r
 conan install .
 conan install . -s build_type=Debug --build=missing
 ```
-The above step configures the environment in way that only the C++ API will be build. If you want to build the python 
+The above step configures the environment in way that only the C++ API will be built. If you want to build the python 
 wrapper, the API reference, and/or the tests then you need to specify this by providing an option to the above commands.
 See the conanfile.py for available options.
 ```
@@ -110,10 +143,27 @@ conan build .
 ```
 
 ## Building using a build script
-Alternative you can use the CI build script for building the project. For available options run the script with the help
-flag (-h/--help). Build the project by invoking the CI build script with required options.
+Alternatively you can use the build script for a quick standalone build (Windows, MSVC):
 
-Note: if build of docs is enabled the generated files will be saved under current user home directory.
+**Windows**
+```
+build.bat                    Build Release
+build.bat --deploy           Build Release + deploy dflash.exe to Erase/
+build.bat --all              Clean + Build Release + deploy
+```
+
+The compiled `dflash.exe` is located at:
+```
+build/apps/dflash/Release/dflash.exe
+```
+
+Deployed (with `build.bat --deploy`):
+```
+Erase/dflash.exe
+Erase/DeviceConfigs/*.json
+```
+
+For the CI build script with more options:
 
 **Windows**
 ```

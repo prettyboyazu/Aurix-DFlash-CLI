@@ -74,7 +74,7 @@ include(CTest)
 
 add_subdirectory(apps/tas_rw_api_demo)
 add_subdirectory(apps/tas_chl_api_demo)
-add_subdirectory(apps/tas_dflash_erase)
+add_subdirectory(apps/dflash)
 add_subdirectory(python)
 add_subdirectory(src)
 add_subdirectory(docs)
