@@ -16,15 +16,16 @@
  See the License for the specific language governing permissions and
  limitations under the License.
  ****************************************************************************************************************-->
-# TAS DFlash Tool {#tas_dflash_erase_tool}
+# TAS DFlash Tool {#tas_dflash_tool}
 
 ## Overview
 
-`tas_dflash_erase` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports three subcommands:
+`dflash` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports four subcommands:
 
 - **erase** - Erase DFlash sectors with AURIX-compliant sequence
 - **read** - Read DFlash content and output as hex dump, binary, or Intel HEX
 - **list** - List connected TAS targets and device info
+- **reset** - Reset the MCU (with optional halt)
 
 The tool connects to a TAS server, auto-detects the connected MCU, and performs device-specific register access (TC2x uses PMU `FLASH0_FSR`, TC3x uses DMU `DMU_HF_STATUS`/`DMU_HF_ERRSR`).
 
@@ -50,6 +51,8 @@ Typical DFlash parameters (loaded from JSON, sample values):
 
 DFlash base address for TC2x/TC3x is `0xAF000000` (also loaded from the JSON files). AURIX DFlash erased state is `0x00` (all bits zero).
 
+> **Note:** TC4x (AURIX 2G+) devices are **not supported**. TC4x uses different DFlash base addresses (`0xAE000000`/`0xAC000000`) and a different erase command sequence. If a TC4x device is detected, the tool will display an error message and exit.
+
 To add support for an additional device, drop the corresponding `<Device>_<step>.json` file into the `DeviceConfigs/` directory — no source-code change or rebuild is required.
 
 ## Prerequisites
@@ -61,7 +64,7 @@ To add support for an additional device, drop the corresponding `<Device>_<step>
 ## Usage
 
 ```
-tas_dflash_erase <subcommand> [options]
+dflash <subcommand> [options]
 ```
 
 ### Subcommands
@@ -71,15 +74,16 @@ tas_dflash_erase <subcommand> [options]
 | `erase` | `e` | Erase DFlash sectors |
 | `read` | `r` | Read DFlash content |
 | `list` | `l` | List connected TAS targets |
+| `reset` | | Reset the MCU |
 
 ### Legacy Mode (backward compatible)
 
 The tool supports the original positional-argument syntax, automatically routed to `erase`:
 
 ```
-tas_dflash_erase <addr> <num_sectors> [options]
-tas_dflash_erase --all [options]
-tas_dflash_erase --info [options]
+dflash <addr> <num_sectors> [options]
+dflash --all [options]
+dflash --info [options]
 ```
 
 ---
@@ -87,7 +91,7 @@ tas_dflash_erase --info [options]
 ## `erase` Subcommand
 
 ```
-tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]
+dflash erase [--addr <hex> --sectors <n> | --all] [options]
 ```
 
 ### Options
@@ -110,23 +114,23 @@ tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]
 
 Show device info:
 ```
-tas_dflash_erase erase --info
+dflash erase --info
 ```
 
 Erase a single sector with verification:
 ```
-tas_dflash_erase erase --addr 0xAF000000 --sectors 1 --verify
+dflash erase --addr 0xAF000000 --sectors 1 --verify
 ```
 
 Erase entire DFlash with backup, verify, and MCU reset:
 ```
-tas_dflash_erase erase --all --backup dump.bin --verify --reset
+dflash erase --all --backup dump.bin --verify --reset
 ```
 
 Legacy syntax (still supported):
 ```
-tas_dflash_erase 0xAF000000 1 --verify
-tas_dflash_erase --all --verify
+dflash 0xAF000000 1 --verify
+dflash --all --verify
 ```
 
 ---
@@ -134,7 +138,7 @@ tas_dflash_erase --all --verify
 ## `read` Subcommand
 
 ```
-tas_dflash_erase read --addr <hex> --length <hex> [--output <file>] [options]
+dflash read --addr <hex> --length <hex> [--output <file>] [options]
 ```
 
 ### Options
@@ -152,17 +156,17 @@ tas_dflash_erase read --addr <hex> --length <hex> [--output <file>] [options]
 
 Hex dump to terminal:
 ```
-tas_dflash_erase read --addr 0xAF000000 --length 0x1000
+dflash read --addr 0xAF000000 --length 0x1000
 ```
 
 Save as raw binary:
 ```
-tas_dflash_erase read --addr 0xAF000000 --length 0x20000 --output dump.bin
+dflash read --addr 0xAF000000 --length 0x20000 --output dump.bin
 ```
 
 Save as Intel HEX:
 ```
-tas_dflash_erase read --addr 0xAF000000 --length 0x20000 --output dump.hex
+dflash read --addr 0xAF000000 --length 0x20000 --output dump.hex
 ```
 
 ---
@@ -170,7 +174,7 @@ tas_dflash_erase read --addr 0xAF000000 --length 0x20000 --output dump.hex
 ## `list` Subcommand
 
 ```
-tas_dflash_erase list [--server <ip>]
+dflash list [--server <ip>]
 ```
 
 Lists all targets connected to the TAS server, showing device type and identifier string. Does not require session start or device connect.
@@ -178,7 +182,7 @@ Lists all targets connected to the TAS server, showing device type and identifie
 ### Example
 
 ```
-tas_dflash_erase list
+dflash list
 ```
 
 Output:
@@ -189,6 +193,36 @@ Connecting to TAS server at localhost...
   Server: TasServer V2.0 (Aug  7 2025)
   Targets (1):
   [0] TC36x          Application Kit TC367 V2.0
+```
+
+---
+
+## `reset` Subcommand
+
+```
+dflash reset [--halt] [--server <ip>] [--target <id>]
+```
+
+Resets the MCU. By default, the MCU resumes normal execution after reset. Use `--halt` to halt the CPU after reset (useful for debugging or before performing flash operations).
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--halt` | Halt the CPU after reset (reset and halt mode). |
+| `--server <ip>` | TAS server IP address. Default: `localhost` |
+| `--target <id>` | Target identifier string. Default: first available target |
+
+### Examples
+
+Reset MCU and resume execution:
+```
+dflash reset
+```
+
+Reset and halt MCU:
+```
+dflash reset --halt
 ```
 
 ---
@@ -216,7 +250,7 @@ The shipped `*.json` files originate from Infineon's **AURIXFlasherSoftwareTool 
 
 To add support for a new TC2x/TC3x device:
 
-1. Obtain the device's JSON file from AURIXFlasherSoftwareTool's `DeviceConfigs/` directory (e.g. `TC4xx_A_step.json`).
+1. Obtain the device's JSON file from AURIXFlasherSoftwareTool's `DeviceConfigs/` directory (e.g. `TC37x_A_step.json`).
 2. Drop the file into the `DeviceConfigs/` directory the tool is using (see search-path priority above).
 3. Re-run the tool — no rebuild and no source change is needed.
 
@@ -449,51 +483,55 @@ cmake --build --preset conan-release
 cmake --build --preset conan-release
 ```
 
-### Method 2: Build Script
+### Method 2: Build Script (Windows)
 
-```powershell
-# Windows
-python tools\build.py
+For quick standalone builds without Conan:
 
-# Linux
-python3 tools/build.py
+```cmd
+build.bat                    Build Release
+build.bat --deploy           Build Release + deploy to Erase/
+build.bat --all              Clean + Build Release + deploy
+build.bat --debug --deploy   Build Debug + deploy
+build.bat --clean            Clean and rebuild
 ```
 
-Options:
-```
--c release|debug|all    Build configuration (default: release)
--p, --python            Build Python wrapper
--d, --docs              Build API documentation
--t, --tests             Build test executables
-```
+The build script uses CMake directly with MSVC, automatically sets C++17 and static CRT linking. Conan is not required for this method.
 
 ### Build Output
 
 The compiled executable is located at:
 
 ```
-build/Release/apps/tas_dflash_erase/tas_dflash_erase.exe   (Windows)
-build/Release/apps/tas_dflash_erase/tas_dflash_erase       (Linux)
+build/apps/tas_dflash_erase/Release/dflash.exe   (Windows, build.bat)
+build/Release/apps/tas_dflash_erase/dflash        (Linux, Conan)
 ```
 
-Other build artifacts:
+Deployed (with `build.bat --deploy`):
 ```
-build/Release/apps/tas_rw_api_demo/tas_rw_api_demo.exe     # RW API demo
-build/Release/apps/tas_chl_api_demo/tas_chl_api_demo.exe   # Channel API demo
-build/Release/src/tas_client/libtas_client.a                # Static library
-build/Release/src/tas_socket/libtas_socket.a                # Socket library
+Erase/dflash.exe                                  # Standalone executable
+Erase/DeviceConfigs/*.json                        # Device configuration files
 ```
 
-### Static Linking (Windows MinGW)
+### Static Linking
 
-The tool uses static linking to eliminate DLL dependencies, so the `.exe` can run standalone on any Windows machine without requiring MinGW runtime DLLs (`libwinpthread-1.dll`, `libgcc_s_seh-1.dll`, `libstdc++-6.dll`).
+The tool uses static linking to eliminate all runtime DLL dependencies, producing a standalone `.exe` that runs on any Windows 10+ machine without additional installations.
 
-This is configured in `apps/tas_dflash_erase/CMakeLists.txt`:
+**MSVC** — Static CRT (`/MT`), configured globally in the root `CMakeLists.txt`:
+```cmake
+# Static CRT linking (MSVC): produce standalone exe without VCRUNTIME DLL dependency
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+```
+
+**MinGW** — Static libgcc/libstdc++, configured in `apps/tas_dflash_erase/CMakeLists.txt`:
 ```cmake
 if (MINGW)
     target_link_options(${EXE_NAME} PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 ```
+
+The resulting `dflash.exe` depends only on Windows system DLLs (`KERNEL32.dll`, `WS2_32.dll`, `SHELL32.dll`, `ADVAPI32.dll`) — no VC++ Redistributable or MinGW DLLs required.
 
 ### Troubleshooting
 

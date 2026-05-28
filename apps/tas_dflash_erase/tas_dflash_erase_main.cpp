@@ -19,7 +19,7 @@
 
 //********************************************************************************************************************
 //  TAS DFlash Tool for AURIX
-//  Subcommands: erase, read, list
+//  Subcommands: erase, read, list, reset
 //  Device configurations are loaded at runtime from JSON files (DeviceConfigs/).
 //********************************************************************************************************************
 
@@ -46,6 +46,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 //********************************************************************************************************************
@@ -87,8 +89,51 @@ static constexpr uint32_t FLASH_VAL_RESET_READ    = 0xF0;
 
 static constexpr uint32_t DFLASH_ERASED_BYTE      = 0x00u;
 
+//********************************************************************************************************************
+//  Exit/error codes (consistent across all subcommands)
+//********************************************************************************************************************
+
+static constexpr int EXIT_OK                 = 0;
+static constexpr int EXIT_USAGE_ERROR        = 1;   // Bad arguments / usage
+static constexpr int EXIT_SERVER_ERROR       = 2;   // Cannot connect to TAS server
+static constexpr int EXIT_TARGET_ERROR       = 3;   // Cannot query targets
+static constexpr int EXIT_NO_TARGET          = 4;   // No targets found
+static constexpr int EXIT_SESSION_ERROR      = 5;   // Session start failed
+static constexpr int EXIT_CONNECT_ERROR      = 6;   // Device connect failed
+static constexpr int EXIT_DEVICE_ERROR       = 7;   // Device not supported / not found in config
+static constexpr int EXIT_BACKUP_ERROR       = 8;   // Backup failed
+static constexpr int EXIT_WDTPW_ERROR        = 9;   // Safety Watchdog password read failed
+static constexpr int EXIT_ENDINIT_CLR_ERROR  = 10;  // Clear Safety EndInit failed
+static constexpr int EXIT_FLASH_STATUS_ERROR = 11;  // Flash status clear failed
+static constexpr int EXIT_ERASE_CMD_ERROR    = 12;  // Erase command failed
+static constexpr int EXIT_ENDINIT_SET_ERROR  = 13;  // Restore Safety EndInit failed
+static constexpr int EXIT_ERASE_TIMEOUT      = 14;  // Erase timeout
+static constexpr int EXIT_ERASE_FLAGS        = 15;  // Error flags detected
+static constexpr int EXIT_FLASH_RESET_ERROR  = 16;  // Reset to read mode failed
+static constexpr int EXIT_VERIFY_ERROR       = 17;  // Verification failed
+static constexpr int EXIT_IO_ERROR           = 18;  // File I/O error
+
 static constexpr uint32_t WAIT_UNBUSY_TIMEOUT_MS  = 10000;
 static constexpr uint32_t POLL_INTERVAL_MS         = 10;
+
+//********************************************************************************************************************
+//  TC4x rejection helper (TC4x has different DFlash base addresses and erase command sequence)
+//********************************************************************************************************************
+
+// Check if device is unsupported TC4x, print error and return EXIT_DEVICE_ERROR if so.
+// Returns EXIT_OK if device is OK (not TC4x), or EXIT_DEVICE_ERROR if TC4x detected.
+static int rejectTc4xDevice(const tas_con_info_st* conInfo)
+{
+    if (tas_df_check_if_tc4x(conInfo->device_type)) {
+        fprintf(stderr, "ERROR: TC4x devices are not supported by this tool.\n");
+        fprintf(stderr, "  Detected: %s (jtag_id=0x%08X)\n",
+               tas_get_device_name_str(conInfo->device_type), conInfo->device_type);
+        fprintf(stderr, "  TC4x uses different DFlash base addresses (0xAE000000/0xAC000000)\n");
+        fprintf(stderr, "  and requires a different erase command sequence.\n");
+        return EXIT_DEVICE_ERROR;
+    }
+    return EXIT_OK;
+}
 
 //********************************************************************************************************************
 //  Register read/write wrappers
@@ -144,6 +189,27 @@ static std::string findConfigDir(const char* userSpecified)
         candidate = exeDir / ".." / ".." / ".." / ".." / "data" / "DeviceConfigs";
         if (fs::is_directory(candidate, ec)) return fs::weakly_canonical(candidate, ec).string();
     }
+#elif defined(__linux__)
+    // Linux: resolve exe path via /proc/self/exe
+    // Note: macOS would use _NSGetExecutablePath(), FreeBSD uses /proc/curproc/file
+    // Currently only Linux is supported for non-Windows platforms.
+    std::error_code ec;
+    fs::path exeLink = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        fs::path exeDir = exeLink.parent_path();
+
+        // exe/DeviceConfigs/
+        fs::path candidate = exeDir / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return candidate.string();
+
+        // exe/../data/DeviceConfigs/ (developer layout)
+        candidate = exeDir / ".." / "data" / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return fs::weakly_canonical(candidate, ec).string();
+
+        // exe/../../../data/DeviceConfigs/ (build layout)
+        candidate = exeDir / ".." / ".." / ".." / "data" / "DeviceConfigs";
+        if (fs::is_directory(candidate, ec)) return fs::weakly_canonical(candidate, ec).string();
+    }
 #endif
 
     // 3. Environment variable TAS_DEVICE_CONFIGS
@@ -166,7 +232,11 @@ static std::string findConfigDir(const char* userSpecified)
 
 static tas_return_et startSession(CTasClientRw& client, const char* targetId, const char* defaultSessionName)
 {
+#ifdef _WIN32
     std::string sessionName = std::string(defaultSessionName) + "_" + std::to_string(GetCurrentProcessId());
+#else
+    std::string sessionName = std::string(defaultSessionName) + "_" + std::to_string(getpid());
+#endif
 
     // Try with our own session name first
     tas_return_et ret = client.session_start(targetId, sessionName.c_str());
@@ -180,6 +250,7 @@ static tas_return_et startSession(CTasClientRw& client, const char* targetId, co
     tas_return_et qr = client.get_target_clients(targetId, &existingSessionName, &sessionStartTime, &clientInfo, &numClients);
     if (qr == TAS_ERR_NONE && existingSessionName && existingSessionName[0] != '\0') {
         printf("  Reconnecting to existing session '%s'...\n", existingSessionName);
+        printf("  WARNING: Taking over an existing session. Other tools using this session may be affected.\n");
         return client.session_start(targetId, existingSessionName);
     }
 
@@ -285,7 +356,8 @@ static bool checkEraseErrors(CTasClientRw& client, bool isTc3x)
 
 static bool verifyErase(CTasClientRw& client, uint32_t startAddr, uint32_t numSectors, uint32_t sectorSize)
 {
-    const uint32_t totalBytes = numSectors * sectorSize;
+    // Overflow protection (theoretical: DFlash max 1MB, uint32_t max 4GB - always safe)
+    const uint32_t totalBytes = static_cast<uint32_t>(static_cast<uint64_t>(numSectors) * sectorSize);
     const uint32_t chunkSize = sectorSize;
     std::vector<uint8_t> buf(chunkSize, 0);
     uint32_t totalErrors = 0;
@@ -437,11 +509,8 @@ static bool saveToIntelHex(const char* filePath, uint32_t baseAddr,
 
 static bool parseHexAddr(const char* s, uint32_t& val)
 {
-    if (sscanf(s, "%x", &val) == 1) return true;
-    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        return sscanf(s + 2, "%x", &val) == 1;
-    }
-    return false;
+    // sscanf with %x handles both "AF000000" and "0xAF000000" formats
+    return sscanf(s, "%x", &val) == 1;
 }
 
 //********************************************************************************************************************
@@ -528,13 +597,13 @@ static int doList(int argc, char** argv)
         int consumed = parseCommonOption(argc, argv, i, args);
         if (consumed > 0) { i += consumed; continue; }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: tas_dflash_erase list [options]\n"
+            printf("Usage: dflash list [options]\n"
                    "  --server <ip>       TAS server IP (default: localhost)\n"
                    "  --target <id>       Target identifier\n");
-            return 0;
+            return EXIT_OK;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
 
     printf("TAS DFlash Tool - Device List\n");
@@ -543,7 +612,7 @@ static int doList(int argc, char** argv)
 
     CTasClientRw client("DFlashList");
     tas_return_et ret = client.server_connect(args.serverIp);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 2; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR; }
 
     const tas_server_info_st* si = client.get_server_info();
     printf("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
@@ -551,7 +620,7 @@ static int doList(int argc, char** argv)
     const tas_target_info_st* targets;
     uint32_t numTargets;
     ret = client.get_targets(&targets, &numTargets);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 3; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR; }
 
     printf("  Targets (%u):\n", numTargets);
     for (uint32_t i = 0; i < numTargets; i++) {
@@ -560,7 +629,71 @@ static int doList(int argc, char** argv)
                targets[i].identifier);
     }
     if (numTargets == 0) printf("  No targets found.\n");
-    return 0;
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doReset - reset the MCU
+//********************************************************************************************************************
+
+static int doReset(int argc, char** argv)
+{
+    CommonArgs args;
+    bool halt = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--halt") == 0) { halt = true; i++; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash reset [options]\n\n"
+                   "Options:\n"
+                   "  --halt              Reset and halt (default: reset and run)\n"
+                   "  --server <ip>       TAS server IP (default: localhost)\n"
+                   "  --target <id>       Target identifier\n");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+
+    printf("TAS DFlash Tool - MCU Reset\n");
+    printf("===========================\n");
+    printf("Connecting to TAS server at %s...\n", args.serverIp);
+
+    CTasClientRw client("DFlashReset");
+    tas_return_et ret = client.server_connect(args.serverIp);
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR; }
+
+    const tas_server_info_st* si = client.get_server_info();
+    printf("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
+
+    const tas_target_info_st* targets;
+    uint32_t numTargets;
+    ret = client.get_targets(&targets, &numTargets);
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR; }
+
+    if (numTargets == 0) { fprintf(stderr, "ERROR: No targets found\n"); return EXIT_NO_TARGET; }
+
+    const char* selectedTargetId = (args.targetId != nullptr) ? args.targetId : targets[0].identifier;
+    if (args.targetId == nullptr) {
+        printf("  Target: [0] %s (%s)\n",
+               tas_get_device_name_str(targets[0].device_type), targets[0].identifier);
+    }
+
+    ret = startSession(client, selectedTargetId, "DFlashReset");
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SESSION_ERROR; }
+
+    tas_clnt_dco_et dco = halt ? TAS_CLNT_DCO_RESET_AND_HALT : TAS_CLNT_DCO_RESET;
+    printf("Resetting MCU (%s)...\n", halt ? "reset and halt" : "reset and run");
+    ret = client.device_connect(dco);
+    if (ret != TAS_ERR_NONE) {
+        fprintf(stderr, "ERROR: Reset failed: %s\n", client.get_error_info());
+        return EXIT_CONNECT_ERROR;
+    }
+
+    printf("  MCU reset successful.%s\n", halt ? " Device is halted." : " Normal execution resumed.");
+    return EXIT_OK;
 }
 
 //********************************************************************************************************************
@@ -580,18 +713,18 @@ static int doRead(int argc, char** argv)
         int consumed = parseCommonOption(argc, argv, i, args);
         if (consumed > 0) { i += consumed; continue; }
         if ((strcmp(argv[i], "--addr") == 0 || strcmp(argv[i], "-a") == 0) && i + 1 < argc) {
-            if (!parseHexAddr(argv[++i], readAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return 1; }
+            if (!parseHexAddr(argv[++i], readAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
             hasAddr = true; i++; continue;
         }
         if ((strcmp(argv[i], "--length") == 0 || strcmp(argv[i], "-l") == 0) && i + 1 < argc) {
-            if (!parseHexAddr(argv[++i], readLength) || readLength == 0) { fprintf(stderr, "ERROR: Invalid length\n"); return 1; }
+            if (!parseHexAddr(argv[++i], readLength) || readLength == 0) { fprintf(stderr, "ERROR: Invalid length\n"); return EXIT_USAGE_ERROR; }
             hasLength = true; i++; continue;
         }
         if ((strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
             outputFile = argv[++i]; i++; continue;
         }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: tas_dflash_erase read --addr <hex> --length <hex> [options]\n\n"
+            printf("Usage: dflash read --addr <hex> --length <hex> [options]\n\n"
                    "Options:\n"
                    "  --addr/-a <hex>     Start address (required)\n"
                    "  --length/-l <hex>   Length in bytes (required)\n"
@@ -601,19 +734,19 @@ static int doRead(int argc, char** argv)
                    "  --device <name>     Override device type (skip auto-detect)\n"
                    "  --config-dir <path> DeviceConfigs JSON directory\n\n"
                    "Examples:\n"
-                   "  tas_dflash_erase read -a AF000000 -l 100\n"
-                   "  tas_dflash_erase read -a AF000000 -l 1000 -o dump.hex\n"
-                   "  tas_dflash_erase read -a AF000000 -l 400 --device TC27x\n\n"
-                   "Run 'tas_dflash_erase erase --info' to see supported devices.\n");
-            return 0;
+                   "  dflash read -a AF000000 -l 100\n"
+                   "  dflash read -a AF000000 -l 1000 -o dump.hex\n"
+                   "  dflash read -a AF000000 -l 400 --device TC27x\n\n"
+                   "Run 'dflash erase --info' to see supported devices.\n");
+            return EXIT_OK;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
 
     if (!hasAddr || !hasLength) {
         fprintf(stderr, "ERROR: --addr and --length are required\n");
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
 
     printf("TAS DFlash Read Tool\n");
@@ -622,38 +755,42 @@ static int doRead(int argc, char** argv)
     // ---- Load device configs ----
     DeviceConfigLoader configLoader;
     std::string configDirPath;
-    if (!loadDeviceConfigs(args, configLoader, configDirPath)) return 1;
+    if (!loadDeviceConfigs(args, configLoader, configDirPath)) return EXIT_USAGE_ERROR;
 
     printf("Connecting to TAS server at %s...\n", args.serverIp);
 
     CTasClientRw client("DFlashRead");
     tas_return_et ret = client.server_connect(args.serverIp);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 2; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR; }
 
     const tas_target_info_st* targets;
     uint32_t numTargets;
     ret = client.get_targets(&targets, &numTargets);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 3; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR; }
 
     const char* selectedTargetId = (args.targetId != nullptr) ? args.targetId
                                    : (numTargets > 0) ? targets[0].identifier : nullptr;
-    if (!selectedTargetId) { fprintf(stderr, "ERROR: No targets\n"); return 4; }
+    if (!selectedTargetId) { fprintf(stderr, "ERROR: No targets\n"); return EXIT_NO_TARGET; }
     if (args.targetId == nullptr) printf("  Auto-selected target [0]\n");
 
     ret = startSession(client, selectedTargetId, "DFlashRead");
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 5; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SESSION_ERROR; }
 
     ret = client.device_connect(TAS_CLNT_DCO_RESET_AND_HALT);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 6; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_CONNECT_ERROR; }
 
     const tas_con_info_st* conInfo = client.get_con_info();
     DFlashConfig flashCfg;
+
+    // Check for unsupported TC4x devices
+    int tc4xCheck = rejectTc4xDevice(conInfo);
+    if (tc4xCheck != EXIT_OK) return tc4xCheck;
 
     if (args.deviceName != nullptr) {
         if (!configLoader.findByName(args.deviceName, flashCfg)) {
             fprintf(stderr, "ERROR: Unknown device '%s'\n", args.deviceName);
             printSupportedDevices(configLoader);
-            return 7;
+            return EXIT_DEVICE_ERROR;
         }
         printf("  Device (manual): %s\n", args.deviceName);
     } else {
@@ -661,7 +798,7 @@ static int doRead(int argc, char** argv)
             fprintf(stderr, "ERROR: Unsupported device '%s' (jtag_id=0x%08X)\n",
                    tas_get_device_name_str(conInfo->device_type), conInfo->device_type);
             printSupportedDevices(configLoader);
-            return 7;
+            return EXIT_DEVICE_ERROR;
         }
     }
 
@@ -669,11 +806,11 @@ static int doRead(int argc, char** argv)
     if (readAddr < flashCfg.baseAddress || readAddr > dflashEndAddr) {
         fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range (0x%08X - 0x%08X)\n",
                 readAddr, flashCfg.baseAddress, dflashEndAddr);
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
     if (readAddr + readLength - 1 > dflashEndAddr) {
         fprintf(stderr, "ERROR: Range exceeds DFlash boundary (max 0x%08X)\n", dflashEndAddr);
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
 
     const char* displayName = args.deviceName ? args.deviceName : flashCfg.deviceName.c_str();
@@ -693,7 +830,7 @@ static int doRead(int argc, char** argv)
         tas_return_et r = client.read(readAddr + offset, allData.data() + offset, thisChunk, &bytesRead);
         if (r != TAS_ERR_NONE && r != TAS_ERR_RW_READ) {
             fprintf(stderr, "ERROR: Read failed at 0x%08X: %s\n", readAddr + offset, client.get_error_info());
-            return 18;
+            return EXIT_IO_ERROR;
         }
         totalRead += bytesRead;
         printf("  Read %u/%u bytes\r", totalRead, readLength);
@@ -706,11 +843,11 @@ static int doRead(int argc, char** argv)
         std::string path(outputFile);
         bool isHex = (path.size() >= 4 && path.compare(path.size() - 4, 4, ".hex") == 0);
         if (isHex) {
-            if (!saveToIntelHex(outputFile, readAddr, allData)) return 1;
+            if (!saveToIntelHex(outputFile, readAddr, allData)) return EXIT_IO_ERROR;
             printf("  Saved Intel HEX: %s\n", outputFile);
         } else {
             std::ofstream ofs(outputFile, std::ios::binary);
-            if (!ofs) { fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile); return 1; }
+            if (!ofs) { fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile); return EXIT_IO_ERROR; }
             ofs.write(reinterpret_cast<const char*>(allData.data()), totalRead);
             printf("  Saved binary: %s (%u bytes)\n", outputFile, totalRead);
         }
@@ -719,7 +856,7 @@ static int doRead(int argc, char** argv)
         hexDumpXxd(allData.data(), totalRead, readAddr);
     }
 
-    return 0;
+    return EXIT_OK;
 }
 
 //********************************************************************************************************************
@@ -746,9 +883,9 @@ static int doErase(int argc, char** argv, bool legacyMode)
         } else if (strcmp(argv[0], "--info") == 0) {
             infoOnly = true;
         } else {
-            if (argc < 2) { printf("ERROR: Missing num_sectors\n"); return 1; }
-            if (!parseHexAddr(argv[0], sectorAddr)) { printf("ERROR: Invalid address\n"); return 1; }
-            if (sscanf(argv[1], "%u", &numSectors) != 1 || numSectors == 0) { printf("ERROR: Invalid sectors\n"); return 1; }
+            if (argc < 2) { printf("ERROR: Missing num_sectors\n"); return EXIT_USAGE_ERROR; }
+            if (!parseHexAddr(argv[0], sectorAddr)) { printf("ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
+            if (sscanf(argv[1], "%u", &numSectors) != 1 || numSectors == 0) { printf("ERROR: Invalid sectors\n"); return EXIT_USAGE_ERROR; }
             hasAddr = true;
         }
         // Parse options from appropriate offset
@@ -763,7 +900,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
             if (strcmp(argv[i], "--all") == 0) { eraseAll = true; i++; continue; }
             if (strcmp(argv[i], "--info") == 0) { infoOnly = true; i++; continue; }
             fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
-            return 1;
+            return EXIT_USAGE_ERROR;
         }
     } else {
         // Subcommand mode
@@ -777,15 +914,15 @@ static int doErase(int argc, char** argv, bool legacyMode)
             if (strcmp(argv[i], "--no-reset") == 0) { noReset = true; i++; continue; }
             if (strcmp(argv[i], "--reset") == 0) { doReset = true; i++; continue; }
             if (strcmp(argv[i], "--addr") == 0 && i + 1 < argc) {
-                if (!parseHexAddr(argv[++i], sectorAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return 1; }
+                if (!parseHexAddr(argv[++i], sectorAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
                 hasAddr = true; i++; continue;
             }
             if (strcmp(argv[i], "--sectors") == 0 && i + 1 < argc) {
-                if (sscanf(argv[++i], "%u", &numSectors) != 1 || numSectors == 0) { fprintf(stderr, "ERROR: Invalid sectors\n"); return 1; }
+                if (sscanf(argv[++i], "%u", &numSectors) != 1 || numSectors == 0) { fprintf(stderr, "ERROR: Invalid sectors\n"); return EXIT_USAGE_ERROR; }
                 i++; continue;
             }
             if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-                printf("Usage: tas_dflash_erase erase [--addr <hex> --sectors <n> | --all] [options]\n\n"
+                printf("Usage: dflash erase [--addr <hex> --sectors <n> | --all] [options]\n\n"
                        "Options:\n"
                        "  --addr <hex>       DFlash start address, auto-aligned to sector\n"
                        "  --sectors <n>      Number of sectors to erase\n"
@@ -800,21 +937,21 @@ static int doErase(int argc, char** argv, bool legacyMode)
                        "  --device <name>    Override device type (skip auto-detect)\n"
                        "  --config-dir <path> DeviceConfigs JSON directory\n\n"
                        "Examples:\n"
-                       "  tas_dflash_erase erase --addr AF000000 --sectors 1\n"
-                       "  tas_dflash_erase erase --addr AF000000 --sectors 4 --verify\n"
-                       "  tas_dflash_erase erase --all --backup backup.hex\n"
-                       "  tas_dflash_erase erase --info --device TC27x\n\n"
+                       "  dflash erase --addr AF000000 --sectors 1\n"
+                       "  dflash erase --addr AF000000 --sectors 4 --verify\n"
+                       "  dflash erase --all --backup backup.hex\n"
+                       "  dflash erase --info --device TC27x\n\n"
                        "Run with --info to see supported devices.\n");
-                return 0;
+                return EXIT_OK;
             }
             fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
-            return 1;
+            return EXIT_USAGE_ERROR;
         }
     }
 
     if (!infoOnly && !eraseAll && !hasAddr) {
         fprintf(stderr, "ERROR: Specify --addr + --sectors, --all, or --info\n");
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
 
     printf("TAS DFlash Erase Tool\n");
@@ -823,14 +960,14 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // ---- Load device configs ----
     DeviceConfigLoader configLoader;
     std::string configDirPath;
-    if (!loadDeviceConfigs(args, configLoader, configDirPath)) return 1;
+    if (!loadDeviceConfigs(args, configLoader, configDirPath)) return EXIT_USAGE_ERROR;
 
     // ---- Connect to server ----
     printf("Connecting to TAS server at %s...\n", args.serverIp);
     CTasClientRw client("DFlashErase");
 
     tas_return_et ret = client.server_connect(args.serverIp);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 2; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR; }
 
     const tas_server_info_st* serverInfo = client.get_server_info();
     printf("  Server: %s V%d.%d (%s)\n",
@@ -840,7 +977,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
     const tas_target_info_st* targets;
     uint32_t numTargets;
     ret = client.get_targets(&targets, &numTargets);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 3; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR; }
 
     printf("  Targets: %u\n", numTargets);
     for (uint32_t i = 0; i < numTargets; i++) {
@@ -849,28 +986,32 @@ static int doErase(int argc, char** argv, bool legacyMode)
 
     const char* selectedTargetId = (args.targetId != nullptr) ? args.targetId
                                  : (numTargets > 0) ? targets[0].identifier : nullptr;
-    if (!selectedTargetId) { fprintf(stderr, "ERROR: No targets\n"); return 4; }
+    if (!selectedTargetId) { fprintf(stderr, "ERROR: No targets\n"); return EXIT_NO_TARGET; }
     if (args.targetId == nullptr) printf("  Auto-selected target [0]\n");
 
     printf("\nStarting session...\n");
     ret = startSession(client, selectedTargetId, "DFlashErase");
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 5; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SESSION_ERROR; }
 
     // ---- Connect to device ----
     tas_clnt_dco_et dco = noReset ? TAS_CLNT_DCO_HOT_ATTACH : TAS_CLNT_DCO_RESET_AND_HALT;
     printf("Connecting to device (%s)...\n", noReset ? "hot attach" : "reset and halt");
     ret = client.device_connect(dco);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return 6; }
+    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_CONNECT_ERROR; }
 
     // ---- Detect MCU ----
     const tas_con_info_st* conInfo = client.get_con_info();
     DFlashConfig flashCfg;
 
+    // Check for unsupported TC4x devices
+    int tc4xCheck = rejectTc4xDevice(conInfo);
+    if (tc4xCheck != EXIT_OK) return tc4xCheck;
+
     if (args.deviceName != nullptr) {
         if (!configLoader.findByName(args.deviceName, flashCfg)) {
             fprintf(stderr, "ERROR: Unknown device '%s'\n", args.deviceName);
             printSupportedDevices(configLoader);
-            return 7;
+            return EXIT_DEVICE_ERROR;
         }
         printf("  Device (manual): %s\n", args.deviceName);
     } else {
@@ -878,7 +1019,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
             fprintf(stderr, "ERROR: Unsupported device '%s' (jtag_id=0x%08X)\n",
                    tas_get_device_name_str(conInfo->device_type), conInfo->device_type);
             printSupportedDevices(configLoader);
-            return 7;
+            return EXIT_DEVICE_ERROR;
         }
     }
 
@@ -894,7 +1035,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // ---- --info mode: just print info and exit ----
     if (infoOnly) {
         printf("\nDevice info displayed. No erase performed.\n");
-        return 0;
+        return EXIT_OK;
     }
 
     // ---- --all mode ----
@@ -915,23 +1056,31 @@ static int doErase(int argc, char** argv, bool legacyMode)
     if (sectorAddr < flashCfg.baseAddress || sectorAddr >= flashCfg.baseAddress + flashCfg.totalSize) {
         fprintf(stderr, "ERROR: Address 0x%08X out of range (0x%08X - 0x%08X)\n",
                sectorAddr, flashCfg.baseAddress, dflashEndAddr);
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
-    if (sectorAddr + numSectors * flashCfg.sectorSize - 1 > dflashEndAddr) {
+    // Overflow protection (theoretical: DFlash max 1MB, uint32_t max 4GB - always safe)
+    uint64_t eraseBytesU64 = static_cast<uint64_t>(numSectors) * flashCfg.sectorSize;
+    if (eraseBytesU64 > UINT32_MAX) {
+        fprintf(stderr, "ERROR: Erase size exceeds 4GB (overflow)\n");
+        return EXIT_USAGE_ERROR;
+    }
+    uint32_t eraseSize = static_cast<uint32_t>(eraseBytesU64);
+
+    if (sectorAddr + eraseSize - 1 > dflashEndAddr) {
         fprintf(stderr, "ERROR: Range exceeds DFlash boundary (max 0x%08X)\n", dflashEndAddr);
-        return 1;
+        return EXIT_USAGE_ERROR;
     }
 
     // ---- Backup ----
     if (backupFile != nullptr) {
         printf("\nBackup:\n");
-        if (!backupDFlash(client, sectorAddr, numSectors * flashCfg.sectorSize, flashCfg.sectorSize, backupFile)) return 8;
+        if (!backupDFlash(client, sectorAddr, eraseSize, flashCfg.sectorSize, backupFile)) return EXIT_BACKUP_ERROR;
     }
 
     // ---- Print erase parameters ----
     printf("\nErasing DFlash:\n");
     printf("  Address:  0x%08X\n", sectorAddr);
-    printf("  Sectors:  %u (%u KB)\n\n", numSectors, numSectors * flashCfg.sectorSize / 1024);
+    printf("  Sectors:  %u (%u KB)\n\n", numSectors, eraseSize / 1024);
 
     // ---- Flash command base = DFlash base address (TC2x/TC3x convention) ----
     const uint64_t flashCmdBase = static_cast<uint64_t>(flashCfg.baseAddress);
@@ -939,31 +1088,31 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // ---- Step 1: Clear status ----
     printf("Step 1/5: Clearing flash status...                ");
     if (!clearFlashStatus(client, flashCmdBase)) {
-        printf("FAILED\n"); return 11;
+        printf("FAILED\n"); return EXIT_FLASH_STATUS_ERROR;
     }
     printf("OK\n");
 
     // ---- Step 2: Erase (atomic) ----
     printf("Step 2/5: Executing erase command...              ");
     if (!eraseMultipleSectors(client, flashCmdBase, sectorAddr, numSectors)) {
-        printf("FAILED\n"); return 12;
+        printf("FAILED\n"); return EXIT_ERASE_CMD_ERROR;
     }
     printf("OK\n");
 
     // ---- Step 3: Wait unbusy ----
     printf("Step 3/5: Waiting for erase to complete...        ");
     uint32_t elapsedMs = 0;
-    if (!waitUnbusyD0(client, flashCfg.isTc3x, elapsedMs)) { printf("TIMEOUT\n"); return 14; }
+    if (!waitUnbusyD0(client, flashCfg.isTc3x, elapsedMs)) { printf("TIMEOUT\n"); return EXIT_ERASE_TIMEOUT; }
     printf("OK (%u ms)\n", elapsedMs);
 
     // ---- Step 4: Check error flags ----
     printf("Step 4/5: Checking error flags...                 ");
-    if (!checkEraseErrors(client, flashCfg.isTc3x)) { return 15; }
+    if (!checkEraseErrors(client, flashCfg.isTc3x)) { return EXIT_ERASE_FLAGS; }
     printf("OK\n");
 
     // ---- Step 5: Reset to read ----
     printf("Step 5/5: Reset to read mode...                   ");
-    if (!resetToRead(client, flashCmdBase)) { printf("FAILED\n"); return 16; }
+    if (!resetToRead(client, flashCmdBase)) { printf("FAILED\n"); return EXIT_FLASH_RESET_ERROR; }
     printf("OK\n");
 
     // ---- Verify ----
@@ -971,7 +1120,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
         printf("\nVerifying erase:\n");
         if (!verifyErase(client, sectorAddr, numSectors, flashCfg.sectorSize)) {
             printf("\nDFlash erase completed with verification ERRORS.\n");
-            return 17;
+            return EXIT_VERIFY_ERROR;
         }
     }
 
@@ -987,7 +1136,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
     }
 
     printf("\nDFlash erase completed successfully.\n");
-    return 0;
+    return EXIT_OK;
 }
 
 //********************************************************************************************************************
@@ -1007,7 +1156,8 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
     printf("Subcommands:\n");
     printf("  erase    Erase DFlash sectors\n");
     printf("  read     Read DFlash content\n");
-    printf("  list     List connected TAS targets\n\n");
+    printf("  list     List connected TAS targets\n");
+    printf("  reset    Reset the MCU\n\n");
     printf("Legacy (backward compatible):\n");
     printf("  %s <addr> <num_sectors> [options]\n", base);
     printf("  %s --all [options]\n", base);
@@ -1040,17 +1190,18 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) { printUsage(argv[0]); return 1; }
+    if (argc < 2) { printUsage(argv[0]); return EXIT_USAGE_ERROR; }
 
     std::string first(argv[1]);
 
     // Help
-    if (first == "--help" || first == "-h") { printUsage(argv[0]); return 0; }
+    if (first == "--help" || first == "-h") { printUsage(argv[0]); return EXIT_OK; }
 
     // Subcommands
     if (first == "erase" || first == "e") return doErase(argc - 2, argv + 2, false);
     if (first == "read"  || first == "r") return doRead(argc - 2, argv + 2);
     if (first == "list"  || first == "l") return doList(argc - 2, argv + 2);
+    if (first == "reset") return doReset(argc - 2, argv + 2);
 
     // Legacy backward compatibility: --all, --info, or hex address as first arg
     if (first == "--all" || first == "--info" ||
@@ -1060,5 +1211,5 @@ int main(int argc, char** argv)
 
     fprintf(stderr, "ERROR: Unknown subcommand '%s'\n", argv[1]);
     printUsage(argv[0]);
-    return 1;
+    return EXIT_USAGE_ERROR;
 }

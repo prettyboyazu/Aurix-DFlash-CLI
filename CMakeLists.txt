@@ -41,6 +41,11 @@ project(tas_client_api
 )
 set(TAS_CLIENT_COPYRIGHT "(c) Infineon Technologies AG 2026")
 
+# Static CRT linking (MSVC): produce standalone exe without VCRUNTIME DLL dependency
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # -----------------------------------------------------------------------------
 # Break in case of popular CMake configuration mistakes
 # -----------------------------------------------------------------------------

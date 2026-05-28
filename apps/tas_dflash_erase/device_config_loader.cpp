@@ -6,6 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 
 #include "nlohmann/json.hpp"
 
@@ -17,7 +18,8 @@ static uint32_t hexStringToUint32(const std::string& s) {
     if (s.empty()) return 0;
     try {
         return static_cast<uint32_t>(std::stoul(s, nullptr, 0));
-    } catch (...) {
+    } catch (const std::exception& e) {
+        fprintf(stderr, "WARNING: Failed to parse hex value '%s': %s\n", s.c_str(), e.what());
         return 0;
     }
 }
@@ -87,10 +89,13 @@ bool DeviceConfigLoader::loadFromDirectory(const std::string& dirPath) {
         // Only process .json files
         if (entry.path().extension() != ".json") continue;
 
-        // Skip "devices.json"
+        // Skip "devices.json" - it's an index file not used by this loader
+        // (loadFromDirectory parses each device JSON individually)
         if (iequals(filename, "devices.json")) continue;
 
-        // Skip TC4x files (not supported yet)
+        // Skip TC4x config files - TC4x uses different DFlash base addresses
+        // (0xAE000000/0xAC000000) and erase sequences; not supported in this tool.
+        // Runtime detection via tas_df_check_if_tc4x() provides a second safety check.
         if (filename.size() >= 3 && filename.substr(0, 3) == "TC4") continue;
 
         if (parseDeviceJson(entry.path().string())) {
@@ -227,6 +232,9 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
     entry.dflash.baseAddress = baseAddress;
     entry.dflash.totalSize = totalSize;
     entry.dflash.sectorSize = sectorSize;
+    // NOTE: Assumes uniform sector size across all DFlash sectors.
+    // This holds true for all current TC2x/TC3x DataFlash configurations.
+    // ProgramFlash may have non-uniform sectors, but DataFlash does not.
     entry.dflash.numSectors = totalSize / sectorSize;
     entry.jtagIds = jtagIds;
 

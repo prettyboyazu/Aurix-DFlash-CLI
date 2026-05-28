@@ -18,9 +18,9 @@
  ****************************************************************************************************************]]
 
 # -----------------------------------------------------------------------------
-# tas_dflash_erase
+# dflash - AURIX DFlash Tool (erase, read, list, reset)
 # -----------------------------------------------------------------------------
-set(EXE_NAME tas_dflash_erase)
+set(EXE_NAME dflash)
 
 set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/tas_dflash_erase_main.cpp"
