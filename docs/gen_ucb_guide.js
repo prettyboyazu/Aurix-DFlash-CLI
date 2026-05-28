@@ -605,6 +605,292 @@ children.push(Note('UCB_OTP 的 "Write configuration" 是不可逆操作，操�
 children.push(Bullet('IsValid = n 表示 BMHD 数据无效（CRC 错误或未编程），芯片会跳过此 BMHD'));
 children.push(Bullet('IsConfirmed = n 且 IsValid = n 的 BMHD 不影响芯片启动（被忽略）'));
 
+// =============== 10. Memtool UCB 各 Tab 页配置项详解 ===============
+children.push(H1('10. Memtool UCB 各 Tab 页配置项详解'));
+children.push(P('本章基于实际板卡 TC334（TC33x A step）通过 Memtool TC3 UCB Handler 读取到的真实配置数据，对每个 Tab 页的字段进行逐项详细解释。每个 UCB Tab 页通常分为左右两个区域：左侧 Current Status 显示当前芯片中读取到的实际值；右侧 New 配置面板用于设置即将写入的新值。'));
+
+// ---------- 10.1 BMHD ----------
+children.push(H2('10.1 UCB_BMHD0 ~ UCB_BMHD3（Boot Mode Header 0-3）'));
+children.push(P('本板上 4 个 BMHD Tab 页显示的配置完全相同（统一默认配置）。下面以单个 BMHD 为例进行字段解析。'));
+
+children.push(H3('左侧 Current Status 字段解析'));
+const bmhdStatusHeaders = ['字段', '当前值', '含义'];
+const bmhdStatusWidths = [22, 22, 56];
+const bmhdStatusRows = [
+    ['DMU_HF_CONFIRM0', '0x8200AA55', 'DMU 确认寄存器值，表示 BMHD 已编程（注意：这不是 UCB sector 的 CONFIRMATION code，而是 DMU 硬件寄存器的确认状态）'],
+    ['BMI.PINDIS',      '0',          'Pin Disable = 0：允许通过外部引脚选择启动模式'],
+    ['BMI.HWCFG',       '7',          '硬件配置值 = 7：Internal start from Flash（从内部 Flash 启动）'],
+    ['BMI.LSENA0',      '1',          'Lockstep Enable 0 = 1：CPU0 锁步监控已使能'],
+    ['BMI.LBISTENA',    '0',          'LBIST Enable = 0：逻辑内建自测试未使能'],
+    ['BMI.CHSWENA',     '0',          'CHSW Enable = 0：Core Hardware Software Watchdog 未使能'],
+    ['IsConfirmed',     'n',          '该 BMHD 未被 CONFIRMED（可重新擦写）'],
+    ['ProtDis',         'n',          '保护未被禁用（Protection Disable = No）'],
+    ['STAD',            '0xA0000000', '启动地址 = 0xA0000000（PFlash Bank0 起始地址，CPU 从此处开始执行代码）'],
+    ['OptionMask',      '0x0000000E', '选项掩码，标记哪些 BMI 位域有效（bit1=HWCFG, bit2=LSENA0, bit3=LBISTENA）'],
+    ['IsValid',         'y',          'BMHD 数据有效（CRC 校验通过，且数据格式正确）'],
+];
+children.push(buildTable(bmhdStatusHeaders, bmhdStatusRows, bmhdStatusWidths));
+children.push(P(' '));
+
+children.push(H3('右侧 New 配置面板解析'));
+const bmhdNewHeaders = ['配置项', '当前设定', '含义'];
+const bmhdNewWidths = [38, 24, 38];
+const bmhdNewRows = [
+    ['Mode selection by HWCFG pins is disable', '未勾选',                    '不禁用硬件引脚启动模式选择（= 允许通过 HWCFG 引脚选择启动模式）'],
+    ['HWCFG',                                    'Internal start from Flash', '从内部 PFlash 启动（值 = 7），其他选项包括：Internal start from SRAM、Boot from CAN/ASC 等'],
+    ['Lockstep monitoring for CPU0',             '已勾选',                    'CPU0 双核锁步监控使能（两个 CPU 核心执行相同指令，比较结果不一致则触发告警）'],
+    ['Lockstep monitoring for CPU1-3',           '未勾选',                    'CPU1-3 锁步监控未使能（TC334 只有 1 个 CPU 核心）'],
+    ['LBIST execution start by SSW',             '未勾选',                    '启动软件（SSW）启动时不执行逻辑内建自测试'],
+    ['CHSW execution after SSW is disabled',     '未勾选',                    'SSW 执行后 CHSW 检查未禁用'],
+    ['Start address / ABM header',               '0xA0000000',                '应用程序启动地址 = PFlash Bank0 起始（0xA0000000），这是 CPU 复位后跳转的第一条指令地址'],
+    ['BMI',                                      '0x001E',                    'Boot Mode Index 完整值，编码了上述所有 BMI 位域的组合'],
+];
+children.push(buildTable(bmhdNewHeaders, bmhdNewRows, bmhdNewWidths));
+children.push(P(' '));
+
+children.push(H3('BMI 值 0x001E 位域拆解'));
+const bmiBitsHeaders = ['Bit', '字段', '值', '含义'];
+const bmiBitsWidths = [10, 18, 12, 60];
+const bmiBitsRows = [
+    ['[0]',   'PINDIS',   '0',         '引脚启动模式选择未禁用'],
+    ['[3:1]', 'HWCFG',    '7 (0b111)', 'Internal start from Flash'],
+    ['[4]',   'LSENA0',   '1',         'CPU0 锁步使能'],
+    ['[5]',   'LBISTENA', '0',         'LBIST 未使能'],
+    ['[6]',   'CHSWENA',  '0',         'CHSW 未使能'],
+];
+children.push(buildTable(bmiBitsHeaders, bmiBitsRows, bmiBitsWidths));
+children.push(P(' '));
+
+// ---------- 10.2 PFLASH ----------
+children.push(H2('10.2 UCB_PFLASH（PFlash Protection）'));
+
+children.push(H3('左侧 Current Status 字段解析'));
+const pflashStatusHeaders = ['字段', '当前值', '含义'];
+const pflashStatusWidths = [24, 22, 54];
+const pflashStatusRows = [
+    ['Pflash0Sectors',   '128',        'PFlash Bank0 共 128 个扇区'],
+    ['Pflash1-5Sectors', '0',          'PFlash Bank1-5 无扇区（TC334 只有 Bank0）'],
+    ['PROCONPF',         '0x00000000', 'PFlash 全局保护配置 = 0（无保护）'],
+    ['PROCONP00-03',     '0x00000000', 'PFlash 写保护掩码（每位对应一个扇区）= 全零表示所有扇区均未写保护'],
+    ['IsConfirmed',      'n',          '未确认锁定'],
+    ['ProtDis',          'n',          '保护未禁用'],
+    ['PROCONPF.RPRO',    '0',          '读保护位 = 0（PFlash 可读）'],
+];
+children.push(buildTable(pflashStatusHeaders, pflashStatusRows, pflashStatusWidths));
+children.push(P(' '));
+
+children.push(H3('右侧 New 配置面板解析'));
+const pflashNewHeaders = ['配置项', '说明'];
+const pflashNewWidths = [34, 66];
+const pflashNewRows = [
+    ['PFLASH read protection',          '勾选后启用 PFlash 读保护（代码加密，调试器无法读出 Flash 内容）'],
+    ['PFLASH0 Tab',                     'PFlash Bank0 的写保护配置'],
+    ['Write Protection (PROCONP00-03)', '4 个 32-bit 写保护寄存器，每 bit 对应一个扇区（共 128 扇区 = 4×32 bit）'],
+    ['Sector 列表 (0-15)',              '显示扇区编号、起始地址、结束地址，勾选后该扇区被写保护'],
+    ['Select All',                      '一键勾选所有扇区的写保护'],
+    ['PROCONPF',                        'PFlash 全局保护配置寄存器值'],
+];
+children.push(buildTable(pflashNewHeaders, pflashNewRows, pflashNewWidths));
+children.push(P(' '));
+children.push(P('当前板状态：所有 PFlash 扇区均未写保护（全零），读保护未启用。'));
+
+// ---------- 10.3 DFLASH ----------
+children.push(H2('10.3 UCB_DFLASH（DFlash Protection, Safety Configuration）'));
+
+children.push(H3('左侧 Current Status 字段解析'));
+const dflashStatusHeaders = ['字段', '当前值', '含义'];
+const dflashStatusWidths = [28, 22, 50];
+const dflashStatusRows = [
+    ['PROCONUSR',                  '0x00000000', '用户配置寄存器 = 0'],
+    ['PROCONDF',                   '0x00000000', 'DFlash 保护配置 = 0（无保护）'],
+    ['PROCONRAM',                  '0x00000000', 'RAM 配置 = 0'],
+    ['IsConfirmed',                'n',          '未确认锁定'],
+    ['ProtDis',                    'n',          '保护未禁用'],
+    ['PROCONUSR.MODE',             '0',          '用户模式 = 0'],
+    ['PROCONDF.L',                 '0',          'DFlash 锁定位 = 0（未锁定）'],
+    ['PROCONDF.OSCCFG',            '0',          '振荡器配置 = 0'],
+    ['PROCONDF.MODE',              '0',          'DFlash 模式 = 0'],
+    ['PROCONDF.APREN',             '0',          '自动预充电使能 = 0'],
+    ['PROCONDF.CAP0EN-CAP3EN',     '0',          '电容使能位 = 0'],
+    ['PROCONDF.ESROCNT',           '0',          'ESR0 计数 = 0'],
+    ['PROCONDF.RPRO',              '0',          'DFlash 读保护 = 0（可读）'],
+    ['PROCONDF.HYSEN',             '0',          '迟滞使能 = 0'],
+    ['PROCONDF.HYSCTL',            '0',          '迟滞控制 = 0'],
+    ['PROCONDF.AMPCTL',            '0',          '振幅控制 = 0'],
+    ['PROCONRAM.RAMIN',            '0',          'RAM 初始化模式 = 0（上电复位后初始化）'],
+    ['PROCONRAM.RAMINSEL0',        '0',          'RAM 初始化选择 = 0'],
+    ['PROCONRAM.LMUINSEL0/6',      '0',          'LMU 初始化选择 = 0'],
+    ['OptionMask',                 '0x0000003E', '选项掩码'],
+];
+children.push(buildTable(dflashStatusHeaders, dflashStatusRows, dflashStatusWidths));
+children.push(P(' '));
+
+children.push(H3('右侧 New 配置面板解析'));
+const dflashNewHeaders = ['配置项', '说明'];
+const dflashNewWidths = [38, 62];
+const dflashNewRows = [
+    ['Use complement sensing mode',                'Flash 读取使用互补感应模式（提高数据读取可靠性）'],
+    ['DFLASH read protection',                     'DFlash 读保护（勾选后 DFlash 内容不可通过调试器读取）'],
+    ['DFLASH write protection',                    'DFlash 写保护（勾选后 DFlash 不可编程/擦除）'],
+    ['Use user defined values for SCU_OSCCON',     '使用用户自定义振荡器配置值'],
+    ['Mode',                                       '振荡器工作模式选择（Mode 0 = 默认外部晶振模式）'],
+    ['OSC Capacitance 0-3 Enable',                 '片内振荡器电容使能（用于调整晶振负载电容）'],
+    ['OSC Amplitude Regulation Enable',            '振荡器振幅调节使能'],
+    ['ESR0 Prolongation',                          'ESR0 复位延长时间（0 = 不延长）'],
+    ['RAMIN',                                      'RAM 初始化模式（0 = 每次上电复位后初始化 RAM）'],
+    ["Don't init CPU0-5 RAMs",                     '不初始化对应 CPU 的 DSPR/PSPR RAM'],
+    ["Don't init CPU0-5 LMU RAM",                  '不初始化对应 CPU 的 LMU RAM'],
+    ["Don't init Standalone LMU and AMU RAM",      '不初始化独立 LMU 和 AMU RAM'],
+    ['Hysteresis Enable',                          '迟滞使能'],
+    ['HYSCTL',                                     '迟滞控制设置'],
+    ['AMPCTL',                                     '振幅控制设置'],
+    ['PROCONUSR / PROCONDF / PROCONRAM',           '最终寄存器值（自动计算）'],
+];
+children.push(buildTable(dflashNewHeaders, dflashNewRows, dflashNewWidths));
+children.push(P(' '));
+children.push(P('当前板状态：DFlash 无读/写保护，振荡器使用默认配置，RAM 初始化正常。'));
+
+// ---------- 10.4 DBG ----------
+children.push(H2('10.4 UCB_DBG（Debug Interface Protection）'));
+
+children.push(H3('左侧 Current Status 字段解析'));
+const dbgStatusHeaders = ['字段', '当前值', '含义'];
+const dbgStatusWidths = [26, 22, 52];
+const dbgStatusRows = [
+    ['PROCONDBG',           '0x00000000', '调试保护配置寄存器 = 0（调试接口完全开放）'],
+    ['IsConfirmed',         'n',          '未确认锁定'],
+    ['ProtDis',             'n',          '保护未禁用'],
+    ['PROCONDBG.OCDSDIS',   '0',          'OCDS 禁用 = 0（片上调试系统未禁用）'],
+    ['PROCONDBG.DBGIFLCK',  '0',          'Debug Interface Lock = 0（调试接口未锁定）'],
+    ['PROCONDBG.TIC',       '0',          'Tool Interface Control = 0'],
+];
+children.push(buildTable(dbgStatusHeaders, dbgStatusRows, dbgStatusWidths));
+children.push(P(' '));
+
+children.push(H3('右侧 New 配置面板解析'));
+const dbgNewHeaders = ['配置项', '说明'];
+const dbgNewWidths = [32, 68];
+const dbgNewRows = [
+    ['OCDS Lock (OCDSDIS)',             '勾选后永久禁用片上调试系统（OCDS），芯片将无法被任何调试器连接。极度危险操作！'],
+    ['Debug interface lock (DBGIFLCK)', '勾选后锁定调试接口，需要密码才能连接调试器'],
+    ['Tool Interface Control',          '工具接口控制下拉框：DXCPL will be disabled after power-on-reset = DAP 接口在上电复位后禁用（当前设置）。其他选项控制调试器连接窗口'],
+    ['PROCONDBG',                       '最终寄存器值'],
+];
+children.push(buildTable(dbgNewHeaders, dbgNewRows, dbgNewWidths));
+children.push(P(' '));
+children.push(P('当前板状态：调试接口完全开放（全零），任何调试器都可以自由连接。这是开发阶段的正常状态。'));
+
+// ---------- 10.5 OTP ----------
+children.push(H2('10.5 UCB_OTP（One-Time Programmable Configuration）'));
+
+children.push(H3('左侧 Current Status 字段解析'));
+const otpStatusHeaders = ['字段', '当前值', '含义'];
+const otpStatusWidths = [26, 22, 52];
+const otpStatusRows = [
+    ['Pflash0Sectors',     '128',        'PFlash Bank0 扇区数'],
+    ['Cpus',               '1',          'CPU 核心数 = 1（TC334 单核）'],
+    ['NoSota',             'n',          '不禁用 SOTA（Software Over The Air 更新）'],
+    ['AllowEnableSota',    'n',          '不允许使能 SOTA'],
+    ['PROCONTP',           '0x00000000', 'OTP 保护配置 = 0'],
+    ['PROCONOTP00-03',     '0x00000000', 'OTP 保护掩码（每 bit 对应一个扇区）= 全零'],
+    ['PROCONWOP00-03',     '0x00000000', 'WOP 写保护掩码 = 全零'],
+    ['MaxUcbs',            '8',          '最大 UCB_OTP 数量 = 8（可写 8 次）'],
+    ['UcbsUsed',           '0',          '已使用的 UCB_OTP 数量 = 0（未使用过）'],
+    ['PROCONTP.TP',        'n',          'Tuning Protection = 未使能'],
+    ['PROCONTP.BML',       '0',          'Boot Mode Lock = 0（启动模式未锁定）'],
+    ['PROCONTP.SWAPEN',    '0',          'Swap Enable = 0（Flash Swap 未使能）'],
+    ['PROCONTP.CPU0DDIS',  'n',          'CPU0 Debug Disable = 未禁用'],
+];
+children.push(buildTable(otpStatusHeaders, otpStatusRows, otpStatusWidths));
+children.push(P(' '));
+
+children.push(H3('右侧 New 配置面板解析'));
+const otpNewHeaders = ['配置项', '说明'];
+const otpNewWidths = [36, 64];
+const otpNewRows = [
+    ['0 of 8 UCB_OTPs used',             '显示 OTP 使用情况（最多可编程 8 次，当前未使用）'],
+    ['Enable SOTA mode',                 '使能软件空中升级模式'],
+    ['CPU0-5 disable direct LPB access', '禁用对应 CPU 的直接 LPB（Local Peripheral Bus）访问'],
+    ['UCB_SWAP not configured !',        '提示 Flash Swap 功能未配置'],
+    ['Tuning Protection',                '调谐保护（用于限制 PFlash 扇区的可擦写次数）'],
+    ['Boot Mode Lock',                   '启动模式锁定（锁定后不能通过 BMHD 修改启动配置）'],
+    ['OTP 列表',                          '按扇区显示 OTP 保护状态，勾选后该扇区一次性编程保护（不可逆！）'],
+    ['WOP 列表',                          '写一次保护（Write Once Protection），勾选后该扇区只能写入一次'],
+    ['PROCONTP',                         '最终 OTP 保护配置寄存器值'],
+];
+children.push(buildTable(otpNewHeaders, otpNewRows, otpNewWidths));
+children.push(P(' '));
+children.push(P('当前板状态：OTP 全部未使用（0 of 8），所有保护位均为零。'));
+children.push(Note('严重警告：OTP 一旦编程不可恢复！CONFIRMED 后永久锁定！'));
+
+// ---------- 10.6 ECPRIO ----------
+children.push(H2('10.6 UCB_ECPRIO（Erase Counter Priority）'));
+
+children.push(H3('左侧 Current Status 字段解析'));
+const ecprioStatusHeaders = ['字段', '当前值', '含义'];
+const ecprioStatusWidths = [26, 22, 52];
+const ecprioStatusRows = [
+    ['Pflash0Sectors',   '128',        'PFlash Bank0 扇区数'],
+    ['Pflash1-5Sectors', '0',          '其他 Bank 无扇区'],
+    ['ECPRIO00-03',      '0x00000000', '擦除计数器优先级寄存器 = 全零'],
+    ['IsConfirmed',      'n',          '未确认锁定'],
+    ['ProtDis',          'n',          '保护未禁用'],
+];
+children.push(buildTable(ecprioStatusHeaders, ecprioStatusRows, ecprioStatusWidths));
+children.push(P(' '));
+
+children.push(H3('右侧 New 配置面板解析'));
+const ecprioNewHeaders = ['配置项', '说明'];
+const ecprioNewWidths = [34, 66];
+const ecprioNewRows = [
+    ['ECPRIO0 Tab',                    '擦除计数器优先级 Bank0 配置'],
+    ['Write Protection (ECPRIO00-03)', '4 个 32-bit 寄存器，每 bit 对应一个扇区的擦除计数器优先级'],
+    ['Sector 列表 (0-15)',             '显示扇区编号和地址范围'],
+    ['Select All',                     '一键选择所有扇区'],
+];
+children.push(buildTable(ecprioNewHeaders, ecprioNewRows, ecprioNewWidths));
+children.push(P(' '));
+children.push(P('功能说明：ECPRIO 用于配置哪些 PFlash 扇区使用“擦除计数器优先”模式。在此模式下，Flash 控制器会优先使用擦除次数较少的扇区，延长 Flash 寿命（耐久性均衡）。'));
+children.push(P('当前板状态：所有扇区的擦除计数器优先级均为默认值（零），未启用特殊均衡。'));
+
+// ---------- 10.7 Setup FLASH/OTP Device ----------
+children.push(H2('10.7 Setup FLASH/OTP Device — Protection/BMI 页面'));
+children.push(P('这是 Memtool 的设备设置对话框中的 Protection/BMI 标签页，用于在 Flash 操作激活时配置保护解锁密码以及启动配置。'));
+
+const setupHeaders = ['配置项', '当前值/状态', '说明'];
+const setupWidths = [32, 26, 42];
+const setupRows = [
+    ['Password to disable Protection',                              '000000,0x00000000,...（全零）', '用于解锁受保护 UCB 的密码（两组各 4 个 32-bit word = 256-bit 密码）。全零表示使用默认密码（出厂未编程）'],
+    ['Result',                                                      'PW0-PW7 = 0x00000000',         '密码校验结果，全零表示当前使用默认密码'],
+    ['Save Password to Disk',                                       '未勾选',                       '是否将密码保存到磁盘文件'],
+    ['Try to disable protection when FLASH handling is activated',  '未勾选',                       '激活 Flash 操作时是否自动尝试解锁保护'],
+    ['Install BMI configuration',                                   '未勾选',                       '是否在编程时安装 BMI 配置'],
+    ['Startup configuration',                                       '空',                           '启动配置文件路径'],
+    ['Exclude DFLASH from protection',                              '未勾选',                       '是否将 DFlash 排除在保护之外'],
+];
+children.push(buildTable(setupHeaders, setupRows, setupWidths));
+children.push(P(' '));
+
+// ---------- 10.8 汇总 ----------
+children.push(H2('10.8 各 UCB Tab 页当前板配置状态汇总'));
+
+const summaryHeaders = ['Tab', 'IsConfirmed', 'IsValid', 'ProtDis', '状态说明'];
+const summaryWidths = [16, 16, 12, 14, 42];
+const summaryRows = [
+    ['UCB_BMHD0',  'n', 'y', 'n', '已编程有效，未锁定'],
+    ['UCB_BMHD1',  'n', 'y', 'n', '已编程有效，未锁定'],
+    ['UCB_BMHD2',  'n', 'y', 'n', '已编程有效，未锁定'],
+    ['UCB_BMHD3',  'n', 'y', 'n', '已编程有效，未锁定'],
+    ['UCB_PFLASH', 'n', '-', 'n', '无写保护，无读保护'],
+    ['UCB_DFLASH', 'n', '-', 'n', '无读/写保护'],
+    ['UCB_DBG',    'n', '-', 'n', '调试接口完全开放'],
+    ['UCB_OTP',    'n', '-', 'n', '0/8 OTP 已使用'],
+    ['UCB_ECPRIO', 'n', '-', 'n', '默认擦除计数器优先级'],
+];
+children.push(buildTable(summaryHeaders, summaryRows, summaryWidths));
+children.push(P(' '));
+children.push(P('结论：该 TC334 开发板所有 UCB 均为未锁定（IsConfirmed = n）状态，4 个 BMHD 均已正确编程（IsValid = y），启动地址为 0xA0000000，调试接口完全开放。这是标准的开发阶段配置。'));
+
 children.push(P(' '));
 children.push(P(' '));
 children.push(new Paragraph({
