@@ -8,14 +8,7 @@ install
 # ---------------------------------------------------------------------------------------------------------------------
 # VS Code
 # ---------------------------------------------------------------------------------------------------------------------
-.vscode/*
-# Ignore all files in the .vscode directory except for the following:
-# Uncomment the following lines to keep specific VS Code settings and configurations.
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
+.vscode/
 
 # Local History for Visual Studio Code
 .history/
