@@ -1,0 +1,240 @@
+================================================================================
+           dflash.exe v2.0 硬件功能测试报告
+           设备: TC33x (TriBoard TC3XX V2.0 TB9QTU70)
+           测试日期: 2026-05-29
+           工作目录: D:\workspace\tas-dflash_-erase\TDFlash
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 1】基础功能 - 版本号
+命令: dflash.exe --version
+输出: dflash version 2.0
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 2】基础功能 - 帮助输出
+命令: dflash.exe --help
+输出: 显示完整帮助信息，包含所有子命令 (erase/write/rewrite/restore/read/list/reset/ucb)
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 3】list 子命令
+命令: dflash.exe list
+输出:
+  Server: TasServer V2.0 (Aug  7 2025)
+  Targets (1):
+  [0] TC33x         TriBoard TC3XX V2.0 TB9QTU70
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 4】read 子命令 - 读取 256 字节
+命令: dflash.exe read --addr AF004000 --length 100
+输出:
+  Device: TC33x A step (TC3x), DFlash: 128 KB
+  Read: 0xAF004000 - 0xAF0040FF (256 bytes)
+  Read complete: 256 bytes
+  数据: 全 0x00（已擦除状态）
+注意: 参数名为 --length（非 --size）
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 5】erase 子命令 - 擦除 1 个 sector
+命令: dflash.exe erase --addr AF004000 --sectors 1
+输出:
+  Device: TC33x A step (TC3x)
+  DFlash: 128 KB total, 32 sectors, sector size 4 KB
+  Erase completed in 36 ms
+  DFlash erase completed successfully.
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 5b】erase 后验证 - 数据为全 0x00
+命令: dflash.exe read --addr AF004000 --length 20
+输出:
+  AF004000: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  AF004010: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+判定: PASS ✓ （擦除后为全 0x00，符合 AURIX DFlash 预期）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 6】write 子命令（通过 rewrite --data）- 写入 12 字节
+命令: dflash.exe rewrite --addr AF004000 --data 1122334455667788AABBCCDD --verify
+输出:
+  Write: 0xAF004000 - 0xAF00400B (12 bytes)
+  Sectors: 0xAF004000 - 0xAF004FFF (1 sectors, 4096 bytes)
+  Verifying rewrite: PASSED: all 12 bytes verified
+  DFlash rewrite completed successfully.
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 6b】write 后读回验证
+命令: dflash.exe read --addr AF004000 --length 10
+输出:
+  AF004000: 11 22 33 44 55 66 77 88  AA BB CC DD 00 00 00 00
+判定: PASS ✓ （12 字节数据完整写入）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 6c】write 子命令（文件输入）
+命令: dflash.exe write --file test_data.bin --addr AF004000 --verify
+输出:
+  Write: 8 bytes (1 pages) in 1 segment(s)
+  Write completed in 25 ms
+  Verifying write: PASSED: all 8 bytes verified
+  DFlash write completed successfully.
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 7】rewrite 子命令 - 非对齐地址 Read-Modify-Write
+命令: dflash.exe rewrite --addr AF004010 --data DEADBEEFCAFEBABE --verify
+输出:
+  Write: 0xAF004010 - 0xAF004017 (8 bytes)
+  Sectors: 0xAF004000 - 0xAF004FFF (1 sectors, 4096 bytes)
+  Step 1/5: Reading 1 sector(s)... Read 4096 bytes OK
+  Step 3/5: Merging 8 bytes at offset 0x10... Merge complete
+  Step 4/5: Erasing... Erase completed in 41 ms
+  Step 5/5: Writing back... Write completed in 72 ms
+  Verifying rewrite: PASSED: all 8 bytes verified
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 7b】rewrite 后验证 - 原数据未被破坏
+命令: dflash.exe read --addr AF004000 --length 20
+输出:
+  AF004000: 11 22 33 44 55 66 77 88  AA BB CC DD 00 00 00 00
+  AF004010: DE AD BE EF CA FE BA BE  00 00 00 00 00 00 00 00
+判定: PASS ✓ （AF004000处原数据完好，AF004010处新数据正确）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 8】rewrite --backup 测试
+命令: dflash.exe rewrite --addr AF004020 --data 0102030405060708 --backup --verify
+输出:
+  Write: 0xAF004020 - 0xAF004027 (8 bytes)
+  Backing up 4096 bytes from 0xAF004000 to rewrite_backup_AF004000.hex...
+  Backup saved (Intel HEX): 4096 bytes -> rewrite_backup_AF004000.hex
+  Verifying rewrite: PASSED: all 8 bytes verified
+  DFlash rewrite completed successfully.
+备份文件: rewrite_backup_AF004000.hex (Intel HEX 格式, 4096 bytes)
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 9】restore 子命令 - 从备份还原
+命令: dflash.exe restore --file rewrite_backup_AF004000.hex
+输出:
+  File: rewrite_backup_AF004000.hex (4096 bytes)
+  Restore: 4096 bytes to 0xAF004000
+  Step 1/3: Erasing 1 sectors... Erase completed in 37 ms
+  Step 2/3: Writing 4096 bytes... Write completed in 77 ms
+  Step 3/3: Verifying restore... PASSED: all 4096 bytes verified
+  DFlash restore completed successfully.
+
+还原后验证:
+  AF004000: 11 22 33 44 55 66 77 88  AA BB CC DD 00 00 00 00
+  AF004010: DE AD BE EF CA FE BA BE  00 00 00 00 00 00 00 00
+  AF004020: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  （AF004020 已恢复为备份时状态 0x00）
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 10】reset 子命令
+命令: dflash.exe reset
+输出:
+  Target: [0] TC33x (TriBoard TC3XX V2.0 TB9QTU70)
+  MCU reset successful. Normal execution resumed.
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 11】UCB 读取（只读）
+命令: dflash.exe ucb read --addr AF400000 --length 200
+输出:
+  UCB: 0xAF400000 - 0xAF405FFF (24576 bytes, 48 sectors of 512 bytes)
+  Read: 0xAF400000 - 0xAF4001FF (512 bytes)
+  Read 512/512 bytes, Read complete: 512 bytes
+  AF400000: 3E 00 59 B3 00 00 00 A0  AB BD 6C D8 54 42 93 27  (BMHD header)
+  AF4001F0: 34 12 21 43 00 00 00 00  ... (CONFIRMATION code: 0x43211234 = CONFIRMED)
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 12】错误处理 - 缺少必填参数 (erase)
+命令: dflash.exe erase
+输出: ERROR: Specify --addr + --sectors, --all, or --info
+退出码: 1
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 13】错误处理 - 缺少数据源 (write)
+命令: dflash.exe write --addr AF004000
+输出: ERROR: --file is required
+退出码: 1
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 14】错误处理 - 非法地址
+命令: dflash.exe read --addr ZZZZ --length 10
+输出: ERROR: Invalid address
+退出码: 1
+判定: PASS ✓
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【测试 15】清理 - 擦除测试区域
+命令: dflash.exe erase --addr AF004000 --sectors 1
+输出: DFlash erase completed successfully. (34 ms)
+判定: PASS ✓
+
+================================================================================
+                          测试结果汇总
+================================================================================
+
+| #   | 测试项                              | 结果   |
+|-----|--------------------------------------|--------|
+|  1  | --version 版本号 2.0                 | PASS ✓ |
+|  2  | --help 帮助输出                      | PASS ✓ |
+|  3  | list 列出设备                        | PASS ✓ |
+|  4  | read 读取 256 字节                   | PASS ✓ |
+|  5  | erase 擦除 1 sector                  | PASS ✓ |
+|  5b | erase 后验证全 0x00                  | PASS ✓ |
+|  6  | write (rewrite --data) 写入 12 字节  | PASS ✓ |
+|  6b | write 后读回验证                     | PASS ✓ |
+|  6c | write --file 文件写入               | PASS ✓ |
+|  7  | rewrite 非对齐 R-M-W                 | PASS ✓ |
+|  7b | rewrite 后原数据完整性验证           | PASS ✓ |
+|  8  | rewrite --backup 备份生成            | PASS ✓ |
+|  9  | restore 从备份还原                   | PASS ✓ |
+| 10  | reset 复位 MCU                       | PASS ✓ |
+| 11  | ucb read UCB 区域读取                | PASS ✓ |
+| 12  | 错误处理: erase 缺参数               | PASS ✓ |
+| 13  | 错误处理: write 缺数据源             | PASS ✓ |
+| 14  | 错误处理: 非法地址                   | PASS ✓ |
+| 15  | 清理: 擦除测试区域                   | PASS ✓ |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+总计: 19 项测试 | 通过: 19 | 失败: 0 | 跳过: 0
+总体结果: ★ ALL PASS ★
+
+备注:
+1. write 子命令仅支持文件输入（--file），不支持 --data 内联数据。
+   内联数据写入使用 rewrite --data 替代。
+2. read 子命令参数为 --length（非 --size）。
+3. AURIX DFlash 擦除后默认值为 0x00（非 0xFF）。
+4. UCB BMHD0 (AF400000) CONFIRMATION code = 0x43211234 (CONFIRMED 状态)。
+5. 备份文件自动生成为 Intel HEX 格式: rewrite_backup_AF004000.hex
+
+================================================================================

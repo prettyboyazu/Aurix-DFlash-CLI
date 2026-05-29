@@ -1,240 +1,95 @@
-# DFlash Tool 使用手册
+# DFlash Tool v2.0 用户手册
 
-AURIX MCU DFlash 操作工具 — 支持擦除、读取、设备列表、复位。
+## 简介
+DFlash 是基于 TAS Client API 的 AURIX MCU Data Flash (DFlash) 操作命令行工具，支持 TC2xx/TC3xx 系列芯片。
 
----
+## 运行环境要求
+- Windows 10/11 x64
+- TAS Server 已启动并连接 miniWiggler 调试器
+- 目标芯片通过 miniWiggler 连接
+- DeviceConfigs/ 目录与 dflash.exe 同级放置
+
+## 文件结构
+```
+TDFlash/
+├── dflash.exe          # 主程序（静态链接，无 DLL 依赖）
+├── DeviceConfigs/      # 设备配置 JSON 文件
+├── README.md           # 本文档
+└── test_report_v2.0.txt # 测试报告
+```
+
+## 子命令一览
+
+| 子命令 | 功能 | 示例 |
+|--------|------|------|
+| list | 列出连接的设备 | `dflash list` |
+| read | 读取 DFlash 数据 | `dflash read --addr AF004000 --length 100` |
+| erase | 擦除 DFlash sector | `dflash erase --addr AF004000 --sectors 1` |
+| write | 从文件写入 DFlash | `dflash write --file data.hex` |
+| rewrite | 任意地址写入（R-M-W） | `dflash rewrite --addr AF004010 --data DEADBEEF --verify` |
+| restore | 从备份文件还原 | `dflash restore backup.hex` |
+| reset | 复位 MCU | `dflash reset` |
+| ucb read | 读取 UCB 区域 | `dflash ucb read --addr AF400000 --length 200` |
+| ucb write | 写入 UCB（高风险） | `dflash ucb write --file ucb_data.hex` |
+| ucb erase | 擦除 UCB（高风险） | `dflash ucb erase --addr AF400000` |
+
+## 全局参数
+
+| 参数 | 简写 | 说明 |
+|------|------|------|
+| --help | -h | 显示帮助信息 |
+| --version | -v | 显示版本号 |
+| --server | -s | TAS Server 地址（默认 localhost） |
+| --port | -p | TAS Server 端口（默认 2000） |
+| --device | -d | 设备标识符 |
+| --config-dir | | DeviceConfigs 目录路径 |
+
+## 对齐约束
+
+| 操作 | 对齐要求 |
+|------|----------|
+| read | 无对齐要求 |
+| write | 8 字节（page）对齐 |
+| erase | 0x2000（sector）自动对齐 |
+| rewrite | 无要求（内部自动处理） |
+
+## 重要注意事项
+
+1. **AURIX DFlash 擦除态为 0x00**（非传统 0xFF）
+2. **UCB 操作高风险**：写错误数据可能永久锁死芯片，工具会要求输入 "yes" 确认
+3. **地址和长度参数均为十六进制**，无需 0x 前缀
+4. **rewrite 使用 Read-Modify-Write 模式**：自动读取整个 sector → 合并新数据 → 擦除 → 写回，确保相邻数据不被破坏
+5. **--backup** 参数可选路径：`--backup` 自动生成文件名，`--backup path.hex` 指定路径
+6. **--verify** 参数：写入后自动读回比对，确保数据正确
 
 ## 快速开始
 
-```
-dflash list                    # 查看连接的设备
-dflash erase --info            # 查看 DFlash 信息（不执行擦除）
-dflash erase --all --verify    # 擦除全部 DFlash 并验证
-dflash reset                   # 复位 MCU
-```
-
----
-
-## 环境要求
-
-| 条件 | 说明 |
-|------|------|
-| 操作系统 | Windows 10 或更高版本 |
-| TAS Server | 必须运行（工具通过 TCP 连接 localhost:24817） |
-| 硬件 | miniWiggler 连接 AURIX MCU |
-| 文件 | `dflash.exe` + `DeviceConfigs/` 目录放在同一路径下 |
-
-> 无需安装 VC++ Redistributable，exe 为静态链接，零额外依赖。
-
----
-
-## 命令总览
-
-```
-dflash <子命令> [选项]
-```
-
-| 子命令 | 功能 |
-|--------|------|
-| `erase` | 擦除 DFlash 扇区 |
-| `read` | 读取 DFlash 内容 |
-| `list` | 列出已连接设备 |
-| `reset` | 复位 MCU |
-
----
-
-## erase — 擦除 DFlash
-
-### 语法
-
-```
-dflash erase [选项]
-```
-
-### 选项
-
-| 选项 | 说明 |
-|------|------|
-| `--all` | 擦除全部 DFlash |
-| `--addr <hex>` | 起始地址（如 `0xAF000000`），自动对齐到扇区边界 |
-| `--sectors <n>` | 擦除扇区数（十进制） |
-| `--info` | 仅显示设备和 DFlash 信息，不执行擦除 |
-| `--verify` | 擦除后回读验证（所有字节应为 0x00） |
-| `--backup <file>` | 擦除前备份 DFlash 内容到文件 |
-| `--reset` | 擦除完成后复位 MCU（恢复运行） |
-| `--no-reset` | 热连接，不复位设备 |
-| `--server <ip>` | TAS Server 地址（默认 localhost） |
-| `--target <id>` | 指定目标设备 |
-| `--config-dir <path>` | 指定 DeviceConfigs 目录路径 |
-
-### 示例
-
 ```bash
-# 查看设备 DFlash 信息
-dflash erase --info
+# 1. 启动 TAS Server（确保 miniWiggler 已连接）
+start_tas_server.bat
 
-# 擦除第一个扇区并验证
-dflash erase --addr 0xAF000000 --sectors 1 --verify
-
-# 擦除全部 DFlash + 备份 + 验证 + 复位
-dflash erase --all --backup backup.bin --verify --reset
-
-# 擦除全部（连接远程 TAS Server）
-dflash erase --all --server 192.168.1.100
-```
-
----
-
-## read — 读取 DFlash
-
-### 语法
-
-```
-dflash read --addr <hex> --length <hex> [选项]
-```
-
-### 选项
-
-| 选项 | 说明 |
-|------|------|
-| `--addr <hex>` / `-a` | 起始地址（必填） |
-| `--length <hex>` / `-l` | 读取字节数（必填） |
-| `--output <file>` / `-o` | 输出文件（`.bin`=二进制，`.hex`=Intel HEX），不指定则终端输出 hex dump |
-| `--server <ip>` | TAS Server 地址 |
-| `--target <id>` | 指定目标设备 |
-
-### 示例
-
-```bash
-# 终端显示 hex dump（4KB）
-dflash read --addr 0xAF000000 --length 0x1000
-
-# 保存为二进制文件
-dflash read -a 0xAF000000 -l 0x20000 -o dump.bin
-
-# 保存为 Intel HEX 格式
-dflash read -a 0xAF000000 -l 0x20000 -o dump.hex
-```
-
----
-
-## list — 列出设备
-
-### 语法
-
-```
-dflash list [--server <ip>]
-```
-
-### 示例
-
-```bash
+# 2. 列出设备
 dflash list
-```
 
-输出：
-```
-TAS DFlash Tool - Device List
-=============================
-Connecting to TAS server at localhost...
-  Server: TasServer V2.0 (Aug  7 2025)
-  Targets (1):
-  [0] TC37x         Application Kit TC367 V2.0
-```
+# 3. 读取 DFlash 数据
+dflash read --addr AF004000 --length 100
 
----
+# 4. 擦除一个 sector
+dflash erase --addr AF004000 --sectors 1
 
-## reset — 复位 MCU
+# 5. 写入数据（带验证）
+dflash rewrite --addr AF004000 --data 1122334455667788 --verify
 
-### 语法
+# 6. 带备份的写入
+dflash rewrite --addr AF004000 --data AABBCCDD --backup --verify
 
-```
-dflash reset [--halt] [--server <ip>] [--target <id>]
-```
-
-### 选项
-
-| 选项 | 说明 |
-|------|------|
-| `--halt` | 复位后暂停 CPU（调试模式） |
-| `--server <ip>` | TAS Server 地址 |
-| `--target <id>` | 指定目标设备 |
-
-### 示例
-
-```bash
-# 复位并恢复运行
+# 7. 复位芯片
 dflash reset
-
-# 复位并暂停（用于调试或 Flash 操作前准备）
-dflash reset --halt
 ```
 
----
+## 版本历史
 
-## 支持的设备
-
-| 设备系列 | 扇区大小 | DFlash 总容量 |
-|----------|----------|---------------|
-| TC21x, TC22x, TC23x, TC26x | 8 KB | 128 KB |
-| TC27x | 8 KB | 384 KB |
-| TC29x | 8 KB | 512 KB |
-| TC33x, TC35x, TC36x | 4 KB | 128 KB |
-| TC37x, TC3Ex | 4 KB | 256 KB |
-| TC38x | 4 KB | 512 KB |
-| TC39x | 4 KB | 1 MB |
-
-- DFlash 基地址：`0xAF000000`
-- 擦除后状态：`0x00`（全零）
-- **不支持 TC4x**（地址/命令序列不同）
-
----
-
-## 退出码
-
-| 码 | 含义 |
-|----|------|
-| 0 | 成功 |
-| 1 | 参数错误 |
-| 2 | 服务器连接失败 |
-| 3 | 获取目标失败 |
-| 4 | 无可用目标 |
-| 5 | 会话启动失败 |
-| 6 | 设备连接失败 |
-| 7 | 不支持的设备 |
-| 10 | Flash 操作失败 |
-| 17 | 验证失败 |
-| 18 | 读取失败 |
-
----
-
-## 常见问题
-
-**Q: 提示 "Cannot connect to TAS server"**
-A: 确保 TAS Server 已启动。检查任务管理器中是否有 `TasServer.exe` 进程。
-
-**Q: 提示 "No targets available"**
-A: 检查 miniWiggler USB 连接是否正常，目标板是否上电。
-
-**Q: 提示 "TC4x devices are not supported"**
-A: 本工具仅支持 TC2x/TC3x 系列。TC4x 需使用其他工具。
-
-**Q: 擦除后读取报 ECC 错误**
-A: 正常现象。擦除后 ECC 校验值失效，但数据读取仍然正确。工具已自动处理此情况。
-
-**Q: 如何添加新设备支持？**
-A: 将设备 JSON 文件放入 `DeviceConfigs/` 目录即可，无需重新编译。
-
----
-
-## 文件结构
-
-```
-Erase/
-├── dflash.exe           # 主程序（静态链接，无 DLL 依赖）
-├── DeviceConfigs/       # 设备配置文件
-│   ├── TC23x_A_step.json
-│   ├── TC37x_A_step.json
-│   └── ...
-└── README.md            # 本文档
-```
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| 2.0 | 2026-05 | 新增 rewrite/ucb 子命令、--version、安全确认机制、C++17 |
+| 1.0 | 2026-04 | 初始版本，支持 erase/read/write/restore/list/reset |

@@ -19,7 +19,7 @@
 
 //********************************************************************************************************************
 //  TAS DFlash Tool for AURIX
-//  Subcommands: erase, read, write, restore, list, reset, ucb
+//  Subcommands: erase, read, write, rewrite, restore, list, reset, ucb
 //  Device configurations are loaded at runtime from JSON files (DeviceConfigs/).
 //********************************************************************************************************************
 
@@ -97,6 +97,9 @@ static constexpr uint32_t FLASH_VAL_WRITE_CMD2         = 0xAA;    // Write confi
 static constexpr uint32_t DFLASH_PAGE_SIZE             = 8;        // DFlash page size in bytes
 
 static constexpr uint32_t DFLASH_ERASED_BYTE      = 0x00u;
+
+// Tool version
+static const char* DFLASH_VERSION = "2.0";
 
 //********************************************************************************************************************
 //  Exit/error codes (consistent across all subcommands)
@@ -584,11 +587,15 @@ static bool saveToIntelHex(const char* filePath, uint32_t baseAddr,
 
 static bool parseHexAddr(const char* s, uint32_t& val)
 {
-    // Use strtoul + tail check to reject trailing garbage (e.g. "AF000000xyz")
+    // Use strtoull + tail check to reject trailing garbage (e.g. "AF000000xyz")
     if (!s || *s == '\0') return false;
     char* end = nullptr;
-    unsigned long v = strtoul(s, &end, 16);
+    unsigned long long v = strtoull(s, &end, 16);
     if (end == s || *end != '\0') return false;
+    if (v > 0xFFFFFFFFULL) {
+        fprintf(stderr, "ERROR: Address 0x%llX exceeds 32-bit range\n", v);
+        return false;
+    }
     val = static_cast<uint32_t>(v);
     return true;
 }
@@ -1797,6 +1804,28 @@ static int doUcbWrite(int argc, char** argv)
     printf("  Write:  %u bytes (%u pages) in %zu segment(s)\n\n",
            totalWriteBytes, totalWriteBytes / DFLASH_PAGE_SIZE, parseResult.segments.size());
 
+    // --- High-risk warning + confirmation ---
+    printf("\n");
+    printf("  *** HIGH RISK OPERATION ***\n");
+    printf("  Writing incorrect UCB data may permanently lock the chip!\n");
+    printf("  Target: %u bytes in %zu segment(s)\n", totalWriteBytes, parseResult.segments.size());
+    printf("\n");
+    printf("  Type 'yes' to confirm: ");
+    fflush(stdout);
+
+    char confirm[16] = {0};
+    if (!fgets(confirm, sizeof(confirm), stdin)) {
+        printf("\nAborted (no input).\n");
+        return EXIT_USAGE_ERROR;
+    }
+    // Strip trailing newline/CR
+    size_t cl = strlen(confirm);
+    while (cl > 0 && (confirm[cl - 1] == '\n' || confirm[cl - 1] == '\r')) confirm[--cl] = '\0';
+    if (strcmp(confirm, "yes") != 0) {
+        printf("  Aborted.\n");
+        return EXIT_SUCCESS;
+    }
+
     // --- Write loop (no erase, direct page programming) ---
     const uint64_t flashCmdBase = static_cast<uint64_t>(ctx.flashCfg.baseAddress);
     uint32_t totalPages = 0;
@@ -2205,7 +2234,7 @@ static int doErase(int argc, char** argv, bool legacyMode)
     }
     uint32_t eraseSize = static_cast<uint32_t>(eraseBytesU64);
 
-    if (sectorAddr + eraseSize - 1 > dflashEndAddr) {
+    if (static_cast<uint64_t>(sectorAddr) + eraseSize - 1 > dflashEndAddr) {
         fprintf(stderr, "ERROR: Range exceeds DFlash boundary (max 0x%08X)\n", dflashEndAddr);
         return EXIT_USAGE_ERROR;
     }
@@ -2279,6 +2308,412 @@ static int doErase(int argc, char** argv, bool legacyMode)
 }
 
 //********************************************************************************************************************
+//  parseHexData - parse hex string (e.g. "12345678AABBCCDD") into byte vector
+//********************************************************************************************************************
+
+static std::vector<uint8_t> parseHexData(const char* hexStr)
+{
+    std::vector<uint8_t> result;
+    if (!hexStr || *hexStr == '\0') {
+        fprintf(stderr, "ERROR: Empty hex data string\n");
+        return result;
+    }
+
+    size_t len = strlen(hexStr);
+    if (len % 2 != 0) {
+        fprintf(stderr, "ERROR: Hex data string must have even length (got %zu)\n", len);
+        return result;
+    }
+
+    result.reserve(len / 2);
+    for (size_t i = 0; i < len; i += 2) {
+        char hi = hexStr[i];
+        char lo = hexStr[i + 1];
+        auto hexVal = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int hv = hexVal(hi);
+        int lv = hexVal(lo);
+        if (hv < 0 || lv < 0) {
+            fprintf(stderr, "ERROR: Invalid hex character at position %zu: '%c%c'\n", i, hi, lo);
+            result.clear();
+            return result;
+        }
+        result.push_back(static_cast<uint8_t>((hv << 4) | lv));
+    }
+    return result;
+}
+
+//********************************************************************************************************************
+//  doRewrite - Read-Modify-Write: arbitrary address write with automatic sector alignment
+//********************************************************************************************************************
+
+static void printRewriteUsage()
+{
+    printf("Usage: dflash rewrite --file <path> [--addr <hex>] [options]\n");
+    printf("       dflash rewrite --addr <hex> --data <hexstring> [options]\n\n");
+    printf("Write data to DFlash at arbitrary addresses using Read-Modify-Write.\n");
+    printf("Automatically handles sector alignment by reading, merging, erasing,\n");
+    printf("and writing back entire sectors.\n\n");
+    printf("Data source (mutually exclusive):\n");
+    printf("  --file, -f <path>     Input file (.hex or .bin)\n");
+    printf("  --data <hexstring>    Hex data string (e.g. 12345678AABBCCDD)\n\n");
+    printf("Options:\n");
+    printf("  --addr, -a <hex>      Start address (required for .bin and --data)\n");
+    printf("  --backup [path]       Backup affected sectors before rewrite\n");
+    printf("                        (auto-generates filename if path omitted)\n");
+    printf("  --verify, -v          Read back and verify after writing\n");
+    printf("  --reset               Reset MCU after rewrite\n");
+    printf("  --device <name>       Device name (e.g. TC27x)\n");
+    printf("  --server <ip>         TAS server IP (default: localhost)\n");
+    printf("  --target <id>         Target identifier\n");
+    printf("  --config-dir <path>   DeviceConfigs directory\n\n");
+    printf("Examples:\n");
+    printf("  dflash rewrite --file patch.hex --verify\n");
+    printf("  dflash rewrite --file patch.bin --addr AF001000\n");
+    printf("  dflash rewrite --addr AF000010 --data DEADBEEF --backup\n");
+    printf("  dflash rewrite --addr AF000010 --data 0102030405060708 --backup my_backup.hex\n");
+}
+
+static int doRewrite(int argc, char** argv)
+{
+    CommonArgs args;
+    const char* inputFile = nullptr;
+    const char* dataStr = nullptr;
+    uint32_t writeAddr = 0;
+    bool hasAddr = false;
+    bool doVerify = false;
+    bool doResetMcu = false;
+    bool doBackup = false;
+    const char* backupPath = nullptr;  // nullptr = auto-generate
+
+    // Parse arguments
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if ((strcmp(argv[i], "--file") == 0 || strcmp(argv[i], "-f") == 0) && i + 1 < argc) {
+            inputFile = argv[++i]; i++; continue;
+        }
+        if ((strcmp(argv[i], "--addr") == 0 || strcmp(argv[i], "-a") == 0) && i + 1 < argc) {
+            if (!parseHexAddr(argv[++i], writeAddr)) { fprintf(stderr, "ERROR: Invalid address\n"); return EXIT_USAGE_ERROR; }
+            hasAddr = true; i++; continue;
+        }
+        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
+            dataStr = argv[++i]; i++; continue;
+        }
+        if (strcmp(argv[i], "--backup") == 0) {
+            doBackup = true;
+            // Check if next arg is a path (not starting with '--' and not end of args)
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
+                backupPath = argv[++i];
+            }
+            i++; continue;
+        }
+        if (strcmp(argv[i], "--verify") == 0 || strcmp(argv[i], "-v") == 0) {
+            doVerify = true; i++; continue;
+        }
+        if (strcmp(argv[i], "--reset") == 0) {
+            doResetMcu = true; i++; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printRewriteUsage();
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+
+    // Mutual exclusion check
+    if (inputFile && dataStr) {
+        fprintf(stderr, "ERROR: --file and --data are mutually exclusive\n");
+        return EXIT_USAGE_ERROR;
+    }
+    if (!inputFile && !dataStr) {
+        fprintf(stderr, "ERROR: Either --file or --data is required\n");
+        printRewriteUsage();
+        return EXIT_USAGE_ERROR;
+    }
+    if (dataStr && !hasAddr) {
+        fprintf(stderr, "ERROR: --addr is required when using --data\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    // --- Parse data source ---
+    std::vector<uint8_t> newData;
+
+    if (dataStr) {
+        newData = parseHexData(dataStr);
+        if (newData.empty()) return EXIT_USAGE_ERROR;
+    } else {
+        // Parse from file
+        std::string filePath(inputFile);
+        std::string ext;
+        size_t dotPos = filePath.find_last_of('.');
+        if (dotPos != std::string::npos && dotPos + 1 < filePath.size()) {
+            ext = filePath.substr(dotPos + 1);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        }
+
+        HexParseResult parseResult;
+        if (ext == "hex" || ext == "ihex") {
+            parseResult = parseIntelHex(filePath);
+        } else {
+            if (!hasAddr) {
+                fprintf(stderr, "ERROR: --addr is required for binary files\n");
+                return EXIT_USAGE_ERROR;
+            }
+            parseResult = loadBinaryFile(filePath, writeAddr);
+        }
+
+        if (!parseResult.success) {
+            fprintf(stderr, "ERROR: Failed to parse '%s': %s\n", inputFile, parseResult.errorMsg.c_str());
+            return EXIT_HEX_PARSE_ERROR;
+        }
+        if (parseResult.segments.empty()) {
+            fprintf(stderr, "ERROR: No data found in '%s'\n", inputFile);
+            return EXIT_HEX_PARSE_ERROR;
+        }
+
+        // For HEX files, use embedded address unless --addr overrides
+        if (hasAddr && (ext == "hex" || ext == "ihex")) {
+            uint32_t originalBase = parseResult.segments[0].baseAddress;
+            int32_t offset = static_cast<int32_t>(writeAddr) - static_cast<int32_t>(originalBase);
+            for (auto& seg : parseResult.segments) {
+                seg.baseAddress = static_cast<uint32_t>(static_cast<int32_t>(seg.baseAddress) + offset);
+            }
+        }
+
+        // For rewrite, we flatten all segments into one contiguous block
+        // Use the first segment's base address as writeAddr
+        if (!hasAddr) {
+            writeAddr = parseResult.segments[0].baseAddress;
+        }
+
+        // Flatten segments: find min and max address, create contiguous buffer
+        uint32_t minAddr = parseResult.segments[0].baseAddress;
+        uint32_t maxEnd = minAddr + static_cast<uint32_t>(parseResult.segments[0].data.size());
+        for (const auto& seg : parseResult.segments) {
+            if (seg.baseAddress < minAddr) minAddr = seg.baseAddress;
+            uint32_t segEnd = seg.baseAddress + static_cast<uint32_t>(seg.data.size());
+            if (segEnd > maxEnd) maxEnd = segEnd;
+        }
+
+        writeAddr = minAddr;
+        uint32_t totalLen = maxEnd - minAddr;
+        newData.resize(totalLen, DFLASH_ERASED_BYTE);
+        for (const auto& seg : parseResult.segments) {
+            uint32_t offset = seg.baseAddress - minAddr;
+            memcpy(newData.data() + offset, seg.data.data(), seg.data.size());
+        }
+    }
+
+    if (newData.empty()) {
+        fprintf(stderr, "ERROR: No data to write\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    uint32_t dataLen = static_cast<uint32_t>(newData.size());
+
+    printf("TAS DFlash Rewrite Tool (Read-Modify-Write)\n");
+    printf("============================================\n\n");
+
+    // --- Common initialization ---
+    ToolContext ctx("DFlashRewrite");
+    int initResult = initTool(ctx, args, "DFlashRewrite", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (initResult != EXIT_OK) return initResult;
+
+    DFlashConfig& flashCfg = ctx.flashCfg;
+    const uint64_t flashCmdBase = static_cast<uint64_t>(flashCfg.baseAddress);
+    uint32_t dflashEndAddr = flashCfg.baseAddress + flashCfg.totalSize - 1;
+
+    // --- Safety checks ---
+    // DFlash address range check
+    if (writeAddr < flashCfg.baseAddress || writeAddr > dflashEndAddr) {
+        fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range (0x%08X - 0x%08X)\n",
+                writeAddr, flashCfg.baseAddress, dflashEndAddr);
+        return EXIT_USAGE_ERROR;
+    }
+
+    // Overflow protection
+    uint64_t writeEndU64 = static_cast<uint64_t>(writeAddr) + dataLen;
+    if (writeEndU64 - 1 > dflashEndAddr) {
+        fprintf(stderr, "ERROR: Write range exceeds DFlash boundary (end=0x%08llX, max=0x%08X)\n",
+                static_cast<unsigned long long>(writeEndU64 - 1), dflashEndAddr);
+        return EXIT_USAGE_ERROR;
+    }
+
+    // --- Step 1: Determine sector range ---
+    uint32_t sectorSize = flashCfg.sectorSize;
+    uint32_t sectorStart = writeAddr & ~(sectorSize - 1);
+    uint32_t sectorEnd = (writeAddr + dataLen + sectorSize - 1) & ~(sectorSize - 1);
+    uint32_t numSectors = (sectorEnd - sectorStart) / sectorSize;
+    uint32_t totalSectorBytes = sectorEnd - sectorStart;
+
+    // UCB locked region check (reuse LockedRegion pattern from doUcbErase)
+    struct LockedRegion { uint32_t start; uint32_t end; const char* name; };
+    static const LockedRegion lockedRegions[] = {
+        { 0xAF400800, 0xAF400FFF, "UCB security (OTP/DFLASH/DBG/HSM)" },
+        { 0xAF401800, 0xAF401FFF, "UCB security (reserved)" },
+    };
+
+    uint32_t writeEnd = writeAddr + dataLen - 1;
+    for (const auto& locked : lockedRegions) {
+        if (!(writeEnd < locked.start || writeAddr > locked.end)) {
+            fprintf(stderr, "ERROR: Write range 0x%08X-0x%08X overlaps locked region 0x%08X-0x%08X (%s)\n",
+                    writeAddr, writeEnd, locked.start, locked.end, locked.name);
+            fprintf(stderr, "  These regions are chip-level protected and cannot be modified.\n");
+            return EXIT_USAGE_ERROR;
+        }
+    }
+
+    // Large operation warning
+    if (numSectors > 10) {
+        printf("  WARNING: Rewrite affects %u sectors (>10). This may take a while.\n", numSectors);
+    }
+
+    const char* displayName = args.deviceName ? args.deviceName : flashCfg.deviceName.c_str();
+    printf("  Device:  %s (%s), DFlash: %u KB\n",
+           displayName, flashCfg.family.c_str(), flashCfg.totalSize / 1024);
+    printf("  Write:   0x%08X - 0x%08X (%u bytes)\n", writeAddr, writeEnd, dataLen);
+    printf("  Sectors: 0x%08X - 0x%08X (%u sectors, %u bytes)\n\n",
+           sectorStart, sectorEnd - 1, numSectors, totalSectorBytes);
+
+    // --- Step 2: Read original sector data ---
+    printf("Step 1/5: Reading %u sector(s) from 0x%08X...\n", numSectors, sectorStart);
+    std::vector<uint8_t> sectorData(totalSectorBytes, 0);
+    uint32_t totalRead = 0;
+    const uint32_t chunkSize = sectorSize;
+
+    for (uint32_t offset = 0; offset < totalSectorBytes; offset += chunkSize) {
+        uint32_t remaining = totalSectorBytes - offset;
+        uint32_t thisChunk = std::min(remaining, chunkSize);
+        uint32_t bytesRead = 0;
+        tas_return_et r = ctx.client.read(sectorStart + offset, sectorData.data() + offset, thisChunk, &bytesRead);
+        if (r != TAS_ERR_NONE && r != TAS_ERR_RW_READ) {
+            fprintf(stderr, "ERROR: Read failed at 0x%08X: %s\n", sectorStart + offset, ctx.client.get_error_info());
+            return EXIT_IO_ERROR;
+        }
+        totalRead += bytesRead;
+    }
+    printf("  Read %u bytes OK\n", totalRead);
+
+    // --- Step 3: Optional backup ---
+    if (doBackup) {
+        std::string autoBackupName;
+        const char* backupFilePath;
+        if (backupPath) {
+            backupFilePath = backupPath;
+        } else {
+            char nameBuf[128];
+            snprintf(nameBuf, sizeof(nameBuf), "rewrite_backup_%08X.hex", sectorStart);
+            autoBackupName = nameBuf;
+            backupFilePath = autoBackupName.c_str();
+        }
+        printf("\nStep 2/5: Backing up to %s...\n", backupFilePath);
+        if (!backupDFlash(ctx.client, sectorStart, totalSectorBytes, sectorSize, backupFilePath)) {
+            fprintf(stderr, "ERROR: Backup failed, aborting rewrite\n");
+            return EXIT_BACKUP_ERROR;
+        }
+    } else {
+        printf("Step 2/5: Backup skipped (use --backup to enable)\n");
+    }
+
+    // --- Step 4: Merge new data ---
+    printf("\nStep 3/5: Merging %u bytes at offset 0x%X...\n", dataLen, writeAddr - sectorStart);
+    uint32_t mergeOffset = writeAddr - sectorStart;
+    memcpy(sectorData.data() + mergeOffset, newData.data(), dataLen);
+    printf("  Merge complete\n");
+
+    // --- Step 5: Erase and write back ---
+    printf("\nStep 4/5: Erasing %u sector(s) at 0x%08X...\n", numSectors, sectorStart);
+    if (!clearFlashStatus(ctx.client, flashCmdBase)) {
+        fprintf(stderr, "ERROR: Clear flash status failed\n");
+        return EXIT_FLASH_STATUS_ERROR;
+    }
+    if (!eraseMultipleSectors(ctx.client, flashCmdBase, sectorStart, numSectors)) {
+        fprintf(stderr, "ERROR: Erase command failed\n");
+        return EXIT_ERASE_CMD_ERROR;
+    }
+    uint32_t elapsedMs = 0;
+    if (!waitUnbusyD0(ctx.client, flashCfg.isTc3x, elapsedMs)) {
+        fprintf(stderr, "ERROR: Erase timeout\n");
+        return EXIT_ERASE_TIMEOUT;
+    }
+    if (!checkEraseErrors(ctx.client, flashCfg.isTc3x)) {
+        return EXIT_ERASE_FLAGS;
+    }
+    if (!resetToRead(ctx.client, flashCmdBase)) {
+        fprintf(stderr, "ERROR: Reset to read mode failed\n");
+        return EXIT_FLASH_RESET_ERROR;
+    }
+    printf("  Erase completed in %u ms\n", elapsedMs);
+
+    // Write back merged sector data
+    printf("\nStep 5/5: Writing back %u bytes to 0x%08X...\n", totalSectorBytes, sectorStart);
+    uint32_t totalPages = (totalSectorBytes + DFLASH_PAGE_SIZE - 1) / DFLASH_PAGE_SIZE;
+    uint32_t pagesWritten = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    int writeResult = writeSegmentPages(ctx.client, flashCfg.isTc3x, flashCmdBase,
+                                        sectorData, sectorStart,
+                                        pagesWritten, totalPages, startTime);
+    if (writeResult != EXIT_OK) return writeResult;
+
+    printf("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
+    auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    printf("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
+
+    // --- Verify ---
+    if (doVerify) {
+        printf("\nVerifying rewrite:\n");
+        uint32_t verifyErrors = 0;
+        std::vector<uint8_t> readBuf(chunkSize, 0);
+
+        for (uint32_t offset = 0; offset < dataLen; offset += chunkSize) {
+            uint32_t remaining = dataLen - offset;
+            uint32_t thisChunk = std::min(remaining, chunkSize);
+            uint32_t bytesRead = 0;
+            tas_return_et vret = ctx.client.read(writeAddr + offset, readBuf.data(), thisChunk, &bytesRead);
+            if (vret != TAS_ERR_NONE && vret != TAS_ERR_RW_READ) {
+                fprintf(stderr, "  ERROR: Verify read failed at 0x%08X\n", writeAddr + offset);
+                return EXIT_WRITE_VERIFY_ERROR;
+            }
+            for (uint32_t i = 0; i < bytesRead && i < thisChunk; i++) {
+                if (readBuf[i] != newData[offset + i]) {
+                    if (verifyErrors < 10)
+                        printf("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
+                               writeAddr + offset + i, newData[offset + i], readBuf[i]);
+                    verifyErrors++;
+                }
+            }
+        }
+        if (verifyErrors > 0) {
+            printf("  FAILED: %u bytes mismatch\n", verifyErrors);
+            return EXIT_WRITE_VERIFY_ERROR;
+        }
+        printf("  PASSED: all %u bytes verified\n", dataLen);
+    }
+
+    // --- Reset MCU ---
+    if (doResetMcu) {
+        printf("\nResetting MCU...\n");
+        tas_return_et r = ctx.client.device_connect(TAS_CLNT_DCO_RESET);
+        if (r != TAS_ERR_NONE) {
+            printf("  WARN: Reset failed: %s\n", ctx.client.get_error_info());
+        } else {
+            printf("  MCU reset. Normal execution resumed.\n");
+        }
+    }
+
+    printf("\nDFlash rewrite completed successfully.\n");
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
 //  UCB Usage
 //********************************************************************************************************************
 
@@ -2307,6 +2742,7 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
     printf("Subcommands:\n");
     printf("  erase    Erase DFlash sectors\n");
     printf("  write    Write data to DFlash from HEX/BIN file\n");
+    printf("  rewrite  Write to DFlash at arbitrary address (Read-Modify-Write)\n");
     printf("  restore  Restore DFlash from backup (erase + write + verify)\n");
     printf("  read     Read DFlash content\n");
     printf("  list     List connected TAS targets\n");
@@ -2353,9 +2789,13 @@ int main(int argc, char** argv)
     // Help
     if (first == "--help" || first == "-h") { printUsage(argv[0]); return EXIT_OK; }
 
+    // Version
+    if (first == "--version" || first == "-v") { printf("dflash version %s\n", DFLASH_VERSION); return EXIT_OK; }
+
     // Subcommands
     if (first == "erase" || first == "e") return doErase(argc - 2, argv + 2, false);
     if (first == "write" || first == "w") return doWrite(argc - 2, argv + 2);
+    if (first == "rewrite" || first == "rw") return doRewrite(argc - 2, argv + 2);
     if (first == "restore") return doRestore(argc - 2, argv + 2);
     if (first == "read"  || first == "r") return doRead(argc - 2, argv + 2);
     if (first == "list"  || first == "l") return doList(argc - 2, argv + 2);

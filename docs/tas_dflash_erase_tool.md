@@ -25,6 +25,7 @@
 - **erase** - Erase DFlash sectors with AURIX-compliant sequence
 - **read** - Read DFlash content and output as hex dump, binary, or Intel HEX
 - **write** - Write data to DFlash from a HEX or binary file
+- **rewrite** - Read-Modify-Write to any DFlash address (no alignment required)
 - **restore** - Restore DFlash from a backup file (erase + write + verify)
 - **list** - List connected TAS targets and device info
 - **reset** - Reset the MCU (with optional halt)
@@ -77,6 +78,7 @@ dflash <subcommand> [options]
 | `erase` | `e` | Erase DFlash sectors |
 | `read` | `r` | Read DFlash content |
 | `write` | `w` | Write data to DFlash |
+| `rewrite` | `rw` | Read-Modify-Write to any DFlash address |
 | `restore` | | Restore DFlash from backup |
 | `list` | `l` | List connected TAS targets |
 | `reset` | | Reset the MCU |
@@ -251,6 +253,75 @@ Restore to a remote target:
 ```
 dflash restore --file dump.bin --server 192.168.1.100
 ```
+
+---
+
+## `rewrite` Subcommand
+
+```
+dflash rewrite --file <path> [--addr <hex>]       # From firmware file
+dflash rewrite --addr <hex> --data <hexstring>    # Inline hex data
+```
+
+Read-Modify-Write to any DFlash address. No need to manually handle sector alignment — the tool automatically performs the full read-merge-erase-writeback sequence.
+
+### Options
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `--file <path>` | `-f` | Input file (`.hex` contains address info; `.bin` requires `--addr`). |
+| `--addr <hex>` | `-a` | Target address (hexadecimal, 0x prefix optional). |
+| `--data <hexstring>` | | Hex data string to write (e.g. `12345678AABBCCDD`). |
+| `--backup [path]` | | Optional backup to disk. With path = save to specified file; without path = auto-generate in current directory. |
+| `--verify` | `-v` | Verify written data by read-back comparison. |
+| `--reset` | | Reset MCU after completion. |
+| `--server <ip>` | `-s` | TAS server IP address. Default: `localhost` |
+| `--target <id>` | `-t` | Target identifier string. Default: first available target |
+| `--device <name>` | `-d` | Device name (overrides auto-detection). |
+| `--config-dir <path>` | | Path to the `DeviceConfigs/` directory. See [DeviceConfigs Configuration](#deviceconfigs-configuration). |
+
+### How It Works (5-Step Flow)
+
+1. **Parse parameters** — determine write start address and data length
+2. **Read affected sectors** — calculate sector range, read all sector data into RAM
+3. **Optional backup** — save original sector data to hex file (`--backup`)
+4. **Merge data** — overlay new data at the correct offset within the sector buffer
+5. **Erase and writeback** — erase all affected sectors, write back the merged data
+
+### Examples
+
+Rewrite from a hex file (address determined by file):
+```
+dflash rewrite --file firmware.hex --verify
+```
+
+Rewrite from a bin file to a specific address:
+```
+dflash rewrite --file data.bin --addr AF000100
+```
+
+Inline write 8 bytes:
+```
+dflash rewrite --addr AF000004 --data 12345678AABBCCDD --verify
+```
+
+Rewrite with auto-generated backup file:
+```
+dflash rewrite --addr AF000004 --data FF --backup
+```
+
+Rewrite with specified backup path:
+```
+dflash rewrite --file patch.hex --backup D:\backups\before_patch.hex
+```
+
+### Notes
+
+- Write range does **not** need to be sector-aligned; the tool handles alignment automatically
+- By default, backup is kept only in RAM; use `--backup` to persist to disk for power-failure recovery
+- There is a power-failure risk window during erase-writeback; use `--backup` for critical data
+- `--file` and `--data` are mutually exclusive
+- `--data` requires `--addr`
 
 ---
 
