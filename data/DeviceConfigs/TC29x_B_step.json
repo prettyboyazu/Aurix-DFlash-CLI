@@ -1,5 +1,6 @@
 {
     "deviceName": "TC29x B step",
+    "svdFile": "RegisterDefs/TC29xB-full.json",
     "flaxFileName": "flax_TC2xx.hex",
     "busWidth": 32,
     "addressStep": 4,

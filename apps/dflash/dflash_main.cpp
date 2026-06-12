@@ -32,6 +32,7 @@
 
 #include "device_config_loader.h"
 #include "hex_parser.h"
+#include "svd_loader.h"
 
 #include <cstdio>
 #include <cstring>
@@ -42,8 +43,15 @@
 #include <chrono>
 #include <thread>
 #include <fstream>
+#include <iostream>
+#include <sstream>
 #include <algorithm>
 #include <filesystem>
+#include <cctype>
+
+// nlohmann/json for --json output mode
+#include "nlohmann/json.hpp"
+using nljson = nlohmann::json;
 
 #ifdef _WIN32
 #include <windows.h>
@@ -99,7 +107,7 @@ static constexpr uint32_t DFLASH_PAGE_SIZE             = 8;        // DFlash pag
 static constexpr uint32_t DFLASH_ERASED_BYTE      = 0x00u;
 
 // Tool version
-static const char* DFLASH_VERSION = "2.0";
+static const char* DFLASH_VERSION = "2.2";
 
 //********************************************************************************************************************
 //  Exit/error codes (consistent across all subcommands)
@@ -124,9 +132,37 @@ static constexpr int EXIT_IO_ERROR           = 18;  // File I/O error
 static constexpr int EXIT_WRITE_CMD_ERROR    = 19;  // Write page command failed
 static constexpr int EXIT_WRITE_VERIFY_ERROR = 20;  // Write verification failed
 static constexpr int EXIT_HEX_PARSE_ERROR    = 21;  // HEX file parse error
+static constexpr int EXIT_MISMATCH_ERROR     = 22;  // Compare found mismatches
+static constexpr int EXIT_NOT_FOUND          = 23;  // Search pattern not found
 
 static constexpr uint32_t WAIT_UNBUSY_TIMEOUT_MS  = 10000;
 static constexpr uint32_t POLL_INTERVAL_MS         = 10;
+
+//********************************************************************************************************************
+//  Global JSON output mode flag (set from CommonArgs after parsing)
+//********************************************************************************************************************
+
+static bool g_json = false;
+
+// JSON helper: print JSON to stdout and return exit code
+static int jsonOk(const nljson& data) {
+    nljson out = data;
+    out["status"] = "ok";
+    printf("%s\n", out.dump().c_str());
+    return EXIT_OK;
+}
+
+static int jsonError(int code, const std::string& msg) {
+    nljson out;
+    out["status"] = "error";
+    out["code"] = code;
+    out["message"] = msg;
+    printf("%s\n", out.dump().c_str());
+    return code;
+}
+
+// Conditional printf: only prints when NOT in JSON mode
+#define JPRINTF(...) do { if (!g_json) printf(__VA_ARGS__); } while(0)
 
 //********************************************************************************************************************
 //  TC4x rejection helper (TC4x has different DFlash base addresses and erase command sequence)
@@ -137,6 +173,9 @@ static constexpr uint32_t POLL_INTERVAL_MS         = 10;
 static int rejectTc4xDevice(const tas_con_info_st* conInfo)
 {
     if (tas_df_check_if_tc4x(conInfo->device_type)) {
+        if (g_json) {
+            return EXIT_DEVICE_ERROR; // caller will use jsonError
+        }
         fprintf(stderr, "ERROR: TC4x devices are not supported by this tool.\n");
         fprintf(stderr, "  Detected: %s (jtag_id=0x%08X)\n",
                tas_get_device_name_str(conInfo->device_type), conInfo->device_type);
@@ -609,6 +648,7 @@ struct CommonArgs {
     const char* targetId = nullptr;
     const char* deviceName = nullptr;
     const char* configDir = nullptr;
+    bool jsonOutput = false;
 };
 
 // Returns: 1 = consumed 1 arg, 2 = consumed 2 args (option + value), 0 = not recognized
@@ -629,6 +669,10 @@ static int parseCommonOption(int argc, char** argv, int idx, CommonArgs& args)
     if (strcmp(argv[idx], "--config-dir") == 0 && idx + 1 < argc) {
         args.configDir = argv[idx + 1];
         return 2;
+    }
+    if (strcmp(argv[idx], "--json") == 0) {
+        args.jsonOutput = true;
+        return 1;
     }
     return 0;
 }
@@ -681,8 +725,10 @@ struct ToolContext {
     CTasClientRw client;
     DFlashConfig flashCfg;
     DeviceConfigLoader configLoader;
+    SvdLoader svd;
     const tas_con_info_st* conInfo;
     std::string configDirPath;
+    bool connected = false;
 
     ToolContext(const char* clientName) : client(clientName), conInfo(nullptr) {}
 };
@@ -698,7 +744,7 @@ static int initTool(ToolContext& ctx, const CommonArgs& args,
         return EXIT_USAGE_ERROR;
 
     // Connect to TAS server
-    printf("Connecting to TAS server at %s...\n", args.serverIp);
+    JPRINTF("Connecting to TAS server at %s...\n", args.serverIp);
     tas_return_et ret = ctx.client.server_connect(args.serverIp);
     if (ret != TAS_ERR_NONE) {
         fprintf(stderr, "ERROR: %s\n", ctx.client.get_error_info());
@@ -706,7 +752,7 @@ static int initTool(ToolContext& ctx, const CommonArgs& args,
     }
 
     const tas_server_info_st* si = ctx.client.get_server_info();
-    printf("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
+    JPRINTF("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
 
     // Detect targets
     const tas_target_info_st* targets;
@@ -721,15 +767,15 @@ static int initTool(ToolContext& ctx, const CommonArgs& args,
         return EXIT_NO_TARGET;
     }
 
-    printf("  Targets: %u\n", numTargets);
+    JPRINTF("  Targets: %u\n", numTargets);
 
     // Select target
     const char* selectedTargetId = (args.targetId != nullptr) ? args.targetId : targets[0].identifier;
     if (args.targetId == nullptr)
-        printf("  Auto-selected target [0]\n");
+        JPRINTF("  Auto-selected target [0]\n");
 
     // Start session
-    printf("\nStarting session...\n");
+    JPRINTF("\nStarting session...\n");
     ret = startSession(ctx.client, selectedTargetId, sessionName);
     if (ret != TAS_ERR_NONE) {
         fprintf(stderr, "ERROR: %s\n", ctx.client.get_error_info());
@@ -738,7 +784,7 @@ static int initTool(ToolContext& ctx, const CommonArgs& args,
 
     // Connect to device
     const char* dcoStr = (dco == TAS_CLNT_DCO_HOT_ATTACH) ? "hot attach" : "reset and halt";
-    printf("Connecting to device (%s)...\n", dcoStr);
+    JPRINTF("Connecting to device (%s)...\n", dcoStr);
     ret = ctx.client.device_connect(dco);
     if (ret != TAS_ERR_NONE) {
         fprintf(stderr, "ERROR: %s\n", ctx.client.get_error_info());
@@ -766,6 +812,19 @@ static int initTool(ToolContext& ctx, const CommonArgs& args,
         }
     }
 
+    // Load SVD register definitions if available
+    if (!ctx.flashCfg.svdFilePath.empty()) {
+        std::string parentDir = std::filesystem::path(ctx.configDirPath).parent_path().string();
+        std::string svdPath;
+        if (!parentDir.empty()) {
+            svdPath = (std::filesystem::path(parentDir) / ctx.flashCfg.svdFilePath).string();
+        } else {
+            svdPath = ctx.flashCfg.svdFilePath;
+        }
+        ctx.svd.loadFromFile(svdPath);
+    }
+
+    ctx.connected = true;
     return EXIT_OK;
 }
 
@@ -782,36 +841,59 @@ static int doList(int argc, char** argv)
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: dflash list [options]\n"
                    "  --server <ip>       TAS server IP (default: localhost)\n"
-                   "  --target <id>       Target identifier\n");
+                   "  --target <id>       Target identifier\n"
+                   "  --json              Output as JSON\n");
             return EXIT_OK;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    printf("TAS DFlash Tool - Device List\n");
-    printf("=============================\n");
-    printf("Connecting to TAS server at %s...\n", args.serverIp);
+    JPRINTF("TAS DFlash Tool - Device List\n");
+    JPRINTF("=============================\n");
+    JPRINTF("Connecting to TAS server at %s...\n", args.serverIp);
 
     CTasClientRw client("DFlashList");
     tas_return_et ret = client.server_connect(args.serverIp);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR; }
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_SERVER_ERROR, client.get_error_info());
+        fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR;
+    }
 
     const tas_server_info_st* si = client.get_server_info();
-    printf("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
+    JPRINTF("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
 
     const tas_target_info_st* targets;
     uint32_t numTargets;
     ret = client.get_targets(&targets, &numTargets);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR; }
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_TARGET_ERROR, client.get_error_info());
+        fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR;
+    }
 
-    printf("  Targets (%u):\n", numTargets);
+    JPRINTF("  Targets (%u):\n", numTargets);
     for (uint32_t i = 0; i < numTargets; i++) {
-        printf("  [%u] %-12s  %s\n", i,
+        JPRINTF("  [%u] %-12s  %s\n", i,
                tas_get_device_name_str(targets[i].device_type),
                targets[i].identifier);
     }
-    if (numTargets == 0) printf("  No targets found.\n");
+    if (numTargets == 0) JPRINTF("  No targets found.\n");
+
+    if (g_json) {
+        nljson j;
+        j["server"] = std::string(si->server_name) + " V" + std::to_string(si->v_major) + "." + std::to_string(si->v_minor);
+        nljson targetsArr = nljson::array();
+        for (uint32_t i = 0; i < numTargets; i++) {
+            targetsArr.push_back({
+                {"index", i},
+                {"device", tas_get_device_name_str(targets[i].device_type)},
+                {"identifier", targets[i].identifier}
+            });
+        }
+        j["targets"] = targetsArr;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -833,48 +915,69 @@ static int doReset(int argc, char** argv)
                    "Options:\n"
                    "  --halt              Reset and halt (default: reset and run)\n"
                    "  --server <ip>       TAS server IP (default: localhost)\n"
-                   "  --target <id>       Target identifier\n");
+                   "  --target <id>       Target identifier\n"
+                   "  --json              Output as JSON\n");
             return EXIT_OK;
         }
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    printf("TAS DFlash Tool - MCU Reset\n");
-    printf("===========================\n");
-    printf("Connecting to TAS server at %s...\n", args.serverIp);
+    JPRINTF("TAS DFlash Tool - MCU Reset\n");
+    JPRINTF("===========================\n");
+    JPRINTF("Connecting to TAS server at %s...\n", args.serverIp);
 
     CTasClientRw client("DFlashReset");
     tas_return_et ret = client.server_connect(args.serverIp);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR; }
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_SERVER_ERROR, client.get_error_info());
+        fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SERVER_ERROR;
+    }
 
     const tas_server_info_st* si = client.get_server_info();
-    printf("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
+    JPRINTF("  Server: %s V%d.%d (%s)\n", si->server_name, si->v_major, si->v_minor, si->date);
 
     const tas_target_info_st* targets;
     uint32_t numTargets;
     ret = client.get_targets(&targets, &numTargets);
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR; }
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_TARGET_ERROR, client.get_error_info());
+        fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_TARGET_ERROR;
+    }
 
-    if (numTargets == 0) { fprintf(stderr, "ERROR: No targets found\n"); return EXIT_NO_TARGET; }
+    if (numTargets == 0) {
+        if (g_json) return jsonError(EXIT_NO_TARGET, "No targets found");
+        fprintf(stderr, "ERROR: No targets found\n"); return EXIT_NO_TARGET;
+    }
 
     const char* selectedTargetId = (args.targetId != nullptr) ? args.targetId : targets[0].identifier;
     if (args.targetId == nullptr) {
-        printf("  Target: [0] %s (%s)\n",
+        JPRINTF("  Target: [0] %s (%s)\n",
                tas_get_device_name_str(targets[0].device_type), targets[0].identifier);
     }
 
     ret = startSession(client, selectedTargetId, "DFlashReset");
-    if (ret != TAS_ERR_NONE) { fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SESSION_ERROR; }
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_SESSION_ERROR, client.get_error_info());
+        fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SESSION_ERROR;
+    }
 
     tas_clnt_dco_et dco = halt ? TAS_CLNT_DCO_RESET_AND_HALT : TAS_CLNT_DCO_RESET;
-    printf("Resetting MCU (%s)...\n", halt ? "reset and halt" : "reset and run");
+    JPRINTF("Resetting MCU (%s)...\n", halt ? "reset and halt" : "reset and run");
     ret = client.device_connect(dco);
     if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_CONNECT_ERROR, client.get_error_info());
         fprintf(stderr, "ERROR: Reset failed: %s\n", client.get_error_info());
         return EXIT_CONNECT_ERROR;
     }
 
+    if (g_json) {
+        nljson j;
+        j["action"] = "reset";
+        j["mode"] = halt ? "halt" : "run";
+        return jsonOk(j);
+    }
     printf("  MCU reset successful.%s\n", halt ? " Device is halted." : " Normal execution resumed.");
     return EXIT_OK;
 }
@@ -926,36 +1029,43 @@ static int doRead(int argc, char** argv)
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
     if (!hasAddr || !hasLength) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--addr and --length are required");
         fprintf(stderr, "ERROR: --addr and --length are required\n");
         return EXIT_USAGE_ERROR;
     }
 
-    printf("TAS DFlash Read Tool\n");
-    printf("====================\n");
+    JPRINTF("TAS DFlash Read Tool\n");
+    JPRINTF("====================\n");
 
     ToolContext ctx("DFlashRead");
     int initResult = initTool(ctx, args, "DFlashRead", TAS_CLNT_DCO_RESET_AND_HALT);
-    if (initResult != EXIT_OK) return initResult;
+    if (initResult != EXIT_OK) {
+        if (g_json) return jsonError(initResult, "Failed to initialize tool connection");
+        return initResult;
+    }
 
     DFlashConfig& flashCfg = ctx.flashCfg;
 
     uint32_t dflashEndAddr = flashCfg.baseAddress + flashCfg.totalSize - 1;
     if (readAddr < flashCfg.baseAddress || readAddr > dflashEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address out of DFlash range");
         fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range (0x%08X - 0x%08X)\n",
                 readAddr, flashCfg.baseAddress, dflashEndAddr);
         return EXIT_USAGE_ERROR;
     }
     if (static_cast<uint64_t>(readAddr) + readLength - 1 > dflashEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Range exceeds DFlash boundary");
         fprintf(stderr, "ERROR: Range exceeds DFlash boundary (max 0x%08X)\n", dflashEndAddr);
         return EXIT_USAGE_ERROR;
     }
 
     const char* displayName = args.deviceName ? args.deviceName : flashCfg.deviceName.c_str();
-    printf("  Device: %s (%s), DFlash: %u KB\n",
+    JPRINTF("  Device: %s (%s), DFlash: %u KB\n",
            displayName, flashCfg.family.c_str(), flashCfg.totalSize / 1024);
-    printf("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
+    JPRINTF("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
 
     // Read in sector-sized chunks
     std::vector<uint8_t> allData(readLength, 0);
@@ -968,14 +1078,14 @@ static int doRead(int argc, char** argv)
         uint32_t bytesRead = 0;
         tas_return_et r = ctx.client.read(readAddr + offset, allData.data() + offset, thisChunk, &bytesRead);
         if (r != TAS_ERR_NONE && r != TAS_ERR_RW_READ) {
+            if (g_json) return jsonError(EXIT_IO_ERROR, ctx.client.get_error_info());
             fprintf(stderr, "ERROR: Read failed at 0x%08X: %s\n", readAddr + offset, ctx.client.get_error_info());
             return EXIT_IO_ERROR;
         }
         totalRead += bytesRead;
-        printf("  Read %u/%u bytes\r", totalRead, readLength);
-        fflush(stdout);
+        if (!g_json) { printf("  Read %u/%u bytes\r", totalRead, readLength); fflush(stdout); }
     }
-    printf("\n  Read complete: %u bytes\n", totalRead);
+    JPRINTF("\n  Read complete: %u bytes\n", totalRead);
 
     // Output
     if (outputFile != nullptr) {
@@ -990,17 +1100,42 @@ static int doRead(int argc, char** argv)
         if (ext == "bin") {
             // Raw binary output
             std::ofstream ofs(outputFile, std::ios::binary);
-            if (!ofs) { fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile); return EXIT_IO_ERROR; }
+            if (!ofs) {
+                if (g_json) return jsonError(EXIT_IO_ERROR, std::string("Cannot open '") + outputFile + "'");
+                fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile);
+                return EXIT_IO_ERROR;
+            }
             ofs.write(reinterpret_cast<const char*>(allData.data()), totalRead);
-            printf("  Saved binary: %s (%u bytes)\n", outputFile, totalRead);
+            JPRINTF("  Saved binary: %s (%u bytes)\n", outputFile, totalRead);
         } else {
             // Default: Intel HEX format
-            if (!saveToIntelHex(outputFile, readAddr, allData)) return EXIT_IO_ERROR;
-            printf("  Saved Intel HEX: %s\n", outputFile);
+            if (!saveToIntelHex(outputFile, readAddr, allData)) {
+                if (g_json) return jsonError(EXIT_IO_ERROR, "Failed to save Intel HEX");
+                return EXIT_IO_ERROR;
+            }
+            JPRINTF("  Saved Intel HEX: %s\n", outputFile);
         }
-    } else {
+    } else if (!g_json) {
         printf("\n");
         hexDumpXxd(allData.data(), totalRead, readAddr);
+    }
+
+    if (g_json) {
+        nljson j;
+        char addrStr[16];
+        snprintf(addrStr, sizeof(addrStr), "0x%08X", readAddr);
+        j["address"] = addrStr;
+        j["length"] = totalRead;
+        std::string hexData;
+        hexData.reserve(static_cast<size_t>(totalRead) * 2);
+        for (uint32_t i = 0; i < totalRead; ++i) {
+            char hb[3];
+            snprintf(hb, sizeof(hb), "%02X", allData[i]);
+            hexData += hb;
+        }
+        j["data"] = hexData;
+        if (outputFile) j["output_file"] = outputFile;
+        return jsonOk(j);
     }
 
     return EXIT_OK;
@@ -1141,7 +1276,11 @@ static int doWrite(int argc, char** argv)
         return EXIT_USAGE_ERROR;
     }
 
-    if (!inputFile) { fprintf(stderr, "ERROR: --file is required\n"); return EXIT_USAGE_ERROR; }
+    if (!inputFile) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--file is required");
+        fprintf(stderr, "ERROR: --file is required\n"); return EXIT_USAGE_ERROR;
+    }
+    g_json = args.jsonOutput;
 
     // --- Determine file type and parse ---
     std::string filePath(inputFile);
@@ -1184,13 +1323,13 @@ static int doWrite(int argc, char** argv)
     }
 
     // --- Print header ---
-    printf("TAS DFlash Write Tool\n");
-    printf("=====================\n\n");
+    JPRINTF("TAS DFlash Write Tool\n");
+    JPRINTF("=====================\n\n");
 
     // --- Common initialization ---
     ToolContext ctx("DFlashWrite");
     int initResult = initTool(ctx, args, "DFlashWrite", TAS_CLNT_DCO_RESET_AND_HALT);
-    if (initResult != EXIT_OK) return initResult;
+    if (initResult != EXIT_OK) { if (g_json) return jsonError(initResult, "initTool failed"); return initResult; }
 
     DFlashConfig& flashCfg = ctx.flashCfg;
 
@@ -1296,7 +1435,19 @@ static int doWrite(int argc, char** argv)
         printf("  PASSED: all %u bytes verified\n", totalWriteBytes);
     }
 
-    printf("\nDFlash write completed successfully.\n");
+    JPRINTF("\nDFlash write completed successfully.\n");
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "write";
+        j["file"] = inputFile;
+        j["total_bytes"] = totalWriteBytes;
+        j["pages"] = totalPages;
+        j["segments"] = parseResult.segments.size();
+        j["elapsed_ms"] = static_cast<long long>(totalElapsed);
+        if (doVerify) j["verified"] = true;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -2179,15 +2330,16 @@ static int doErase(int argc, char** argv, bool legacyMode)
         fprintf(stderr, "ERROR: Specify --addr + --sectors, --all, or --info\n");
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    printf("TAS DFlash Erase Tool\n");
-    printf("=====================\n\n");
+    JPRINTF("TAS DFlash Erase Tool\n");
+    JPRINTF("=====================\n\n");
 
     // ---- Common initialization ----
     tas_clnt_dco_et dco = noReset ? TAS_CLNT_DCO_HOT_ATTACH : TAS_CLNT_DCO_RESET_AND_HALT;
     ToolContext ctx("DFlashErase");
     int initResult = initTool(ctx, args, "DFlashErase", dco);
-    if (initResult != EXIT_OK) return initResult;
+    if (initResult != EXIT_OK) { if (g_json) return jsonError(initResult, "initTool failed"); return initResult; }
 
     DFlashConfig& flashCfg = ctx.flashCfg;
 
@@ -2303,7 +2455,18 @@ static int doErase(int argc, char** argv, bool legacyMode)
         }
     }
 
-    printf("\nDFlash erase completed successfully.\n");
+    JPRINTF("\nDFlash erase completed successfully.\n");
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "erase";
+        j["address"] = sectorAddr;
+        j["sectors"] = numSectors;
+        j["sector_size"] = flashCfg.sectorSize;
+        j["total_bytes"] = eraseSize;
+        if (doVerify) j["verified"] = true;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -2727,6 +2890,1085 @@ static void printUcbUsage(const char* progName) {
 }
 
 //********************************************************************************************************************
+//  Helper: parse hex address string (with or without 0x prefix)
+//********************************************************************************************************************
+
+static bool parseAddress(const char* str, uint64_t& addr) {
+    if (!str || !*str) return false;
+    try {
+        addr = std::stoull(str, nullptr, 0);
+        return true;
+    } catch (...) {
+        fprintf(stderr, "ERROR: Invalid address '%s'\n", str);
+        return false;
+    }
+}
+
+static bool parseHexBytes(const char* str, std::vector<uint8_t>& bytes) {
+    if (!str || !*str) return false;
+    std::string s(str);
+    // Remove spaces and 0x prefix
+    std::string clean;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == ' ') continue;
+        clean += s[i];
+    }
+    // Strip optional 0x/0X prefix
+    if (clean.size() >= 2 && (clean.rfind("0x", 0) == 0 || clean.rfind("0X", 0) == 0)) {
+        clean = clean.substr(2);
+    }
+    if (clean.size() % 2 != 0) {
+        fprintf(stderr, "ERROR: Hex pattern must have even number of hex digits\n");
+        return false;
+    }
+    bytes.clear();
+    for (size_t i = 0; i < clean.size(); i += 2) {
+        try {
+            bytes.push_back(static_cast<uint8_t>(std::stoul(clean.substr(i, 2), nullptr, 16)));
+        } catch (...) {
+            fprintf(stderr, "ERROR: Invalid hex pattern '%s'\n", str);
+            return false;
+        }
+    }
+    return !bytes.empty();
+}
+
+// Cross-platform case-insensitive string comparison helper
+static bool iequalsStr(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
+//********************************************************************************************************************
+//  doReg - read/write registers by name or address (SVD-based)
+//********************************************************************************************************************
+
+static int doReg(int argc, char** argv)
+{
+    CommonArgs args;
+    const char* regName = nullptr;
+    const char* writeVal = nullptr;
+    bool listMode = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--list") == 0) { listMode = true; i++; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash reg <name|addr> [value] [options]\n");
+            printf("       dflash reg --list [peripheral]\n\n");
+            printf("  Read/write registers by SVD name or address.\n");
+            printf("  Names: DMU.HF.STATUS, HF.STATUS, or hex address\n\n");
+            printf("Options:\n");
+            printf("  --list [periph]  List registers (optionally filter by peripheral)\n");
+            printf("  --json           Output as JSON\n");
+            return EXIT_OK;
+        }
+        if (!regName) { regName = argv[i]; i++; continue; }
+        if (!writeVal) { writeVal = argv[i]; i++; continue; }
+        fprintf(stderr, "ERROR: Unexpected argument '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    g_json = args.jsonOutput;
+
+    ToolContext ctx("DFlashReg");
+    int rc = initTool(ctx, args, "DFlashReg", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) {
+        if (g_json) return jsonError(rc, "Failed to initialize tool connection");
+        return rc;
+    }
+
+    if (listMode) {
+        if (!ctx.svd.isLoaded()) {
+            fprintf(stderr, "ERROR: No SVD register definitions loaded for this device\n");
+            return EXIT_DEVICE_ERROR;
+        }
+        auto periphs = ctx.svd.getPeripheralNames();
+        for (const auto& p : periphs) {
+            if (regName && !iequalsStr(p, regName)) continue;
+            auto regs = ctx.svd.getRegisters(p);
+            printf("%s (%zu registers):\n", p.c_str(), regs.size());
+            for (const auto* r : regs) {
+                printf("  0x%08llX  %-20s  %s\n",
+                       (unsigned long long)r->address, r->fullName.c_str(),
+                       r->access.c_str());
+            }
+        }
+        return EXIT_OK;
+    }
+
+    if (!regName) {
+        fprintf(stderr, "ERROR: Register name or address required\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    // Try SVD name lookup first
+    const SvdRegister* svdReg = nullptr;
+    uint64_t addr = 0;
+    if (ctx.svd.isLoaded()) {
+        svdReg = ctx.svd.findRegister(regName);
+    }
+    if (svdReg) {
+        addr = svdReg->address;
+    } else if (!parseAddress(regName, addr)) {
+        return EXIT_USAGE_ERROR;
+    }
+
+    if (writeVal) {
+        // Write register
+        uint32_t val = 0;
+        try { val = static_cast<uint32_t>(std::stoul(writeVal, nullptr, 0)); }
+        catch (...) { fprintf(stderr, "ERROR: Invalid value '%s'\n", writeVal); return EXIT_USAGE_ERROR; }
+
+        tas_return_et ret = ctx.client.write32(addr, val);
+        if (ret != TAS_ERR_NONE) {
+            if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
+            fprintf(stderr, "ERROR: Write failed: %s\n", ctx.client.get_error_info());
+            return EXIT_FLASH_STATUS_ERROR;
+        }
+        JPRINTF("Wrote 0x%08X to 0x%08llX", val, (unsigned long long)addr);
+        if (svdReg) JPRINTF(" (%s)", svdReg->fullName.c_str());
+        JPRINTF("\n");
+
+        // Readback
+        uint32_t readback = 0;
+        ret = ctx.client.read32(addr, &readback);
+        if (ret == TAS_ERR_NONE) {
+            JPRINTF("Readback: 0x%08X\n", readback);
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "write";
+            j["address"] = addr;
+            j["value"] = val;
+            if (svdReg) j["register"] = svdReg->fullName;
+            if (ret == TAS_ERR_NONE) j["readback"] = readback;
+            return jsonOk(j);
+        }
+    } else {
+        // Read register
+        uint32_t val = 0;
+        tas_return_et ret = ctx.client.read32(addr, &val);
+        if (ret != TAS_ERR_NONE) {
+            if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
+            fprintf(stderr, "ERROR: Read failed: %s\n", ctx.client.get_error_info());
+            return EXIT_FLASH_STATUS_ERROR;
+        }
+
+        if (g_json) {
+            nljson j;
+            j["action"] = "read";
+            j["address"] = addr;
+            j["value"] = val;
+            if (svdReg) {
+                j["register"] = svdReg->fullName;
+                j["access"] = svdReg->access;
+                nljson fields = nljson::object();
+                for (const auto& f : svdReg->fields) {
+                    uint32_t mask = ((1u << (f.msb - f.lsb + 1)) - 1u) << f.lsb;
+                    uint32_t fval = (val & mask) >> f.lsb;
+                    nljson fj;
+                    fj["value"] = fval;
+                    fj["lsb"] = f.lsb;
+                    fj["msb"] = f.msb;
+                    for (const auto& ev : f.values) {
+                        if (ev.value == fval && !ev.desc.empty()) {
+                            fj["desc"] = ev.desc;
+                            break;
+                        }
+                    }
+                    fields[f.name] = fj;
+                }
+                j["fields"] = fields;
+            }
+            return jsonOk(j);
+        }
+
+        if (svdReg) {
+            printf("%s [0x%08llX] = 0x%08X (%s)\n",
+                   svdReg->fullName.c_str(), (unsigned long long)addr, val,
+                   svdReg->access.c_str());
+            // Parse fields
+            for (const auto& f : svdReg->fields) {
+                uint32_t mask = ((1u << (f.msb - f.lsb + 1)) - 1u) << f.lsb;
+                uint32_t fval = (val & mask) >> f.lsb;
+                printf("  %-12s [%2u:%2u] = 0x%X", f.name.c_str(), f.msb, f.lsb, fval);
+                // Show enum description if available
+                for (const auto& ev : f.values) {
+                    if (ev.value == fval && !ev.desc.empty()) {
+                        printf("  : %s", ev.desc.c_str());
+                        break;
+                    }
+                }
+                if (!f.desc.empty()) {
+                    bool hasEnum = false;
+                    for (const auto& ev : f.values) { if (ev.value == fval) { hasEnum = true; break; } }
+                    if (!hasEnum) printf("  (%s)", f.desc.c_str());
+                }
+                printf("\n");
+            }
+        } else {
+            printf("[0x%08llX] = 0x%08X\n", (unsigned long long)addr, val);
+        }
+    }
+
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doDump - hex dump of memory (PFlash/DFlash/SRAM)
+//********************************************************************************************************************
+
+static int doDump(int argc, char** argv)
+{
+    CommonArgs args;
+    uint64_t addr = 0;
+    uint32_t length = 0;
+    const char* outFile = nullptr;
+    bool hasAddr = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
+            outFile = argv[i + 1]; i += 2; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash dump <addr> <length> [-o file] [options]\n\n");
+            printf("  Read memory and display hex dump. Supports PFlash, DFlash, SRAM.\n\n");
+            printf("Options:\n");
+            printf("  -o, --output <file>  Save to file (.bin=raw, .hex=Intel HEX)\n\n");
+            printf("Examples:\n");
+            printf("  dflash dump 0xAF000000 0x40\n");
+            printf("  dflash dump 0xA0000000 0x100 -o pflash.hex\n");
+            printf("  dflash dump 0x70000000 0x80 -o sram.bin\n");
+            return EXIT_OK;
+        }
+        if (!hasAddr) { if (!parseAddress(argv[i], addr)) return EXIT_USAGE_ERROR; hasAddr = true; i++; continue; }
+        if (length == 0) {
+            try { length = static_cast<uint32_t>(std::stoul(argv[i], nullptr, 0)); }
+            catch (...) { fprintf(stderr, "ERROR: Invalid length '%s'\n", argv[i]); return EXIT_USAGE_ERROR; }
+            i++; continue;
+        }
+        fprintf(stderr, "ERROR: Unexpected argument '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    g_json = args.jsonOutput;
+
+    if (!hasAddr || length == 0) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address and length required");
+        fprintf(stderr, "ERROR: Address and length required\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    ToolContext ctx("DFlashDump");
+    int rc = initTool(ctx, args, "DFlashDump", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) { if (g_json) return jsonError(rc, "initTool failed"); return rc; }
+
+    // Allocate buffer
+    std::vector<uint8_t> buf(length);
+    uint32_t bytesRead = 0;
+    JPRINTF("Reading 0x%X bytes from 0x%08llX...\n", length, (unsigned long long)addr);
+
+    tas_return_et ret = ctx.client.read(addr, buf.data(), length, &bytesRead);
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
+        fprintf(stderr, "ERROR: Read failed: %s\n", ctx.client.get_error_info());
+        return EXIT_FLASH_STATUS_ERROR;
+    }
+
+    // Save to file if requested
+    if (outFile) {
+        std::string outStr(outFile);
+        std::string ext = std::filesystem::path(outStr).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+        if (ext == ".hex") {
+            // Intel HEX format
+            std::ofstream ofs(outStr, std::ios::binary);
+            if (!ofs.is_open()) {
+                fprintf(stderr, "ERROR: Cannot create file '%s'\n", outFile);
+                return EXIT_IO_ERROR;
+            }
+            // Write data records
+            uint32_t currentExtAddr = 0;
+            for (uint32_t offset = 0; offset < bytesRead; offset += 16) {
+                uint32_t absAddr = static_cast<uint32_t>(addr + offset);
+                uint32_t extAddr = (absAddr >> 16) & 0xFFFF;
+                if (extAddr != currentExtAddr) {
+                    // Extended Linear Address record
+                    char line[32];
+                    snprintf(line, sizeof(line), ":02000004%04X%02X\r\n",
+                             extAddr, (uint8_t)(~(0x02 + 0x04 + (extAddr >> 8) + (extAddr & 0xFF)) + 1));
+                    ofs << line;
+                    currentExtAddr = extAddr;
+                }
+                uint16_t localAddr = absAddr & 0xFFFF;
+                uint8_t count = static_cast<uint8_t>(std::min(16u, bytesRead - offset));
+                uint8_t cksum = count + (localAddr >> 8) + (localAddr & 0xFF);
+                char header[16];
+                snprintf(header, sizeof(header), ":%02X%04X00", count, localAddr);
+                ofs << header;
+                for (uint8_t j = 0; j < count; ++j) {
+                    char byte_str[4];
+                    snprintf(byte_str, sizeof(byte_str), "%02X", buf[offset + j]);
+                    ofs << byte_str;
+                    cksum += buf[offset + j];
+                }
+                char cksum_str[4];
+                snprintf(cksum_str, sizeof(cksum_str), "%02X\r\n", (uint8_t)(~cksum + 1));
+                ofs << cksum_str;
+            }
+            // EOF record
+            ofs << ":00000001FF\r\n";
+            ofs.close();
+            printf("Saved %u bytes to %s (Intel HEX)\n", bytesRead, outFile);
+        } else {
+            // Raw binary
+            std::ofstream ofs(outStr, std::ios::binary);
+            if (!ofs.is_open()) {
+                fprintf(stderr, "ERROR: Cannot create file '%s'\n", outFile);
+                return EXIT_IO_ERROR;
+            }
+            ofs.write(reinterpret_cast<const char*>(buf.data()), bytesRead);
+            ofs.close();
+            printf("Saved %u bytes to %s\n", bytesRead, outFile);
+        }
+    }
+
+    // Print hex dump (or JSON)
+    if (g_json) {
+        nljson j;
+        j["address"] = addr;
+        j["bytes"] = bytesRead;
+        std::string hexData;
+        hexData.reserve(bytesRead * 2);
+        for (uint32_t i = 0; i < bytesRead; ++i) {
+            char hex[3];
+            snprintf(hex, sizeof(hex), "%02X", buf[i]);
+            hexData += hex;
+        }
+        j["data"] = hexData;
+        if (outFile) j["output_file"] = outFile;
+        return jsonOk(j);
+    }
+
+    for (uint32_t offset = 0; offset < bytesRead; offset += 16) {
+        printf("%08llX  ", (unsigned long long)(addr + offset));
+        // Hex
+        for (uint32_t j = 0; j < 16; ++j) {
+            if (offset + j < bytesRead)
+                printf("%02X ", buf[offset + j]);
+            else
+                printf("   ");
+            if (j == 7) printf(" ");
+        }
+        printf(" |");
+        // ASCII
+        for (uint32_t j = 0; j < 16 && (offset + j) < bytesRead; ++j) {
+            uint8_t c = buf[offset + j];
+            printf("%c", (c >= 0x20 && c < 0x7F) ? c : '.');
+        }
+        printf("|\n");
+    }
+
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doPoke - write value to memory address
+//********************************************************************************************************************
+
+static int doPoke(int argc, char** argv)
+{
+    CommonArgs args;
+    uint64_t addr = 0;
+    uint32_t value = 0;
+    int width = 32;
+    bool hasAddr = false, hasVal = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
+            width = atoi(argv[i + 1]); i += 2; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash poke <addr> <value> [--width 8|16|32|64] [options]\n\n");
+            printf("  Write a value to a memory address and verify with readback.\n");
+            return EXIT_OK;
+        }
+        if (!hasAddr) { if (!parseAddress(argv[i], addr)) return EXIT_USAGE_ERROR; hasAddr = true; i++; continue; }
+        if (!hasVal) {
+            try { value = static_cast<uint32_t>(std::stoul(argv[i], nullptr, 0)); }
+            catch (...) { fprintf(stderr, "ERROR: Invalid value '%s'\n", argv[i]); return EXIT_USAGE_ERROR; }
+            hasVal = true; i++; continue;
+        }
+        fprintf(stderr, "ERROR: Unexpected argument '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    g_json = args.jsonOutput;
+
+    if (!hasAddr || !hasVal) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address and value required");
+        fprintf(stderr, "ERROR: Address and value required\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    ToolContext ctx("DFlashPoke");
+    int rc = initTool(ctx, args, "DFlashPoke", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) { if (g_json) return jsonError(rc, "initTool failed"); return rc; }
+
+    tas_return_et ret;
+    switch (width) {
+        case 8:  ret = ctx.client.write8(addr, static_cast<uint8_t>(value)); break;
+        case 16: ret = ctx.client.write16(addr, static_cast<uint16_t>(value)); break;
+        case 64: ret = ctx.client.write64(addr, static_cast<uint64_t>(value)); break;
+        default: ret = ctx.client.write32(addr, value); width = 32; break;
+    }
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
+        fprintf(stderr, "ERROR: Write failed: %s\n", ctx.client.get_error_info());
+        return EXIT_FLASH_STATUS_ERROR;
+    }
+    JPRINTF("Wrote 0x%X to 0x%08llX (width=%d)\n", value, (unsigned long long)addr, width);
+
+    // Readback verification
+    uint32_t readback = 0;
+    ret = ctx.client.read32(addr, &readback);
+
+    // Compute mask based on write width and compare readback against written value
+    uint32_t mask;
+    switch (width) {
+        case 8:  mask = 0x000000FFu; break;
+        case 16: mask = 0x0000FFFFu; break;
+        case 64: mask = 0xFFFFFFFFu; break; // compare low 32 bits via read32
+        default: mask = 0xFFFFFFFFu; break;
+    }
+    bool match = (ret == TAS_ERR_NONE) && ((readback & mask) == (value & mask));
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "poke";
+        j["address"] = addr;
+        j["value"] = value;
+        j["width"] = width;
+        if (ret == TAS_ERR_NONE) {
+            j["readback"] = readback;
+            j["match"] = match;
+        }
+        return jsonOk(j);
+    }
+    if (ret == TAS_ERR_NONE) {
+        printf("Readback: 0x%08X\n", readback);
+        if (!match) {
+            printf("WARNING: Readback (0x%08X) does not match written value (0x%08X) within width=%d mask\n",
+                   readback & mask, value & mask, width);
+        }
+    }
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doStatus - Flash status register (SVD-driven)
+//********************************************************************************************************************
+
+static int doStatus(int argc, char** argv)
+{
+    CommonArgs args;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash status [options]\n\n");
+            printf("  Display Flash status register with field decoding.\n");
+            printf("  Uses SVD definitions (no hardcoded addresses).\n");
+            return EXIT_OK;
+        }
+        i++;
+    }
+    g_json = args.jsonOutput;
+
+    ToolContext ctx("DFlashStatus");
+    int rc = initTool(ctx, args, "DFlashStatus", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) { if (g_json) return jsonError(rc, "initTool failed"); return rc; }
+
+    // Status register
+    std::string statusName;
+    if (ctx.svd.isLoaded()) {
+        statusName = ctx.svd.getFlashStatusRegName();
+    }
+
+    uint64_t statusAddr;
+    std::string statusRegName;
+    if (!statusName.empty()) {
+        const SvdRegister* sr = ctx.svd.findRegister(statusName);
+        statusAddr = sr->address;
+        statusRegName = sr->fullName;
+        JPRINTF("Flash Status: %s [0x%08llX]\n", sr->fullName.c_str(), (unsigned long long)statusAddr);
+    } else {
+        // Fallback to hardcoded addresses
+        statusAddr = ctx.flashCfg.isTc3x ? DMU_HF_STATUS_ADDR : FLASH0_FSR_ADDR;
+        JPRINTF("Flash Status: [0x%08llX] (no SVD, using fallback)\n", (unsigned long long)statusAddr);
+    }
+
+    uint32_t statusVal = 0;
+    tas_return_et ret = ctx.client.read32(statusAddr, &statusVal);
+    if (ret != TAS_ERR_NONE) {
+        if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
+        fprintf(stderr, "ERROR: Read failed: %s\n", ctx.client.get_error_info());
+        return EXIT_FLASH_STATUS_ERROR;
+    }
+    JPRINTF("  Value: 0x%08X\n", statusVal);
+
+    // Parse fields using SVD - collect for JSON
+    nljson fieldsJson = nljson::object();
+    if (!statusName.empty()) {
+        const SvdRegister* sr = ctx.svd.findRegister(statusName);
+        for (const auto& f : sr->fields) {
+            uint32_t mask = ((1u << (f.msb - f.lsb + 1)) - 1u) << f.lsb;
+            uint32_t fval = (statusVal & mask) >> f.lsb;
+            JPRINTF("  %-12s [%2u:%2u] = %u", f.name.c_str(), f.msb, f.lsb, fval);
+            for (const auto& ev : f.values) {
+                if (ev.value == fval && !ev.desc.empty()) {
+                    JPRINTF("  (%s)", ev.desc.c_str());
+                    break;
+                }
+            }
+            JPRINTF("\n");
+            fieldsJson[f.name] = fval;
+        }
+    } else {
+        // Fallback for TC3x
+        if (ctx.flashCfg.isTc3x) {
+            JPRINTF("  D0BUSY=%u  D1BUSY=%u  P0BUSY=%u\n",
+                   !!(statusVal & TC3X_D0BUSY_BIT),
+                   !!(statusVal & (1u<<1)),
+                   !!(statusVal & (1u<<2)));
+            fieldsJson["D0BUSY"] = !!(statusVal & TC3X_D0BUSY_BIT);
+            fieldsJson["D1BUSY"] = !!(statusVal & (1u<<1));
+            fieldsJson["P0BUSY"] = !!(statusVal & (1u<<2));
+        } else {
+            JPRINTF("  D0BUSY=%u\n", !!(statusVal & TC2X_D0BUSY_BIT));
+            fieldsJson["D0BUSY"] = !!(statusVal & TC2X_D0BUSY_BIT);
+        }
+    }
+
+    // Error status register
+    std::string errName;
+    if (ctx.svd.isLoaded()) {
+        errName = ctx.svd.getFlashErrorRegName();
+    }
+    nljson errFieldsJson = nljson::object();
+    if (!errName.empty() && errName != statusName) {
+        const SvdRegister* er = ctx.svd.findRegister(errName);
+        uint32_t errVal = 0;
+        ret = ctx.client.read32(er->address, &errVal);
+        if (ret == TAS_ERR_NONE) {
+            JPRINTF("\nFlash Error Status: %s [0x%08llX]\n", er->fullName.c_str(), (unsigned long long)er->address);
+            JPRINTF("  Value: 0x%08X\n", errVal);
+            for (const auto& f : er->fields) {
+                uint32_t mask = ((1u << (f.msb - f.lsb + 1)) - 1u) << f.lsb;
+                uint32_t fval = (errVal & mask) >> f.lsb;
+                if (fval != 0) {
+                    JPRINTF("  %-12s [%2u:%2u] = %u", f.name.c_str(), f.msb, f.lsb, fval);
+                    for (const auto& ev : f.values) {
+                        if (ev.value == fval && !ev.desc.empty()) {
+                            JPRINTF("  (%s)", ev.desc.c_str());
+                            break;
+                        }
+                    }
+                    JPRINTF("\n");
+                }
+                errFieldsJson[f.name] = fval;
+            }
+        }
+    }
+
+    if (g_json) {
+        nljson j;
+        j["register"] = statusRegName.empty() ? "unknown" : statusRegName;
+        j["address"] = statusAddr;
+        j["value"] = statusVal;
+        j["fields"] = fieldsJson;
+        if (!errFieldsJson.empty()) {
+            j["error_register"] = errName;
+            j["error_fields"] = errFieldsJson;
+        }
+        return jsonOk(j);
+    }
+
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doInfo - device information
+//********************************************************************************************************************
+
+static int doInfo(int argc, char** argv)
+{
+    CommonArgs args;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash info [options]\n\n");
+            printf("  Display device info, memory layout, and SVD register summary.\n");
+            return EXIT_OK;
+        }
+        i++;
+    }
+    g_json = args.jsonOutput;
+
+    ToolContext ctx("DFlashInfo");
+    int rc = initTool(ctx, args, "DFlashInfo", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) { if (g_json) return jsonError(rc, "initTool failed"); return rc; }
+
+    // Device info
+    JPRINTF("=== Device Information ===\n");
+    JPRINTF("  Device:    %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    JPRINTF("  JTAG ID:   0x%08X\n", ctx.conInfo->device_type);
+    JPRINTF("  Name:      %s\n", tas_get_device_name_str(ctx.conInfo->device_type));
+    JPRINTF("  Identifier: %s\n", ctx.conInfo->identifier);
+    JPRINTF("  Phys:       %s\n", ctx.conInfo->dev_con_phys == 0 ? "JTAG/DAP" : "Other");
+
+    // Memory regions
+    JPRINTF("\n=== Memory Layout ===\n");
+    for (const auto& mr : ctx.flashCfg.memoryRegions) {
+        const char* type = mr.isSRAM ? "SRAM" : "Flash";
+        JPRINTF("  %-20s  0x%08llX - 0x%08llX  %8u bytes  (%s)\n",
+               mr.name.c_str(),
+               (unsigned long long)mr.startAddr,
+               (unsigned long long)mr.endAddr,
+               mr.size, type);
+    }
+
+    // DFlash details
+    JPRINTF("\n=== DFlash ===\n");
+    JPRINTF("  Base:      0x%08X\n", ctx.flashCfg.baseAddress);
+    JPRINTF("  Size:      %u bytes (0x%X)\n", ctx.flashCfg.totalSize, ctx.flashCfg.totalSize);
+    JPRINTF("  Sectors:   %u x 0x%X\n", ctx.flashCfg.numSectors, ctx.flashCfg.sectorSize);
+
+    // UCB
+    if (ctx.flashCfg.ucb.numSectors > 0) {
+        JPRINTF("\n=== UCB ===\n");
+        JPRINTF("  Base:      0x%08X\n", ctx.flashCfg.ucb.baseAddress);
+        JPRINTF("  Sectors:   %u x 0x%X\n", ctx.flashCfg.ucb.numSectors, ctx.flashCfg.ucb.sectorSize);
+    }
+
+    // SVD registers
+    if (ctx.svd.isLoaded()) {
+        JPRINTF("\n=== SVD Registers (%s) ===\n", ctx.svd.getDeviceName().c_str());
+        auto periphs = ctx.svd.getPeripheralNames();
+        for (const auto& p : periphs) {
+            auto regs = ctx.svd.getRegisters(p);
+            JPRINTF("  %-8s  %zu registers\n", p.c_str(), regs.size());
+        }
+    } else {
+        JPRINTF("\n  (No SVD register definitions loaded)\n");
+    }
+
+    if (g_json) {
+        nljson j;
+        j["device"] = ctx.flashCfg.deviceName;
+        j["family"] = ctx.flashCfg.family;
+        j["jtag_id"] = ctx.conInfo->device_type;
+        j["device_name"] = tas_get_device_name_str(ctx.conInfo->device_type);
+        j["identifier"] = ctx.conInfo->identifier;
+        j["phys"] = ctx.conInfo->dev_con_phys == 0 ? "JTAG/DAP" : "Other";
+
+        nljson memArr = nljson::array();
+        for (const auto& mr : ctx.flashCfg.memoryRegions) {
+            memArr.push_back({
+                {"name", mr.name}, {"start", mr.startAddr}, {"end", mr.endAddr},
+                {"size", mr.size}, {"type", mr.isSRAM ? "SRAM" : "Flash"}
+            });
+        }
+        j["memory_regions"] = memArr;
+
+        j["dflash"] = {
+            {"base", ctx.flashCfg.baseAddress}, {"size", ctx.flashCfg.totalSize},
+            {"sectors", ctx.flashCfg.numSectors}, {"sector_size", ctx.flashCfg.sectorSize}
+        };
+
+        if (ctx.flashCfg.ucb.numSectors > 0) {
+            j["ucb"] = {
+                {"base", ctx.flashCfg.ucb.baseAddress},
+                {"sectors", ctx.flashCfg.ucb.numSectors},
+                {"sector_size", ctx.flashCfg.ucb.sectorSize}
+            };
+        }
+
+        if (ctx.svd.isLoaded()) {
+            nljson svdArr = nljson::array();
+            auto periphs = ctx.svd.getPeripheralNames();
+            for (const auto& p : periphs) {
+                auto regs = ctx.svd.getRegisters(p);
+                svdArr.push_back({{"peripheral", p}, {"register_count", regs.size()}});
+            }
+            j["svd"] = {{"device", ctx.svd.getDeviceName()}, {"peripherals", svdArr}};
+        }
+        return jsonOk(j);
+    }
+
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doCompare - compare local file with Flash content
+//********************************************************************************************************************
+
+static int doCompare(int argc, char** argv)
+{
+    CommonArgs args;
+    const char* filePath = nullptr;
+    uint64_t addr = 0;
+    uint32_t length = 0;
+    bool hasAddr = false;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
+            filePath = argv[i + 1]; i += 2; continue;
+        }
+        if ((strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--addr") == 0) && i + 1 < argc) {
+            if (!parseAddress(argv[i + 1], addr)) return EXIT_USAGE_ERROR;
+            hasAddr = true; i += 2; continue;
+        }
+        if (strcmp(argv[i], "--length") == 0 && i + 1 < argc) {
+            try { length = static_cast<uint32_t>(std::stoul(argv[i + 1], nullptr, 0)); }
+            catch (...) { fprintf(stderr, "ERROR: Invalid length\n"); return EXIT_USAGE_ERROR; }
+            i += 2; continue;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash compare -f <file> -a <addr> [--length <len>] [options]\n\n");
+            printf("  Compare local file contents with Flash/memory.\n");
+            printf("  Supports .hex (Intel HEX) and .bin files.\n");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unexpected argument '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    g_json = args.jsonOutput;
+
+    if (!filePath || !hasAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "File (-f) and address (-a) required");
+        fprintf(stderr, "ERROR: File (-f) and address (-a) required\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    // Load file
+    std::string fileStr(filePath);
+    std::string ext = std::filesystem::path(fileStr).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    HexParseResult fileData;
+    if (ext == ".hex") {
+        fileData = parseIntelHex(fileStr);
+    } else {
+        fileData = loadBinaryFile(fileStr, static_cast<uint32_t>(addr));
+    }
+    if (!fileData.success) {
+        if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, fileData.errorMsg);
+        fprintf(stderr, "ERROR: %s\n", fileData.errorMsg.c_str());
+        return EXIT_HEX_PARSE_ERROR;
+    }
+
+    ToolContext ctx("DFlashCompare");
+    int rc = initTool(ctx, args, "DFlashCompare", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) { if (g_json) return jsonError(rc, "initTool failed"); return rc; }
+
+    uint32_t totalMismatches = 0;
+    uint32_t totalBytes = 0;
+
+    for (const auto& seg : fileData.segments) {
+        uint64_t segAddr = seg.baseAddress;
+        uint32_t segLen = static_cast<uint32_t>(seg.data.size());
+        if (length > 0 && segLen > length) segLen = length;
+
+        std::vector<uint8_t> flashData(segLen);
+        uint32_t bytesRead = 0;
+        tas_return_et ret = ctx.client.read(segAddr, flashData.data(), segLen, &bytesRead);
+        if (ret != TAS_ERR_NONE) {
+            fprintf(stderr, "ERROR: Read failed at 0x%08llX: %s\n",
+                    (unsigned long long)segAddr, ctx.client.get_error_info());
+            return EXIT_FLASH_STATUS_ERROR;
+        }
+
+        printf("Comparing %s with memory @ 0x%08X (%u bytes)...\n",
+               filePath, seg.baseAddress, bytesRead);
+
+        uint32_t mismatches = 0;
+        for (uint32_t j = 0; j < bytesRead; ++j) {
+            if (seg.data[j] != flashData[j]) {
+                if (mismatches < 20) {
+                    printf("  [0x%08llX] expected=0x%02X actual=0x%02X\n",
+                           (unsigned long long)(segAddr + j), seg.data[j], flashData[j]);
+                }
+                mismatches++;
+            }
+        }
+        totalMismatches += mismatches;
+        totalBytes += bytesRead;
+        if (mismatches > 20) printf("  ... (%u more mismatches)\n", mismatches - 20);
+    }
+
+    JPRINTF("  Result: %u mismatches in %u bytes\n", totalMismatches, totalBytes);
+
+    if (g_json) {
+        nljson j;
+        j["file"] = filePath;
+        j["total_bytes"] = totalBytes;
+        j["mismatches"] = totalMismatches;
+        j["match"] = (totalMismatches == 0);
+        return jsonOk(j);
+    }
+    return (totalMismatches > 0) ? EXIT_MISMATCH_ERROR : EXIT_OK;
+}
+
+//********************************************************************************************************************
+//  doSearch - search memory for byte pattern
+//********************************************************************************************************************
+
+static int doSearch(int argc, char** argv)
+{
+    CommonArgs args;
+    uint64_t addr = 0;
+    uint32_t length = 0;
+    const char* patternStr = nullptr;
+    int argIdx = 0;
+
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash search <addr> <length> <pattern> [options]\n\n");
+            printf("  Search memory for a hex byte pattern.\n\n");
+            printf("Examples:\n");
+            printf("  dflash search 0xAF000000 0x20000 DEADBEEF\n");
+            printf("  dflash search 0xA0000000 0x100000 00FF00\n");
+            return EXIT_OK;
+        }
+        if (argIdx == 0) { if (!parseAddress(argv[i], addr)) return EXIT_USAGE_ERROR; argIdx++; i++; continue; }
+        if (argIdx == 1) {
+            try { length = static_cast<uint32_t>(std::stoul(argv[i], nullptr, 0)); }
+            catch (...) { fprintf(stderr, "ERROR: Invalid length\n"); return EXIT_USAGE_ERROR; }
+            argIdx++; i++; continue;
+        }
+        if (argIdx == 2) { patternStr = argv[i]; argIdx++; i++; continue; }
+        fprintf(stderr, "ERROR: Unexpected argument '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    g_json = args.jsonOutput;
+
+    if (!patternStr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address, length, and pattern required");
+        fprintf(stderr, "ERROR: Address, length, and pattern required\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    std::vector<uint8_t> pattern;
+    if (!parseHexBytes(patternStr, pattern)) return EXIT_USAGE_ERROR;
+
+    ToolContext ctx("DFlashSearch");
+    int rc = initTool(ctx, args, "DFlashSearch", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) { if (g_json) return jsonError(rc, "initTool failed"); return rc; }
+
+    // Read memory in chunks for large searches
+    const uint32_t CHUNK_SIZE = 0x10000;  // 64KB chunks
+    std::vector<uint8_t> buf(CHUNK_SIZE + pattern.size() - 1);
+    uint32_t matchCount = 0;
+    std::vector<uint64_t> matchAddrs;  // for JSON output
+
+    JPRINTF("Searching 0x%08llX - 0x%08llX for pattern [",
+           (unsigned long long)addr, (unsigned long long)(addr + length - 1));
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (i > 0) JPRINTF(" ");
+        JPRINTF("%02X", pattern[i]);
+    }
+    JPRINTF("]...\n");
+
+    for (uint32_t offset = 0; offset < length; ) {
+        uint32_t chunkLen = std::min(CHUNK_SIZE, length - offset);
+        // Read extra bytes for pattern overlap at chunk boundaries
+        uint32_t readLen = chunkLen;
+        if (offset + chunkLen < length) {
+            readLen = chunkLen + static_cast<uint32_t>(pattern.size()) - 1;
+            if (offset + readLen > length) readLen = length - offset;
+        }
+
+        uint32_t bytesRead = 0;
+        tas_return_et ret = ctx.client.read(addr + offset, buf.data(), readLen, &bytesRead);
+        if (ret != TAS_ERR_NONE) {
+            if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
+            fprintf(stderr, "ERROR: Read failed at offset 0x%X: %s\n", offset, ctx.client.get_error_info());
+            return EXIT_FLASH_STATUS_ERROR;
+        }
+
+        // Search within chunk
+        for (uint32_t j = 0; j + pattern.size() <= bytesRead; ++j) {
+            if (memcmp(&buf[j], pattern.data(), pattern.size()) == 0) {
+                uint64_t matchAddr = addr + offset + j;
+                JPRINTF("  Found at 0x%08llX\n", (unsigned long long)matchAddr);
+                matchCount++;
+                if (g_json && matchAddrs.size() < 1000) matchAddrs.push_back(matchAddr);
+                if (matchCount >= 1000) {
+                    JPRINTF("  (stopped after 1000 matches)\n");
+                    JPRINTF("%u matches found\n", matchCount);
+                    if (g_json) {
+                        nljson j;
+                        j["address"] = addr;
+                        j["length"] = length;
+                        std::string patStr;
+                        for (auto b : pattern) { char h[3]; snprintf(h,3,"%02X",b); patStr += h; }
+                        j["pattern"] = patStr;
+                        j["matches"] = matchAddrs;
+                        j["match_count"] = matchCount;
+                        j["truncated"] = true;
+                        return jsonOk(j);
+                    }
+                    return EXIT_OK;
+                }
+            }
+        }
+        offset += chunkLen;
+    }
+
+    JPRINTF("%u matches found\n", matchCount);
+
+    if (g_json) {
+        nljson j;
+        j["address"] = addr;
+        j["length"] = length;
+        std::string patStr;
+        for (auto b : pattern) { char h[3]; snprintf(h,3,"%02X",b); patStr += h; }
+        j["pattern"] = patStr;
+        j["matches"] = matchAddrs;
+        j["match_count"] = matchCount;
+        return jsonOk(j);
+    }
+    return (matchCount > 0) ? EXIT_OK : EXIT_NOT_FOUND;
+}
+
+//********************************************************************************************************************
+//  doShell - interactive REPL
+//********************************************************************************************************************
+
+static int doShell(int argc, char** argv)
+{
+    CommonArgs args;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseCommonOption(argc, argv, i, args);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: dflash shell [options]\n\n");
+            printf("  Start interactive REPL mode. Connection is kept alive.\n");
+            printf("  Type 'help' for commands, 'quit' to exit.\n");
+            return EXIT_OK;
+        }
+        i++;
+    }
+
+    ToolContext ctx("DFlashShell");
+    int rc = initTool(ctx, args, "DFlashShell", TAS_CLNT_DCO_RESET_AND_HALT);
+    if (rc != EXIT_OK) return rc;
+
+    printf("\n=== DFlash Shell (v%s) ===\n", DFLASH_VERSION);
+    printf("Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    if (ctx.svd.isLoaded()) {
+        printf("SVD: %s (%zu registers)\n", ctx.svd.getDeviceName().c_str(), ctx.svd.getRegisterCount());
+    }
+    printf("Type 'help' for commands, 'quit' to exit.\n\n");
+
+    std::string line;
+    while (true) {
+        printf("dflash> ");
+        fflush(stdout);
+        if (!std::getline(std::cin, line)) break;
+
+        // Trim
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        line = line.substr(start);
+        size_t end = line.find_last_not_of(" \t\r\n");
+        if (end != std::string::npos) line = line.substr(0, end + 1);
+        if (line.empty()) continue;
+
+        // Parse into argv
+        std::vector<std::string> tokens;
+        std::istringstream iss(line);
+        std::string tok;
+        while (iss >> tok) tokens.push_back(tok);
+        if (tokens.empty()) continue;
+
+        std::string cmd = tokens[0];
+        if (cmd == "quit" || cmd == "exit" || cmd == "q") break;
+        if (cmd == "help" || cmd == "?") {
+            printf("Commands: erase write rewrite restore read dump poke reg status info compare search reset list help quit\n");
+            continue;
+        }
+
+        // Build argv for subcommand
+        std::vector<char*> subArgv;
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            subArgv.push_back(const_cast<char*>(tokens[i].c_str()));
+        }
+        int subArgc = static_cast<int>(subArgv.size());
+        char** subArgvPtr = subArgv.empty() ? nullptr : subArgv.data();
+
+        // Dispatch (reuse existing functions - they each create their own ToolContext and initTool,
+        // but we pass --server/--target/--device to reuse connection params)
+        // Actually, for shell mode we need a different approach - pass connection args
+        std::vector<std::string> fullArgs;
+        if (args.serverIp && strcmp(args.serverIp, "localhost") != 0) {
+            fullArgs.push_back("--server"); fullArgs.push_back(args.serverIp);
+        }
+        if (args.targetId) {
+            fullArgs.push_back("--target"); fullArgs.push_back(args.targetId);
+        }
+        if (args.deviceName) {
+            fullArgs.push_back("--device"); fullArgs.push_back(args.deviceName);
+        }
+        if (args.configDir) {
+            fullArgs.push_back("--config-dir"); fullArgs.push_back(args.configDir);
+        }
+        // Append user's sub-args
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            fullArgs.push_back(tokens[i]);
+        }
+
+        std::vector<char*> shellArgv;
+        for (auto& a : fullArgs) shellArgv.push_back(const_cast<char*>(a.c_str()));
+        int shellArgc = static_cast<int>(shellArgv.size());
+        char** shellArgvPtr = shellArgv.empty() ? nullptr : shellArgv.data();
+
+        if (cmd == "dump") doDump(shellArgc, shellArgvPtr);
+        else if (cmd == "poke") doPoke(shellArgc, shellArgvPtr);
+        else if (cmd == "reg") doReg(shellArgc, shellArgvPtr);
+        else if (cmd == "status") doStatus(shellArgc, shellArgvPtr);
+        else if (cmd == "info") doInfo(shellArgc, shellArgvPtr);
+        else if (cmd == "compare") doCompare(shellArgc, shellArgvPtr);
+        else if (cmd == "search") doSearch(shellArgc, shellArgvPtr);
+        else if (cmd == "erase") doErase(shellArgc, shellArgvPtr, false);
+        else if (cmd == "write") doWrite(shellArgc, shellArgvPtr);
+        else if (cmd == "rewrite") doRewrite(shellArgc, shellArgvPtr);
+        else if (cmd == "restore") doRestore(shellArgc, shellArgvPtr);
+        else if (cmd == "read") doRead(shellArgc, shellArgvPtr);
+        else if (cmd == "reset") doReset(shellArgc, shellArgvPtr);
+        else if (cmd == "list") doList(shellArgc, shellArgvPtr);
+        else printf("Unknown command '%s'. Type 'help' for list.\n", cmd.c_str());
+    }
+
+    printf("\nExiting shell.\n");
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
 //  Usage
 //********************************************************************************************************************
 
@@ -2748,19 +3990,35 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
     printf("  list     List connected TAS targets\n");
     printf("  reset    Reset the MCU\n");
     printf("  ucb      UCB (User Configuration Block) read/write (TC3XX only)\n\n");
+    printf("Debug:\n");
+    printf("  reg      Read/write registers by name or address (SVD-based)\n");
+    printf("  dump     Hex dump of memory (PFlash/DFlash/SRAM)\n");
+    printf("  poke     Write value to memory address\n");
+    printf("  status   Flash status register (SVD-driven field decoding)\n");
+    printf("  info     Device info, memory layout, SVD summary\n");
+    printf("  compare  Compare local file with Flash content\n");
+    printf("  search   Search memory for byte pattern\n");
+    printf("  shell    Interactive REPL mode\n\n");
     printf("Legacy (backward compatible):\n");
     printf("  %s <addr> <num_sectors> [options]\n", base);
     printf("  %s --all [options]\n", base);
     printf("  %s --info [options]\n\n", base);
     printf("Run '%s <subcommand> --help' for details.\n\n", base);
+    printf("Global options:\n");
+    printf("  --json             Output structured JSON (for MCP/AI integration)\n");
+    printf("  --server <ip>      TAS server IP (default: localhost)\n");
+    printf("  --target <id>      Target identifier\n");
+    printf("  --device <name>    Override device type\n");
+    printf("  --config-dir <path> DeviceConfigs directory\n\n");
     printf("Examples:\n");
     printf("  %s list\n", base);
-    printf("  %s erase --info\n", base);
-    printf("  %s erase --addr AF000000 --sectors 1\n", base);
     printf("  %s erase --all --verify\n", base);
     printf("  %s write -f data.hex --verify\n", base);
-    printf("  %s restore -f backup.bin\n", base);
-    printf("  %s read -a AF000000 -l 1000 -o dump.hex\n\n", base);
+    printf("  %s dump 0xAF000000 0x40\n", base);
+    printf("  %s reg DMU.HF.STATUS\n", base);
+    printf("  %s status\n", base);
+    printf("  %s info\n", base);
+    printf("  %s shell\n\n", base);
 
     if (loader && loader->getDeviceCount() > 0) {
         printf("Supported devices (from DeviceConfigs):\n  ");
@@ -2800,6 +4058,16 @@ int main(int argc, char** argv)
     if (first == "read"  || first == "r") return doRead(argc - 2, argv + 2);
     if (first == "list"  || first == "l") return doList(argc - 2, argv + 2);
     if (first == "reset") return doReset(argc - 2, argv + 2);
+
+    // Debug subcommands
+    if (first == "reg") return doReg(argc - 2, argv + 2);
+    if (first == "dump") return doDump(argc - 2, argv + 2);
+    if (first == "poke") return doPoke(argc - 2, argv + 2);
+    if (first == "status") return doStatus(argc - 2, argv + 2);
+    if (first == "info") return doInfo(argc - 2, argv + 2);
+    if (first == "compare") return doCompare(argc - 2, argv + 2);
+    if (first == "search") return doSearch(argc - 2, argv + 2);
+    if (first == "shell") return doShell(argc - 2, argv + 2);
 
     if (first == "ucb") {
         if (argc < 3) { printUcbUsage(argv[0]); return EXIT_USAGE_ERROR; }

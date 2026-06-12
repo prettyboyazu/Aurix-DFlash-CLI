@@ -28,6 +28,8 @@ set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/device_config_loader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/hex_parser.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/hex_parser.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/svd_loader.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/svd_loader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/dflash.rc"
 )
 

@@ -22,6 +22,7 @@
 
 `dflash` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports the following subcommands:
 
+**Flash Operations:**
 - **erase** - Erase DFlash sectors with AURIX-compliant sequence
 - **read** - Read DFlash content and output as hex dump, binary, or Intel HEX
 - **write** - Write data to DFlash from a HEX or binary file
@@ -31,7 +32,17 @@
 - **reset** - Reset the MCU (with optional halt)
 - **ucb** - Read, write, and erase UCB (User Configuration Block) on TC3x devices
 
-The tool connects to a TAS server, auto-detects the connected MCU, and performs device-specific register access (TC2x uses PMU `FLASH0_FSR`, TC3x uses DMU `DMU_HF_STATUS`/`DMU_HF_ERRSR`).
+**Debug Commands (v2.2):**
+- **reg** - Read/write registers by name or address (SVD-based)
+- **dump** - Hex dump of memory (PFlash/DFlash/SRAM)
+- **poke** - Write value to memory address
+- **status** - Flash status register with SVD-driven field decoding
+- **info** - Device info, memory layout, and SVD register summary
+- **compare** - Compare local file with Flash content
+- **search** - Search memory for byte pattern
+- **shell** - Interactive REPL mode
+
+The tool connects to a TAS server, auto-detects the connected MCU, and loads SVD register definitions for device-specific register access.
 
 ## Supported Devices
 
@@ -83,6 +94,15 @@ dflash <subcommand> [options]
 | `list` | `l` | List connected TAS targets |
 | `reset` | | Reset the MCU |
 | `ucb` | `u` | Read/write/erase UCB (TC3x only) |
+| `reg` | | Read/write registers by name or address |
+| `dump` | | Hex dump of memory (PFlash/DFlash/SRAM) |
+| `poke` | | Write value to memory address |
+| `status` | | Flash status register (SVD-driven) |
+| `info` | | Device info and memory layout |
+| `compare` | | Compare file with Flash content |
+| `search` | | Search memory for byte pattern |
+| `shell` | | Interactive REPL mode |
+| `--json` | | JSON output mode (all subcommands) |
 
 ### Legacy Mode (backward compatible)
 
@@ -521,6 +541,422 @@ dflash ucb erase --addr AF401000 --sectors 4 --verify
 
 ---
 
+## Debug Commands
+
+The debug commands provide low-level access to MCU registers and memory, using SVD (System View Description) files for register definitions. SVD-based register access is available for devices with `svdFile` configured in their device JSON.
+
+### `reg` Subcommand
+
+```
+dflash reg <name|addr> [value] [options]
+dflash reg --list [peripheral]
+```
+
+Read or write registers by SVD name or hexadecimal address.
+
+| Option | Description |
+|--------|-------------|
+| `<name>` | Register name: `DMU.HF.STATUS`, `HF.STATUS`, or hex address |
+| `<value>` | Value to write (optional; if omitted, reads) |
+| `--list [periph]` | List all registers, optionally filtered by peripheral name |
+
+When reading with SVD match, all register fields are decoded and displayed:
+
+```
+> dflash reg DMU.HF.STATUS
+HF.STATUS [0xF8040010] = 0x000000FF (read-only)
+  D0BUSY  [ 0: 0] = 0  (DF0 ready, not busy)
+  D1BUSY  [ 1: 1] = 0  (DF1 ready, not busy)
+  P0BUSY  [ 2: 2] = 0  (PFx ready, not busy)
+  DFPAGE  [20:20] = 0  (not in page mode)
+```
+
+#### Examples
+
+```
+dflash reg DMU.HF.STATUS          # Read by SVD name
+dflash reg HF.ERRSR               # Read error register
+dflash reg 0xF8040010             # Read by address
+dflash reg HF.STATUS 0x00000000   # Write to register
+dflash reg --list DMU             # List all DMU registers
+dflash reg --list                 # List all peripherals and registers
+```
+
+### `dump` Subcommand
+
+```
+dflash dump <addr> <length> [-o file] [options]
+```
+
+Read memory and display as hex dump. Supports PFlash, DFlash, SRAM (DSPR/PSPR), and peripheral register regions.
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `-o <file>` | `--output` | Save to file. `.bin` = raw binary, `.hex` = Intel HEX |
+
+#### Examples
+
+```
+dflash dump 0xAF000000 0x40                    # Read DFlash
+dflash dump 0xA0000000 0x100                   # Read PFlash
+dflash dump 0x70000000 0x80                    # Read DSPR (SRAM)
+dflash dump 0xA0000000 0x200000 -o pflash.hex  # Export entire PFlash as Intel HEX
+dflash dump 0xAF000000 0x20000 -o dflash.bin   # Save DFlash as binary
+```
+
+### `poke` Subcommand
+
+```
+dflash poke <addr> <value> [--width 8|16|32|64] [options]
+```
+
+Write a value to a memory address. Performs readback verification after write.
+
+| Option | Description |
+|--------|-------------|
+| `--width <n>` | Access width in bits: 8, 16, 32 (default), or 64 |
+
+#### Examples
+
+```
+dflash poke 0xF8040010 0x00000000       # Write 32-bit value
+dflash poke 0x70000000 0xFF --width 8   # Write single byte
+```
+
+### `status` Subcommand
+
+```
+dflash status [options]
+```
+
+Display Flash status register with SVD-driven field decoding. No hardcoded register addresses or bit definitions — all information comes from SVD files.
+
+- TC3x: Reads `DMU.HF.STATUS` + `DMU.HF.ERRSR`
+- TC2x: Reads `FLASH0.FSR`
+
+If no SVD is loaded, falls back to hardcoded addresses.
+
+### `info` Subcommand
+
+```
+dflash info [options]
+```
+
+Display comprehensive device information:
+
+- Device model, JTAG ID, family (TC2x/TC3x)
+- Connection identifier and physical interface
+- Complete memory layout (PFlash, DFlash, SRAM, UCB)
+- DFlash sector details
+- SVD register summary (peripherals and register counts)
+
+### `compare` Subcommand
+
+```
+dflash compare -f <file> -a <addr> [--length <len>] [options]
+```
+
+Compare local file contents with Flash/memory. Supports `.hex` (Intel HEX) and `.bin` files.
+
+| Option | Shortcut | Description |
+|--------|----------|-------------|
+| `-f <file>` | `--file` | Local file to compare |
+| `-a <addr>` | `--addr` | Memory address to compare against |
+| `--length <len>` | | Maximum bytes to compare |
+
+Output shows mismatch locations with expected/actual values.
+
+#### Examples
+
+```
+dflash compare -f firmware.hex -a 0xA0000000
+dflash compare -f dflash_backup.bin -a 0xAF000000 --length 0x20000
+```
+
+### `search` Subcommand
+
+```
+dflash search <addr> <length> <pattern> [options]
+```
+
+Search memory for a hex byte pattern. Pattern is specified as hex digits (e.g. `DEADBEEF`, `00FF00`).
+
+#### Examples
+
+```
+dflash search 0xAF000000 0x20000 DEADBEEF
+dflash search 0xA0000000 0x100000 00FF00
+```
+
+### `shell` Subcommand
+
+```
+dflash shell [options]
+```
+
+Start interactive REPL mode. The connection to the device is established once and kept alive for the entire session, avoiding repeated connection overhead.
+
+Built-in commands:
+- `help` — show available commands
+- `quit` / `exit` — exit shell mode
+- Any other subcommand (erase, write, dump, reg, etc.)
+
+```
+dflash> status
+Flash Status: HF.STATUS [0xF8040010] = 0x000000FF (read-only)
+  ...
+dflash> dump 0xAF000000 0x40
+AF000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+  ...
+dflash> quit
+```
+
+---
+
+## JSON Output Mode (v2.2)
+
+All subcommands support the `--json` flag for machine-readable structured output. This mode is designed for scripting, CI/CD integration, and AI agent consumption.
+
+### Output Format
+
+**Success:**
+```json
+{"status": "ok", ...}
+```
+Additional fields depend on the subcommand.
+
+**Error:**
+```json
+{"status": "error", "code": <exit_code>, "message": "<description>"}
+```
+
+### Subcommand JSON Output Reference
+
+| Subcommand | JSON Fields |
+|------------|-------------|
+| `list` | `server`, `targets[]` (index, device, identifier) |
+| `status` | `register`, `address`, `value`, `fields{}`, `error_register`, `error_fields{}` |
+| `info` | `device`, `family`, `jtag_id`, `identifier`, `phys`, `memory_regions[]`, `dflash{}`, `ucb{}`, `svd{}` |
+| `reg` (read) | `action`, `address`, `value`, `register`, `access`, `fields{}` |
+| `reg` (write) | `action`, `address`, `value`, `register` |
+| `dump` | `address`, `bytes`, `data` (hex string), `output_file` |
+| `poke` | `address`, `value`, `width`, `readback` |
+| `erase` | `address`, `sectors`, `verified` |
+| `write` | `file`, `address`, `bytes`, `verified` |
+| `read` | `address`, `bytes`, `data` or `output_file` |
+| `compare` | `file`, `address`, `bytes_compared`, `mismatches`, `match` |
+| `search` | `address`, `length`, `pattern`, `matches[]`, `match_count` |
+| `reset` | `action`, `halt` |
+
+### Examples
+
+```bash
+# List connected targets
+dflash list --json
+# {"status":"ok","server":"TasServer V2.0","targets":[{"index":0,"device":"TC33x","identifier":"TriBoard TC3XX V2.0 TB9QTU70"}]}
+
+# Flash status with field decoding
+dflash status --json
+# {"status":"ok","register":"HF.STATUS","address":4161011728,"value":34078720,
+#  "fields":{"D0BUSY":0,"D1BUSY":0,"P0BUSY":0,"DFPAGE":0,"PFPAGE":0},
+#  "error_register":"HF.ERRSR",
+#  "error_fields":{"ADER":0,"EVER":0,"OPER":0,"ORIER":0,"PROER":0,"PVER":0,"SQER":0}}
+
+# Device info with memory layout
+dflash info --json
+# {"status":"ok","device":"TC33x A step","family":"TC3x","jtag_id":270577795,
+#  "memory_regions":[{"name":"ProgramFlash","start":2684354560,...},...],
+#  "dflash":{"base":2936012800,"size":131072,"sectors":32,"sector_size":4096},...}
+
+# Register read with SVD field decoding
+dflash reg DMU.HF.STATUS --json
+# {"status":"ok","action":"read","register":"HF.STATUS","access":"read-only",
+#  "fields":{"D0BUSY":{"lsb":0,"msb":0,"value":0,"desc":"DF0 ready"},...},...}
+
+# Memory dump (data as hex string)
+dflash dump 0xAF000000 0x20 --json
+# {"status":"ok","address":2936012800,"bytes":32,"data":"0B00000000000000004000000B400000AA0000000000000001004000C03F0000"}
+
+# Memory search
+dflash search 0xAF000000 0x20000 DEADBEEF --json
+# {"status":"ok","address":2936012800,"length":131072,"pattern":"DEADBEEF",
+#  "matches":[2936013364],"match_count":1}
+
+# Error output
+dflash erase --all --json
+# {"status":"error","code":14,"message":"Erase timeout"}
+```
+
+### Notes
+
+- When `--json` is active, all informational and diagnostic messages (connection info, progress bars, etc.) are suppressed from stdout
+- Diagnostic messages from device config/SVD loading may still appear; the MCP Server handles this by parsing the last JSON line from stdout
+- Exit codes match the `code` field in error JSON output
+- The `--json` flag can be combined with any other options
+
+---
+
+## MCP Server (AI Agent Integration)
+
+The AURIX MCP Server (`tools/aurix_mcp_server.py`) wraps `dflash.exe` and `AURIXFlasher.exe` as [Model Context Protocol](https://modelcontextprotocol.io/) tools, enabling AI agents to interact with AURIX hardware programmatically.
+
+### Requirements
+
+- Python 3.10+
+- `mcp[cli]` package: `pip install "mcp[cli]"`
+
+### Configuration
+
+The server uses `tools/mcp_config.json`:
+
+```json
+{
+    "dflash_exe": null,
+    "aurix_flasher_exe": null,
+    "server": "localhost",
+    "target": null,
+    "device": null,
+    "timeout": 120
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `dflash_exe` | Path to `dflash.exe`. Auto-detected if `null`. |
+| `aurix_flasher_exe` | Path to `AURIXFlasher.exe`. Auto-detected if `null`. |
+| `server` | TAS Server address (default: `localhost`) |
+| `target` | Target identifier (default: first available) |
+| `device` | Device name override (default: auto-detect) |
+| `timeout` | Command timeout in seconds (default: 120) |
+
+Executable paths are auto-detected by searching `tools/`, `Erase/`, `data/`, and `AURIXFlasher/` directories relative to the script.
+
+### Running the MCP Server
+
+**stdio transport** (default, for AI agent integration):
+```bash
+python tools/aurix_mcp_server.py --config tools/mcp_config.json
+```
+
+**SSE transport** (HTTP server mode):
+```bash
+python tools/aurix_mcp_server.py --config tools/mcp_config.json --transport sse
+# Server starts at http://127.0.0.1:8000
+```
+
+### MCP Tools
+
+| Tool | CLI Equivalent | Description |
+|------|---------------|-------------|
+| `dflash_list` | `dflash list --json` | List connected TAS targets |
+| `dflash_status` | `dflash status --json` | Flash status register with SVD field decoding |
+| `dflash_info` | `dflash info --json` | Device info, memory layout, SVD summary |
+| `dflash_erase` | `dflash erase --json` | Erase DFlash sectors |
+| `dflash_write` | `dflash write --json` | Write data to DFlash from file |
+| `dflash_read` | `dflash read --json` | Read DFlash content |
+| `dflash_dump` | `dflash dump --json` | Hex dump of memory (PFlash/DFlash/SRAM) |
+| `dflash_reg` | `dflash reg --json` | Read/write registers by SVD name or address |
+| `dflash_poke` | `dflash poke --json` | Write value to memory address |
+| `dflash_compare` | `dflash compare --json` | Compare local file with Flash content |
+| `dflash_search` | `dflash search --json` | Search memory for byte pattern |
+| `dflash_reset` | `dflash reset --json` | Reset the MCU |
+| `flash_pflash` | `AURIXFlasher.exe` | Program PFlash via AURIXFlasher CLI |
+
+### Tool Parameters
+
+Each MCP tool accepts optional `server`, `target`, and `device` string parameters that override the config file defaults:
+
+```python
+# Example: dflash_status tool
+dflash_status(server="192.168.1.100", target="TC33x", device="")
+
+# Example: dflash_dump tool
+dflash_dump(address="0xAF000000", length="0x100", server="", target="", device="")
+
+# Example: dflash_reg tool
+dflash_reg(name="DMU.HF.STATUS", value="", server="", target="", device="")
+```
+
+### Registering in AI Agent Platforms
+
+**Qoder (`.qoder/mcps.json`):**
+```json
+{
+  "aurix": {
+    "command": "python",
+    "args": ["tools/aurix_mcp_server.py", "--config", "tools/mcp_config.json"]
+  }
+}
+```
+
+**Claude Desktop (`claude_desktop_config.json`):**
+```json
+{
+  "mcpServers": {
+    "aurix": {
+      "command": "python",
+      "args": ["/path/to/tools/aurix_mcp_server.py", "--config", "/path/to/tools/mcp_config.json"]
+    }
+  }
+}
+```
+
+### Architecture
+
+```
+┌─────────────────────────────────────────┐
+│          AI Agent (Claude, etc.)          │
+├─────────────────────────────────────────┤
+│          MCP Protocol (stdio/SSE)         │
+├─────────────────────────────────────────┤
+│          aurix_mcp_server.py              │
+│          (FastMCP, 13 tools)              │
+├───────────────┬─────────────────────────┤
+│  dflash.exe   │  AURIXFlasher.exe       │
+│  (--json)     │  (PFlash programming)   │
+├───────────────┴─────────────────────────┤
+│          TAS Server + miniWiggler         │
+├─────────────────────────────────────────┤
+│          AURIX TC2x/TC3x Target          │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## SVD Register Definitions
+
+### Overview
+
+Register definitions are loaded from pre-processed JSON files generated from CMSIS-SVD XML files. The preprocessing script (`tools/svd_to_json.py`) extracts peripheral, register, and field information into a compact JSON format.
+
+### File Locations
+
+| File | Description |
+|------|-------------|
+| `data/SVD/tc33xpd/1.2-3/device.svd` | TC33x SVD source |
+| `data/SVD/tc36xpd/1.2-3/device.svd` | TC36x SVD source |
+| `data/RegisterDefs/TC33x.json` | Preprocessed TC33x register definitions |
+| `data/RegisterDefs/TC36x.json` | Preprocessed TC36x register definitions |
+
+### Adding SVD Support for New Devices
+
+1. Place the SVD file under `data/SVD/<device>/`
+2. Run the preprocessing script:
+   ```
+   python tools/svd_to_json.py data/SVD/<device>/device.svd data/RegisterDefs/<Device>.json
+   ```
+3. Add `"svdFile": "RegisterDefs/<Device>.json"` to the device's JSON config in `DeviceConfigs/`
+4. No source code change or rebuild required
+
+### Default Peripheral Filter
+
+The preprocessing script includes a default whitelist of Flash/debug-related peripherals:
+`DMU`, `FLASH0`, `PMU`, `FSI`, `PFI0`, `PFI1`, `CBS`, `SMU`, `SCU`, `MTU`
+
+Use `--all` to include all peripherals, or `--peripherals <list>` for a custom filter.
+
+---
+
 ## DeviceConfigs Configuration
 
 The tool no longer hard-codes any device-specific memory parameters. On startup it automatically loads the device descriptions (DFlash base address, total size, sector size, etc.) from a directory of JSON files called `DeviceConfigs/`.
@@ -578,8 +1014,8 @@ The auto-detected device name (from the connected target) is matched against the
 | 19 | Write failed |
 | 20 | File open/parse failed |
 | 21 | Restore failed |
-| 22 | UCB erase failed (locked region overlap) |
-| 23 | UCB operation on unsupported device (not TC3x) |
+| 22 | Compare found mismatches |
+| 23 | Search pattern not found |
 
 ## Erase Sequence
 
@@ -811,6 +1247,7 @@ Deployed (with `build.bat --deploy`):
 ```
 Erase/dflash.exe                                  # Standalone executable
 Erase/DeviceConfigs/*.json                        # Device configuration files
+Erase/RegisterDefs/*.json                         # SVD register definitions
 ```
 
 ### Static Linking

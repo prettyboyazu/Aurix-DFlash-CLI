@@ -163,10 +163,11 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
         }
     }
 
-    // Extract DataFlash memory segment
-    uint32_t baseAddress = 0;
-    uint32_t totalSize = 0;
-    uint32_t sectorSize = 0;
+    // Parse all memory regions
+    std::vector<MemoryRegion> memRegions;
+    uint32_t dflashBaseAddress = 0;
+    uint32_t dflashTotalSize = 0;
+    uint32_t dflashSectorSize = 0;
     uint32_t ucbBaseAddress = 0;
     uint32_t ucbSectorSize = 0;
     uint32_t ucbNumSectors = 0;
@@ -175,60 +176,74 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
     if (root.contains("memory") && root["memory"].is_array()) {
         for (const auto& mem : root["memory"]) {
             if (!mem.contains("memoryName") || !mem["memoryName"].is_string()) continue;
-            if (mem["memoryName"].get<std::string>() != "DataFlash") continue;
+            std::string memName = mem["memoryName"].get<std::string>();
 
-            // Extract base address
+            MemoryRegion region;
+            region.name = memName;
             if (mem.contains("memoryStartAddress") && mem["memoryStartAddress"].is_string()) {
-                baseAddress = hexStringToUint32(mem["memoryStartAddress"].get<std::string>());
+                region.startAddr = std::stoull(mem["memoryStartAddress"].get<std::string>(), nullptr, 0);
             }
-
-            // Extract total size
+            if (mem.contains("memoryEndAddress") && mem["memoryEndAddress"].is_string()) {
+                region.endAddr = std::stoull(mem["memoryEndAddress"].get<std::string>(), nullptr, 0);
+            }
             if (mem.contains("memorySize") && mem["memorySize"].is_string()) {
-                totalSize = hexStringToUint32(mem["memorySize"].get<std::string>());
+                region.size = hexStringToUint32(mem["memorySize"].get<std::string>());
             }
+            region.isSRAM = mem.value("isSRAM", false);
 
-            // Extract sector size from first logical sector
-            if (mem.contains("logicalSectors") && mem["logicalSectors"].is_array()) {
-                const auto& sectors = mem["logicalSectors"];
-                if (!sectors.empty() && sectors[0].contains("sectorSize")) {
-                    const auto& ss = sectors[0]["sectorSize"];
-                    if (ss.is_string()) {
-                        sectorSize = hexStringToUint32(ss.get<std::string>());
-                    } else if (ss.is_number_unsigned()) {
-                        sectorSize = ss.get<uint32_t>();
-                    }
-                }
-            }
+            // Extract DataFlash-specific config
+            if (memName == "DataFlash") {
+                dflashBaseAddress = static_cast<uint32_t>(region.startAddr);
+                dflashTotalSize = region.size;
 
-            // Parse UCB array if present (inside the DataFlash memory entry)
-            if (mem.contains("UCB") && mem["UCB"].is_array()) {
-                const auto& ucbArray = mem["UCB"];
-                if (!ucbArray.empty()) {
-                    // Extract baseAddress from first sector's sectorStartAddress
-                    if (ucbArray[0].contains("sectorStartAddress") && ucbArray[0]["sectorStartAddress"].is_string()) {
-                        ucbBaseAddress = hexStringToUint32(ucbArray[0]["sectorStartAddress"].get<std::string>());
-                    }
-                    // Extract sectorSize from first sector
-                    if (ucbArray[0].contains("sectorSize")) {
-                        const auto& ss = ucbArray[0]["sectorSize"];
+                // Extract sector size from first logical sector
+                if (mem.contains("logicalSectors") && mem["logicalSectors"].is_array()) {
+                    const auto& sectors = mem["logicalSectors"];
+                    if (!sectors.empty() && sectors[0].contains("sectorSize")) {
+                        const auto& ss = sectors[0]["sectorSize"];
                         if (ss.is_string()) {
-                            ucbSectorSize = hexStringToUint32(ss.get<std::string>());
+                            dflashSectorSize = hexStringToUint32(ss.get<std::string>());
                         } else if (ss.is_number_unsigned()) {
-                            ucbSectorSize = ss.get<uint32_t>();
+                            dflashSectorSize = ss.get<uint32_t>();
                         }
                     }
-                    ucbNumSectors = static_cast<uint32_t>(ucbArray.size());
                 }
+
+                // Parse UCB array if present
+                if (mem.contains("UCB") && mem["UCB"].is_array()) {
+                    const auto& ucbArray = mem["UCB"];
+                    if (!ucbArray.empty()) {
+                        if (ucbArray[0].contains("sectorStartAddress") && ucbArray[0]["sectorStartAddress"].is_string()) {
+                            ucbBaseAddress = hexStringToUint32(ucbArray[0]["sectorStartAddress"].get<std::string>());
+                        }
+                        if (ucbArray[0].contains("sectorSize")) {
+                            const auto& ss = ucbArray[0]["sectorSize"];
+                            if (ss.is_string()) {
+                                ucbSectorSize = hexStringToUint32(ss.get<std::string>());
+                            } else if (ss.is_number_unsigned()) {
+                                ucbSectorSize = ss.get<uint32_t>();
+                            }
+                        }
+                        ucbNumSectors = static_cast<uint32_t>(ucbArray.size());
+                    }
+                }
+
+                foundDFlash = true;
             }
 
-            foundDFlash = true;
-            break;
+            memRegions.push_back(std::move(region));
         }
     }
 
-    if (!foundDFlash || baseAddress == 0 || totalSize == 0 || sectorSize == 0) {
+    if (!foundDFlash || dflashBaseAddress == 0 || dflashTotalSize == 0 || dflashSectorSize == 0) {
         std::cerr << "[DeviceConfigLoader] Missing or invalid DataFlash config in: " << filePath << std::endl;
         return false;
+    }
+
+    // Parse svdFile field
+    std::string svdFile;
+    if (root.contains("svdFile") && root["svdFile"].is_string()) {
+        svdFile = root["svdFile"].get<std::string>();
     }
 
     // Determine family from filename
@@ -245,7 +260,7 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
         isTc3x = true;
     } else {
         // Infer from base address
-        if (baseAddress == 0xAF000000) {
+        if (dflashBaseAddress == 0xAF000000) {
             family = "TC2x";  // Default assumption
             isTc3x = false;
         } else {
@@ -260,18 +275,20 @@ bool DeviceConfigLoader::parseDeviceJson(const std::string& filePath) {
     entry.dflash.shortName = shortName;
     entry.dflash.family = family;
     entry.dflash.isTc3x = isTc3x;
-    entry.dflash.baseAddress = baseAddress;
-    entry.dflash.totalSize = totalSize;
-    entry.dflash.sectorSize = sectorSize;
+    entry.dflash.baseAddress = dflashBaseAddress;
+    entry.dflash.totalSize = dflashTotalSize;
+    entry.dflash.sectorSize = dflashSectorSize;
     // NOTE: Assumes uniform sector size across all DFlash sectors.
     // This holds true for all current TC2x/TC3x DataFlash configurations.
     // ProgramFlash may have non-uniform sectors, but DataFlash does not.
-    entry.dflash.numSectors = totalSize / sectorSize;
+    entry.dflash.numSectors = dflashTotalSize / dflashSectorSize;
     // Populate UCB config (remains default zeros if JSON has no UCB array)
     entry.dflash.ucb.baseAddress = ucbBaseAddress;
     entry.dflash.ucb.sectorSize = ucbSectorSize;
     entry.dflash.ucb.numSectors = ucbNumSectors;
     entry.dflash.ucb.totalSize = ucbNumSectors * ucbSectorSize;
+    entry.dflash.svdFilePath = svdFile;
+    entry.dflash.memoryRegions = std::move(memRegions);
     entry.jtagIds = jtagIds;
 
     devices_.push_back(std::move(entry));

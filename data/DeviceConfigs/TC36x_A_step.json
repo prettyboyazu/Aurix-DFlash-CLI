@@ -1,5 +1,6 @@
 {
     "deviceName": "TC36x A step",
+    "svdFile": "RegisterDefs/TC36x-full.json",
     "flaxFileName": "flax_TC36x.hex",
     "busWidth": 32,
     "addressStep": 4,

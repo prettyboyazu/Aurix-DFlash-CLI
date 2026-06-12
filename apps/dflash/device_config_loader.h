@@ -11,6 +11,14 @@ struct UCBConfig {
     uint32_t totalSize = 0;     // numSectors * sectorSize
 };
 
+struct MemoryRegion {
+    std::string name;       // "ProgramFlash", "DataFlash", "CPU0 DSPR", "CPU0 PSPR"
+    uint64_t startAddr = 0;
+    uint64_t endAddr = 0;
+    uint32_t size = 0;
+    bool isSRAM = false;
+};
+
 struct DFlashConfig {
     std::string deviceName;   // e.g. "TC27x D step"
     std::string shortName;    // e.g. "TC27x" (used for CLI matching)
@@ -21,6 +29,8 @@ struct DFlashConfig {
     uint32_t sectorSize;      // logical sector size
     uint32_t numSectors;      // number of sectors
     UCBConfig ucb;            // UCB (User Configuration Block) config
+    std::string svdFilePath;  // relative path to register def JSON
+    std::vector<MemoryRegion> memoryRegions;  // all memory regions (PFlash, DFlash, SRAM)
 };
 
 class DeviceConfigLoader {

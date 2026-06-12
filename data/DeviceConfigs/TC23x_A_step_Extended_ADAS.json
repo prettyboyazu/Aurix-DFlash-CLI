@@ -1,5 +1,6 @@
 {
     "deviceName": "TC23x A step Extended / ADAS",
+    "svdFile": "RegisterDefs/TC23x-full.json",
     "flaxFileName": "flax_TC2xx.hex",
     "busWidth": 32,
     "addressStep": 4,
