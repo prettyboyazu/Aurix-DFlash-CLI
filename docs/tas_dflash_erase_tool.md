@@ -16,11 +16,11 @@
  See the License for the specific language governing permissions and
  limitations under the License.
  ****************************************************************************************************************-->
-# TAS DFlash Tool {#tas_dflash_tool}
+# Wiggle — TAS DFlash Tool {#tas_dflash_tool}
 
 ## Overview
 
-`dflash` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports the following subcommands:
+`wiggle` is a command-line tool for accessing DFlash on Infineon AURIX microcontrollers via the TAS Client API. It supports the following subcommands:
 
 **Flash Operations:**
 - **erase** - Erase DFlash sectors with AURIX-compliant sequence
@@ -79,7 +79,7 @@ To add support for an additional device, drop the corresponding `<Device>_<step>
 ## Usage
 
 ```
-dflash <subcommand> [options]
+wiggle <subcommand> [options]
 ```
 
 ### Subcommands
@@ -109,9 +109,9 @@ dflash <subcommand> [options]
 The tool supports the original positional-argument syntax, automatically routed to `erase`:
 
 ```
-dflash <addr> <num_sectors> [options]
-dflash --all [options]
-dflash --info [options]
+wiggle <addr> <num_sectors> [options]
+wiggle --all [options]
+wiggle --info [options]
 ```
 
 ---
@@ -119,7 +119,7 @@ dflash --info [options]
 ## `erase` Subcommand
 
 ```
-dflash erase [--addr <hex> --sectors <n> | --all] [options]
+wiggle erase [--addr <hex> --sectors <n> | --all] [options]
 ```
 
 ### Options
@@ -142,23 +142,23 @@ dflash erase [--addr <hex> --sectors <n> | --all] [options]
 
 Show device info:
 ```
-dflash erase --info
+wiggle erase --info
 ```
 
 Erase a single sector with verification:
 ```
-dflash erase --addr 0xAF000000 --sectors 1 --verify
+wiggle erase --addr 0xAF000000 --sectors 1 --verify
 ```
 
 Erase entire DFlash with backup, verify, and MCU reset:
 ```
-dflash erase --all --backup dump.bin --verify --reset
+wiggle erase --all --backup dump.bin --verify --reset
 ```
 
 Legacy syntax (still supported):
 ```
-dflash 0xAF000000 1 --verify
-dflash --all --verify
+wiggle 0xAF000000 1 --verify
+wiggle --all --verify
 ```
 
 ---
@@ -166,7 +166,7 @@ dflash --all --verify
 ## `read` Subcommand
 
 ```
-dflash read --addr <hex> --length <hex> [--output <file>] [options]
+wiggle read --addr <hex> --length <hex> [--output <file>] [options]
 ```
 
 ### Options
@@ -184,17 +184,17 @@ dflash read --addr <hex> --length <hex> [--output <file>] [options]
 
 Hex dump to terminal:
 ```
-dflash read --addr 0xAF000000 --length 0x1000
+wiggle read --addr 0xAF000000 --length 0x1000
 ```
 
 Save as raw binary:
 ```
-dflash read --addr 0xAF000000 --length 0x20000 --output dump.bin
+wiggle read --addr 0xAF000000 --length 0x20000 --output dump.bin
 ```
 
 Save as Intel HEX:
 ```
-dflash read --addr 0xAF000000 --length 0x20000 --output dump.hex
+wiggle read --addr 0xAF000000 --length 0x20000 --output dump.hex
 ```
 
 ---
@@ -202,7 +202,7 @@ dflash read --addr 0xAF000000 --length 0x20000 --output dump.hex
 ## `write` Subcommand
 
 ```
-dflash write --file <path> [--addr <address>] [--verify] [options]
+wiggle write --file <path> [--addr <address>] [--verify] [options]
 ```
 
 Write data to DFlash from a HEX or binary file.
@@ -223,17 +223,17 @@ Write data to DFlash from a HEX or binary file.
 
 Write a binary file to DFlash start address:
 ```
-dflash write --file data.bin
+wiggle write --file data.bin
 ```
 
 Write a binary file to a specific address with verification:
 ```
-dflash write --file data.bin --addr 0xAF001000 --verify
+wiggle write --file data.bin --addr 0xAF001000 --verify
 ```
 
 Write an Intel HEX file (addresses embedded in file):
 ```
-dflash write --file firmware.hex --verify
+wiggle write --file firmware.hex --verify
 ```
 
 ---
@@ -241,7 +241,7 @@ dflash write --file firmware.hex --verify
 ## `restore` Subcommand
 
 ```
-dflash restore --file <path> [--no-verify] [options]
+wiggle restore --file <path> [--no-verify] [options]
 ```
 
 Restore DFlash from a backup file. This command performs erase + write + verify as a single operation, providing a convenient way to restore a previously saved DFlash image.
@@ -261,17 +261,17 @@ Restore DFlash from a backup file. This command performs erase + write + verify 
 
 Restore DFlash from a binary backup:
 ```
-dflash restore --file dump.bin
+wiggle restore --file dump.bin
 ```
 
 Restore from a HEX file without verification:
 ```
-dflash restore --file backup.hex --no-verify
+wiggle restore --file backup.hex --no-verify
 ```
 
 Restore to a remote target:
 ```
-dflash restore --file dump.bin --server 192.168.1.100
+wiggle restore --file dump.bin --server 192.168.1.100
 ```
 
 ---
@@ -279,8 +279,8 @@ dflash restore --file dump.bin --server 192.168.1.100
 ## `rewrite` Subcommand
 
 ```
-dflash rewrite --file <path> [--addr <hex>]       # From firmware file
-dflash rewrite --addr <hex> --data <hexstring>    # Inline hex data
+wiggle rewrite --file <path> [--addr <hex>]       # From firmware file
+wiggle rewrite --addr <hex> --data <hexstring>    # Inline hex data
 ```
 
 Read-Modify-Write to any DFlash address. No need to manually handle sector alignment — the tool automatically performs the full read-merge-erase-writeback sequence.
@@ -312,27 +312,27 @@ Read-Modify-Write to any DFlash address. No need to manually handle sector align
 
 Rewrite from a hex file (address determined by file):
 ```
-dflash rewrite --file firmware.hex --verify
+wiggle rewrite --file firmware.hex --verify
 ```
 
 Rewrite from a bin file to a specific address:
 ```
-dflash rewrite --file data.bin --addr AF000100
+wiggle rewrite --file data.bin --addr AF000100
 ```
 
 Inline write 8 bytes:
 ```
-dflash rewrite --addr AF000004 --data 12345678AABBCCDD --verify
+wiggle rewrite --addr AF000004 --data 12345678AABBCCDD --verify
 ```
 
 Rewrite with auto-generated backup file:
 ```
-dflash rewrite --addr AF000004 --data FF --backup
+wiggle rewrite --addr AF000004 --data FF --backup
 ```
 
 Rewrite with specified backup path:
 ```
-dflash rewrite --file patch.hex --backup D:\backups\before_patch.hex
+wiggle rewrite --file patch.hex --backup D:\backups\before_patch.hex
 ```
 
 ### Notes
@@ -348,7 +348,7 @@ dflash rewrite --file patch.hex --backup D:\backups\before_patch.hex
 ## `list` Subcommand
 
 ```
-dflash list [--server <ip>]
+wiggle list [--server <ip>]
 ```
 
 Lists all targets connected to the TAS server, showing device type and identifier string. Does not require session start or device connect.
@@ -356,7 +356,7 @@ Lists all targets connected to the TAS server, showing device type and identifie
 ### Example
 
 ```
-dflash list
+wiggle list
 ```
 
 Output:
@@ -374,7 +374,7 @@ Connecting to TAS server at localhost...
 ## `reset` Subcommand
 
 ```
-dflash reset [--halt] [--server <ip>] [--target <id>]
+wiggle reset [--halt] [--server <ip>] [--target <id>]
 ```
 
 Resets the MCU. By default, the MCU resumes normal execution after reset. Use `--halt` to halt the CPU after reset (useful for debugging or before performing flash operations).
@@ -391,12 +391,12 @@ Resets the MCU. By default, the MCU resumes normal execution after reset. Use `-
 
 Reset MCU and resume execution:
 ```
-dflash reset
+wiggle reset
 ```
 
 Reset and halt MCU:
 ```
-dflash reset --halt
+wiggle reset --halt
 ```
 
 ---
@@ -404,7 +404,7 @@ dflash reset --halt
 ## `ucb` Subcommand
 
 ```
-dflash ucb <operation> [options]
+wiggle ucb <operation> [options]
 ```
 
 Access the User Configuration Block (UCB) on TC3x AURIX devices. UCB stores critical boot configuration, security settings, and flash protection parameters.
@@ -437,7 +437,7 @@ Access the User Configuration Block (UCB) on TC3x AURIX devices. UCB stores crit
 ### `ucb read`
 
 ```
-dflash ucb read [--addr <hex> --length <hex>] [--output <file>] [options]
+wiggle ucb read [--addr <hex> --length <hex>] [--output <file>] [options]
 ```
 
 Read UCB content. Without `--addr`/`--length`, reads the entire 24 KB UCB area.
@@ -452,23 +452,23 @@ Read UCB content. Without `--addr`/`--length`, reads the entire 24 KB UCB area.
 
 Read entire UCB (24 KB hex dump):
 ```
-dflash ucb read
+wiggle ucb read
 ```
 
 Read BMHD area (first 4 sectors):
 ```
-dflash ucb read --addr AF400000 --length 800
+wiggle ucb read --addr AF400000 --length 800
 ```
 
 Save UCB to Intel HEX file:
 ```
-dflash ucb read -a AF400000 -l 6000 -o ucb_backup.hex
+wiggle ucb read -a AF400000 -l 6000 -o ucb_backup.hex
 ```
 
 ### `ucb write`
 
 ```
-dflash ucb write --file <path> [--addr <hex>] [--verify] [options]
+wiggle ucb write --file <path> [--addr <hex>] [--verify] [options]
 ```
 
 Write data to UCB from a HEX or binary file.
@@ -483,18 +483,18 @@ Write data to UCB from a HEX or binary file.
 
 Write Intel HEX file to UCB:
 ```
-dflash ucb write --file bmhd_config.hex --verify
+wiggle ucb write --file bmhd_config.hex --verify
 ```
 
 Write binary file to specific UCB address:
 ```
-dflash ucb write --file data.bin --addr AF400000 --verify
+wiggle ucb write --file data.bin --addr AF400000 --verify
 ```
 
 ### `ucb erase`
 
 ```
-dflash ucb erase --addr <hex> --sectors <n> [--verify] [options]
+wiggle ucb erase --addr <hex> --sectors <n> [--verify] [options]
 ```
 
 Erase UCB sectors. **High-risk operation** — requires user confirmation.
@@ -517,12 +517,12 @@ If the specified range overlaps a locked region, the tool will report an error a
 
 Erase BMHD sectors (0-3):
 ```
-dflash ucb erase --addr AF400000 --sectors 4 --verify
+wiggle ucb erase --addr AF400000 --sectors 4 --verify
 ```
 
 Erase BMHD COPY sectors (8-11):
 ```
-dflash ucb erase --addr AF401000 --sectors 4 --verify
+wiggle ucb erase --addr AF401000 --sectors 4 --verify
 ```
 
 ### Common Options (all UCB operations)
@@ -548,8 +548,8 @@ The debug commands provide low-level access to MCU registers and memory, using S
 ### `reg` Subcommand
 
 ```
-dflash reg <name|addr> [value] [options]
-dflash reg --list [peripheral]
+wiggle reg <name|addr> [value] [options]
+wiggle reg --list [peripheral]
 ```
 
 Read or write registers by SVD name or hexadecimal address.
@@ -563,7 +563,7 @@ Read or write registers by SVD name or hexadecimal address.
 When reading with SVD match, all register fields are decoded and displayed:
 
 ```
-> dflash reg DMU.HF.STATUS
+> wiggle reg DMU.HF.STATUS
 HF.STATUS [0xF8040010] = 0x000000FF (read-only)
   D0BUSY  [ 0: 0] = 0  (DF0 ready, not busy)
   D1BUSY  [ 1: 1] = 0  (DF1 ready, not busy)
@@ -574,18 +574,18 @@ HF.STATUS [0xF8040010] = 0x000000FF (read-only)
 #### Examples
 
 ```
-dflash reg DMU.HF.STATUS          # Read by SVD name
-dflash reg HF.ERRSR               # Read error register
-dflash reg 0xF8040010             # Read by address
-dflash reg HF.STATUS 0x00000000   # Write to register
-dflash reg --list DMU             # List all DMU registers
-dflash reg --list                 # List all peripherals and registers
+wiggle reg DMU.HF.STATUS          # Read by SVD name
+wiggle reg HF.ERRSR               # Read error register
+wiggle reg 0xF8040010             # Read by address
+wiggle reg HF.STATUS 0x00000000   # Write to register
+wiggle reg --list DMU             # List all DMU registers
+wiggle reg --list                 # List all peripherals and registers
 ```
 
 ### `dump` Subcommand
 
 ```
-dflash dump <addr> <length> [-o file] [options]
+wiggle dump <addr> <length> [-o file] [options]
 ```
 
 Read memory and display as hex dump. Supports PFlash, DFlash, SRAM (DSPR/PSPR), and peripheral register regions.
@@ -597,17 +597,17 @@ Read memory and display as hex dump. Supports PFlash, DFlash, SRAM (DSPR/PSPR), 
 #### Examples
 
 ```
-dflash dump 0xAF000000 0x40                    # Read DFlash
-dflash dump 0xA0000000 0x100                   # Read PFlash
-dflash dump 0x70000000 0x80                    # Read DSPR (SRAM)
-dflash dump 0xA0000000 0x200000 -o pflash.hex  # Export entire PFlash as Intel HEX
-dflash dump 0xAF000000 0x20000 -o dflash.bin   # Save DFlash as binary
+wiggle dump 0xAF000000 0x40                    # Read DFlash
+wiggle dump 0xA0000000 0x100                   # Read PFlash
+wiggle dump 0x70000000 0x80                    # Read DSPR (SRAM)
+wiggle dump 0xA0000000 0x200000 -o pflash.hex  # Export entire PFlash as Intel HEX
+wiggle dump 0xAF000000 0x20000 -o dflash.bin   # Save DFlash as binary
 ```
 
 ### `poke` Subcommand
 
 ```
-dflash poke <addr> <value> [--width 8|16|32|64] [options]
+wiggle poke <addr> <value> [--width 8|16|32|64] [options]
 ```
 
 Write a value to a memory address. Performs readback verification after write.
@@ -619,14 +619,14 @@ Write a value to a memory address. Performs readback verification after write.
 #### Examples
 
 ```
-dflash poke 0xF8040010 0x00000000       # Write 32-bit value
-dflash poke 0x70000000 0xFF --width 8   # Write single byte
+wiggle poke 0xF8040010 0x00000000       # Write 32-bit value
+wiggle poke 0x70000000 0xFF --width 8   # Write single byte
 ```
 
 ### `status` Subcommand
 
 ```
-dflash status [options]
+wiggle status [options]
 ```
 
 Display Flash status register with SVD-driven field decoding. No hardcoded register addresses or bit definitions — all information comes from SVD files.
@@ -639,7 +639,7 @@ If no SVD is loaded, falls back to hardcoded addresses.
 ### `info` Subcommand
 
 ```
-dflash info [options]
+wiggle info [options]
 ```
 
 Display comprehensive device information:
@@ -653,7 +653,7 @@ Display comprehensive device information:
 ### `compare` Subcommand
 
 ```
-dflash compare -f <file> -a <addr> [--length <len>] [options]
+wiggle compare -f <file> -a <addr> [--length <len>] [options]
 ```
 
 Compare local file contents with Flash/memory. Supports `.hex` (Intel HEX) and `.bin` files.
@@ -669,14 +669,14 @@ Output shows mismatch locations with expected/actual values.
 #### Examples
 
 ```
-dflash compare -f firmware.hex -a 0xA0000000
-dflash compare -f dflash_backup.bin -a 0xAF000000 --length 0x20000
+wiggle compare -f firmware.hex -a 0xA0000000
+wiggle compare -f dflash_backup.bin -a 0xAF000000 --length 0x20000
 ```
 
 ### `search` Subcommand
 
 ```
-dflash search <addr> <length> <pattern> [options]
+wiggle search <addr> <length> <pattern> [options]
 ```
 
 Search memory for a hex byte pattern. Pattern is specified as hex digits (e.g. `DEADBEEF`, `00FF00`).
@@ -684,14 +684,14 @@ Search memory for a hex byte pattern. Pattern is specified as hex digits (e.g. `
 #### Examples
 
 ```
-dflash search 0xAF000000 0x20000 DEADBEEF
-dflash search 0xA0000000 0x100000 00FF00
+wiggle search 0xAF000000 0x20000 DEADBEEF
+wiggle search 0xA0000000 0x100000 00FF00
 ```
 
 ### `shell` Subcommand
 
 ```
-dflash shell [options]
+wiggle shell [options]
 ```
 
 Start interactive REPL mode. The connection to the device is established once and kept alive for the entire session, avoiding repeated connection overhead.
@@ -702,13 +702,13 @@ Built-in commands:
 - Any other subcommand (erase, write, dump, reg, etc.)
 
 ```
-dflash> status
+wiggle> status
 Flash Status: HF.STATUS [0xF8040010] = 0x000000FF (read-only)
   ...
-dflash> dump 0xAF000000 0x40
+wiggle> dump 0xAF000000 0x40
 AF000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
   ...
-dflash> quit
+wiggle> quit
 ```
 
 ---
@@ -752,38 +752,38 @@ Additional fields depend on the subcommand.
 
 ```bash
 # List connected targets
-dflash list --json
+wiggle list --json
 # {"status":"ok","server":"TasServer V2.0","targets":[{"index":0,"device":"TC33x","identifier":"TriBoard TC3XX V2.0 TB9QTU70"}]}
 
 # Flash status with field decoding
-dflash status --json
+wiggle status --json
 # {"status":"ok","register":"HF.STATUS","address":4161011728,"value":34078720,
 #  "fields":{"D0BUSY":0,"D1BUSY":0,"P0BUSY":0,"DFPAGE":0,"PFPAGE":0},
 #  "error_register":"HF.ERRSR",
 #  "error_fields":{"ADER":0,"EVER":0,"OPER":0,"ORIER":0,"PROER":0,"PVER":0,"SQER":0}}
 
 # Device info with memory layout
-dflash info --json
+wiggle info --json
 # {"status":"ok","device":"TC33x A step","family":"TC3x","jtag_id":270577795,
 #  "memory_regions":[{"name":"ProgramFlash","start":2684354560,...},...],
 #  "dflash":{"base":2936012800,"size":131072,"sectors":32,"sector_size":4096},...}
 
 # Register read with SVD field decoding
-dflash reg DMU.HF.STATUS --json
+wiggle reg DMU.HF.STATUS --json
 # {"status":"ok","action":"read","register":"HF.STATUS","access":"read-only",
 #  "fields":{"D0BUSY":{"lsb":0,"msb":0,"value":0,"desc":"DF0 ready"},...},...}
 
 # Memory dump (data as hex string)
-dflash dump 0xAF000000 0x20 --json
+wiggle dump 0xAF000000 0x20 --json
 # {"status":"ok","address":2936012800,"bytes":32,"data":"0B00000000000000004000000B400000AA0000000000000001004000C03F0000"}
 
 # Memory search
-dflash search 0xAF000000 0x20000 DEADBEEF --json
+wiggle search 0xAF000000 0x20000 DEADBEEF --json
 # {"status":"ok","address":2936012800,"length":131072,"pattern":"DEADBEEF",
 #  "matches":[2936013364],"match_count":1}
 
 # Error output
-dflash erase --all --json
+wiggle erase --all --json
 # {"status":"error","code":14,"message":"Erase timeout"}
 ```
 
@@ -798,7 +798,7 @@ dflash erase --all --json
 
 ## MCP Server (AI Agent Integration)
 
-The AURIX MCP Server (`tools/aurix_mcp_server.py`) wraps `dflash.exe` and `AURIXFlasher.exe` as [Model Context Protocol](https://modelcontextprotocol.io/) tools, enabling AI agents to interact with AURIX hardware programmatically.
+The AURIX MCP Server (`tools/aurix_mcp_server.py`) wraps `wiggle.exe` and `AURIXFlasher.exe` as [Model Context Protocol](https://modelcontextprotocol.io/) tools, enabling AI agents to interact with AURIX hardware programmatically.
 
 ### Requirements
 
@@ -822,7 +822,7 @@ The server uses `tools/mcp_config.json`:
 
 | Field | Description |
 |-------|-------------|
-| `dflash_exe` | Path to `dflash.exe`. Auto-detected if `null`. |
+| `dflash_exe` | Path to `wiggle.exe`. Auto-detected if `null`. |
 | `aurix_flasher_exe` | Path to `AURIXFlasher.exe`. Auto-detected if `null`. |
 | `server` | TAS Server address (default: `localhost`) |
 | `target` | Target identifier (default: first available) |
@@ -848,18 +848,18 @@ python tools/aurix_mcp_server.py --config tools/mcp_config.json --transport sse
 
 | Tool | CLI Equivalent | Description |
 |------|---------------|-------------|
-| `dflash_list` | `dflash list --json` | List connected TAS targets |
-| `dflash_status` | `dflash status --json` | Flash status register with SVD field decoding |
-| `dflash_info` | `dflash info --json` | Device info, memory layout, SVD summary |
-| `dflash_erase` | `dflash erase --json` | Erase DFlash sectors |
-| `dflash_write` | `dflash write --json` | Write data to DFlash from file |
-| `dflash_read` | `dflash read --json` | Read DFlash content |
-| `dflash_dump` | `dflash dump --json` | Hex dump of memory (PFlash/DFlash/SRAM) |
-| `dflash_reg` | `dflash reg --json` | Read/write registers by SVD name or address |
-| `dflash_poke` | `dflash poke --json` | Write value to memory address |
-| `dflash_compare` | `dflash compare --json` | Compare local file with Flash content |
-| `dflash_search` | `dflash search --json` | Search memory for byte pattern |
-| `dflash_reset` | `dflash reset --json` | Reset the MCU |
+| `dflash_list` | `wiggle list --json` | List connected TAS targets |
+| `dflash_status` | `wiggle status --json` | Flash status register with SVD field decoding |
+| `dflash_info` | `wiggle info --json` | Device info, memory layout, SVD summary |
+| `dflash_erase` | `wiggle erase --json` | Erase DFlash sectors |
+| `dflash_write` | `wiggle write --json` | Write data to DFlash from file |
+| `dflash_read` | `wiggle read --json` | Read DFlash content |
+| `dflash_dump` | `wiggle dump --json` | Hex dump of memory (PFlash/DFlash/SRAM) |
+| `dflash_reg` | `wiggle reg --json` | Read/write registers by SVD name or address |
+| `dflash_poke` | `wiggle poke --json` | Write value to memory address |
+| `dflash_compare` | `wiggle compare --json` | Compare local file with Flash content |
+| `dflash_search` | `wiggle search --json` | Search memory for byte pattern |
+| `dflash_reset` | `wiggle reset --json` | Reset the MCU |
 | `flash_pflash` | `AURIXFlasher.exe` | Program PFlash via AURIXFlasher CLI |
 
 ### Tool Parameters
@@ -912,7 +912,7 @@ dflash_reg(name="DMU.HF.STATUS", value="", server="", target="", device="")
 │          aurix_mcp_server.py              │
 │          (FastMCP, 13 tools)              │
 ├───────────────┬─────────────────────────┤
-│  dflash.exe   │  AURIXFlasher.exe       │
+│  wiggle.exe   │  AURIXFlasher.exe       │
 │  (--json)     │  (PFlash programming)   │
 ├───────────────┴─────────────────────────┤
 │          TAS Server + miniWiggler         │
@@ -1239,13 +1239,13 @@ The build script uses CMake directly with MSVC, automatically sets C++17 and sta
 The compiled executable is located at:
 
 ```
-build/apps/dflash/Release/dflash.exe   (Windows, build.bat)
-build/Release/apps/dflash/dflash        (Linux, Conan)
+build/apps/dflash/Release/wiggle.exe   (Windows, build.bat)
+build/Release/apps/dflash/wiggle        (Linux, Conan)
 ```
 
 Deployed (with `build.bat --deploy`):
 ```
-Erase/dflash.exe                                  # Standalone executable
+Erase/wiggle.exe                                  # Standalone executable
 Erase/DeviceConfigs/*.json                        # Device configuration files
 Erase/RegisterDefs/*.json                         # SVD register definitions
 ```
@@ -1269,7 +1269,7 @@ if (MINGW)
 endif()
 ```
 
-The resulting `dflash.exe` depends only on Windows system DLLs (`KERNEL32.dll`, `WS2_32.dll`, `SHELL32.dll`, `ADVAPI32.dll`) — no VC++ Redistributable or MinGW DLLs required.
+The resulting `wiggle.exe` depends only on Windows system DLLs (`KERNEL32.dll`, `WS2_32.dll`, `SHELL32.dll`, `ADVAPI32.dll`) — no VC++ Redistributable or MinGW DLLs required.
 
 ### Troubleshooting
 

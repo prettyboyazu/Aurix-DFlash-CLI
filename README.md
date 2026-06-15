@@ -17,7 +17,7 @@
  limitations under the License.
  ****************************************************************************************************************-->
 
-# dflash — AURIX DFlash Command-Line Tool
+# wiggle — AURIX DFlash Command-Line Tool
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-informational)](#building)
@@ -26,7 +26,7 @@
 [![Maintained](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/Infineon/tas_client_api/commits/master/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/Infineon/tas_client_api/pulls)
 
-`dflash` is a standalone command-line tool for reading, erasing, and writing **Data Flash (DFlash)** on Infineon **AURIX TC2x/TC3x** microcontrollers. It communicates with the target MCU through a TAS Server and miniWiggler debug probe — no on-chip software or bootloader required.
+`wiggle` is a standalone command-line tool for reading, erasing, and writing **Data Flash (DFlash)** on Infineon **AURIX TC2x/TC3x** microcontrollers. It communicates with the target MCU through a TAS Server and miniWiggler debug probe — no on-chip software or bootloader required.
 
 Built on top of the **[TAS Client API](#tas-client-api)**, an open-source C++ library for device access on Infineon automotive MCUs.
 
@@ -76,46 +76,46 @@ DFlash base address: `0xAF000000` (loaded from JSON). Erased state: `0x00` (all 
 
 ```bash
 # List connected devices
-dflash list
+wiggle list
 
 # Read DFlash (hex dump to terminal)
-dflash read --addr AF004000 --length 100
+wiggle read --addr AF004000 --length 100
 
 # Save DFlash to a binary file
-dflash read --addr AF000000 --length 20000 --output dump.bin
+wiggle read --addr AF000000 --length 20000 --output dump.bin
 
 # Erase one sector
-dflash erase --addr AF004000 --sectors 1
+wiggle erase --addr AF004000 --sectors 1
 
 # Erase entire DFlash with backup and verification
-dflash erase --all --backup dump.bin --verify
+wiggle erase --all --backup dump.bin --verify
 
 # Write inline data with verification
-dflash rewrite --addr AF004000 --data 1122334455667788 --verify
+wiggle rewrite --addr AF004000 --data 1122334455667788 --verify
 
 # Write from a file
-dflash write --file firmware.hex --verify
+wiggle write --file firmware.hex --verify
 
 # Restore from backup
-dflash restore --file dump.bin
+wiggle restore --file dump.bin
 
 # Reset the MCU
-dflash reset
+wiggle reset
 
 # Debug: read Flash status register
-dflash status
+wiggle status
 
 # Debug: read register by SVD name
-dflash reg DMU.HF.STATUS
+wiggle reg DMU.HF.STATUS
 
 # Debug: dump PFlash memory
-dflash dump 0xA0000000 0x100
+wiggle dump 0xA0000000 0x100
 
 # Debug: device info
-dflash info
+wiggle info
 
 # Debug: interactive shell
-dflash shell
+wiggle shell
 ```
 
 ---
@@ -123,7 +123,7 @@ dflash shell
 ## Commands
 
 ```
-dflash <subcommand> [options]
+wiggle <subcommand> [options]
 ```
 
 ### Subcommands
@@ -176,8 +176,8 @@ Addresses and lengths are in **hexadecimal** (no `0x` prefix needed).
 ### `erase` — Erase DFlash Sectors
 
 ```bash
-dflash erase --addr <hex> --sectors <n> [--verify] [--backup <file>]
-dflash erase --all [--verify] [--backup <file>]
+wiggle erase --addr <hex> --sectors <n> [--verify] [--backup <file>]
+wiggle erase --all [--verify] [--backup <file>]
 ```
 
 | Option | Description |
@@ -193,19 +193,19 @@ dflash erase --all [--verify] [--backup <file>]
 
 ```bash
 # Show device info
-dflash erase --info
+wiggle erase --info
 
 # Erase one sector with verification
-dflash erase --addr AF000000 --sectors 1 --verify
+wiggle erase --addr AF000000 --sectors 1 --verify
 
 # Erase all with backup, verify, and MCU reset
-dflash erase --all --backup dump.bin --verify --reset
+wiggle erase --all --backup dump.bin --verify --reset
 ```
 
 ### `read` — Read DFlash Content
 
 ```bash
-dflash read --addr <hex> --length <hex> [--output <file>]
+wiggle read --addr <hex> --length <hex> [--output <file>]
 ```
 
 | Option | Short | Description |
@@ -216,19 +216,19 @@ dflash read --addr <hex> --length <hex> [--output <file>]
 
 ```bash
 # Hex dump to terminal
-dflash read --addr AF000000 --length 1000
+wiggle read --addr AF000000 --length 1000
 
 # Save as raw binary
-dflash read --addr AF000000 --length 20000 --output dump.bin
+wiggle read --addr AF000000 --length 20000 --output dump.bin
 
 # Save as Intel HEX
-dflash read --addr AF000000 --length 20000 --output dump.hex
+wiggle read --addr AF000000 --length 20000 --output dump.hex
 ```
 
 ### `write` — Write Data to DFlash
 
 ```bash
-dflash write --file <path> [--addr <hex>] [--verify]
+wiggle write --file <path> [--addr <hex>] [--verify]
 ```
 
 | Option | Short | Description |
@@ -239,17 +239,17 @@ dflash write --file <path> [--addr <hex>] [--verify]
 
 ```bash
 # Write binary to DFlash start
-dflash write --file data.bin
+wiggle write --file data.bin
 
 # Write HEX file with verification
-dflash write --file firmware.hex --verify
+wiggle write --file firmware.hex --verify
 ```
 
 ### `rewrite` — Read-Modify-Write (No Alignment Needed)
 
 ```bash
-dflash rewrite --addr <hex> --data <hexstring> [--verify] [--backup]
-dflash rewrite --file <path> [--addr <hex>] [--verify] [--backup]
+wiggle rewrite --addr <hex> --data <hexstring> [--verify] [--backup]
+wiggle rewrite --file <path> [--addr <hex>] [--verify] [--backup]
 ```
 
 Rewrites data at any DFlash address without manual sector alignment. Internally performs a 5-step sequence: read affected sectors → optional backup → merge new data → erase → write back.
@@ -264,37 +264,37 @@ Rewrites data at any DFlash address without manual sector alignment. Internally 
 
 ```bash
 # Inline write 8 bytes
-dflash rewrite --addr AF000004 --data 12345678AABBCCDD --verify
+wiggle rewrite --addr AF000004 --data 12345678AABBCCDD --verify
 
 # Write from file with auto backup
-dflash rewrite --file patch.hex --backup --verify
+wiggle rewrite --file patch.hex --backup --verify
 
 # Write from binary to specific address
-dflash rewrite --file data.bin --addr AF000100
+wiggle rewrite --file data.bin --addr AF000100
 ```
 
 ### `restore` — Restore from Backup
 
 ```bash
-dflash restore --file <path> [--no-verify]
+wiggle restore --file <path> [--no-verify]
 ```
 
 Performs erase + write + verify as a single operation.
 
 ```bash
-dflash restore --file dump.bin
+wiggle restore --file dump.bin
 ```
 
 ### `list` — List Connected Devices
 
 ```bash
-dflash list
+wiggle list
 ```
 
 ### `reset` — Reset MCU
 
 ```bash
-dflash reset [--halt]
+wiggle reset [--halt]
 ```
 
 | Option | Description |
@@ -326,19 +326,19 @@ Access UCB on **TC3x** devices. UCB stores boot configuration, security settings
 
 ```bash
 # Read entire UCB (24 KB hex dump)
-dflash ucb read
+wiggle ucb read
 
 # Read BMHD area
-dflash ucb read --addr AF400000 --length 800
+wiggle ucb read --addr AF400000 --length 800
 
 # Save UCB to Intel HEX file
-dflash ucb read -a AF400000 -l 6000 -o ucb_backup.hex
+wiggle ucb read -a AF400000 -l 6000 -o ucb_backup.hex
 
 # Write HEX file to UCB with verification
-dflash ucb write --file bmhd_config.hex --verify
+wiggle ucb write --file bmhd_config.hex --verify
 
 # Erase BMHD sectors (0-3)
-dflash ucb erase --addr AF400000 --sectors 4 --verify
+wiggle ucb erase --addr AF400000 --sectors 4 --verify
 ```
 
 Locked regions (`AF400800`–`AF400FFF`, `AF401800`–`AF401FFF`) cannot be erased — the tool will abort with an error.
@@ -358,27 +358,27 @@ All subcommands support the `--json` flag for machine-readable output. This is d
 
 ```bash
 # List targets as JSON
-dflash list --json
+wiggle list --json
 # {"status":"ok","server":"TasServer V2.0","targets":[{"index":0,"device":"TC33x","identifier":"TriBoard TC3XX V2.0"}]}
 
 # Read Flash status register
-dflash status --json
+wiggle status --json
 # {"status":"ok","register":"HF.STATUS","address":4161011728,"value":34078720,"fields":{"D0BUSY":0,"D1BUSY":0,...},...}
 
 # Read device info
-dflash info --json
+wiggle info --json
 # {"status":"ok","device":"TC33x A step","family":"TC3x","dflash":{...},"memory_regions":[...],...}
 
 # Memory dump as hex string
-dflash dump 0xAF000000 0x20 --json
+wiggle dump 0xAF000000 0x20 --json
 # {"status":"ok","address":2936012800,"bytes":32,"data":"0B00000000..."}
 
 # Register read with field decoding
-dflash reg DMU.HF.STATUS --json
+wiggle reg DMU.HF.STATUS --json
 # {"status":"ok","action":"read","register":"HF.STATUS","fields":{"D0BUSY":{"value":0,...},...},...}
 
 # Error example
-dflash erase --all --json
+wiggle erase --all --json
 # {"status":"error","code":14,"message":"Erase timeout"}
 ```
 
@@ -388,7 +388,7 @@ When `--json` is used, informational/diagnostic messages are suppressed — only
 
 ## MCP Server (AI Agent Integration)
 
-The AURIX MCP Server wraps `dflash.exe` and `AURIXFlasher.exe` as [Model Context Protocol](https://modelcontextprotocol.io/) tools, enabling AI agents (Claude, GPT, etc.) to interact with AURIX hardware.
+The AURIX MCP Server wraps `wiggle.exe` and `AURIXFlasher.exe` as [Model Context Protocol](https://modelcontextprotocol.io/) tools, enabling AI agents (Claude, GPT, etc.) to interact with AURIX hardware.
 
 ### Setup
 
@@ -472,11 +472,11 @@ This tool is built on the **TAS (Tool Access Socket) Client API** — an open-so
 | Socket Transport | `src/tas_socket/` | TCP socket layer for TAS protocol |
 | Packet Handler | `src/tas_client/tas_pkt_handler_*.h` | Protocol packet serialization/deserialization |
 
-### How dflash Uses the TAS API
+### How wiggle Uses the TAS API
 
 ```
 ┌──────────────────────────────────────────┐
-│              dflash CLI                   │
+│              wiggle CLI                   │
 │  (apps/dflash/dflash_main.cpp)           │
 ├──────────────────────────────────────────┤
 │  Device Config Loader │ HEX Parser       │
@@ -500,7 +500,7 @@ This tool is built on the **TAS (Tool Access Socket) Client API** — an open-so
 
 ### Using the TAS API in Your Own Projects
 
-The TAS Client API can be used independently of the dflash tool to build custom device access applications:
+The TAS Client API can be used independently of the wiggle tool to build custom device access applications:
 
 ```cpp
 #include "tas_client_rw.h"
@@ -523,7 +523,7 @@ client.session_end();
 client.server_disconnect();
 ```
 
-The API is built as a static library (`tas_client`) and linked into the dflash executable. See `CMakeLists.txt` and `conanfile.py` for build configuration.
+The API is built as a static library (`tas_client`) and linked into the wiggle executable. See `CMakeLists.txt` and `conanfile.py` for build configuration.
 
 ---
 
@@ -583,11 +583,11 @@ Device parameters (DFlash base address, sector size, total size) are loaded from
 
 ```cmd
 build.bat                Build Release
-build.bat --deploy       Build + deploy dflash.exe to Erase/
+build.bat --deploy       Build + deploy wiggle.exe to Erase/
 build.bat --all          Clean + Build + deploy
 ```
 
-Output: `build/apps/dflash/Release/dflash.exe`
+Output: `build/apps/dflash/Release/wiggle.exe`
 
 ### Conan + CMake Build
 
@@ -606,7 +606,7 @@ cmake --build --preset conan-release
 
 ### Static Linking
 
-The executable is statically linked — no VC++ Redistributable or other runtime DLLs required. The resulting `dflash.exe` depends only on Windows system DLLs.
+The executable is statically linked — no VC++ Redistributable or other runtime DLLs required. The resulting `wiggle.exe` depends only on Windows system DLLs.
 
 ### CI Build
 

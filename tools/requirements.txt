@@ -1,0 +1,8 @@
+# AURIX MCP Server - Python Dependencies
+# 安装命令: pip install -r requirements.txt
+
+# MCP Server 框架 (Model Context Protocol)
+mcp[cli]>=1.0.0
+
+# ELF 文件解析 (支持 TASKING / GCC 编译产物)
+pyelftools>=0.31

@@ -1,8 +1,22 @@
 {
-    "dflash_exe": null,
+    "wiggle_exe": "D:\\wiggle_MCP\\wiggle\\wiggle.exe",
     "aurix_flasher_exe": null,
     "server": "localhost",
     "target": null,
     "device": null,
-    "timeout": 120
+    "timeout": 120,
+
+    "build": {
+        "command": null,
+        "work_dir": null,
+        "timeout": 300
+    },
+    "project": {
+        "elf_file": null,
+        "map_file": null,
+        "lst_file": null,
+        "mdf_file": null,
+        "hex_file": null,
+        "toolchain": null
+    }
 }

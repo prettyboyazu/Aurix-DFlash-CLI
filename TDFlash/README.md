@@ -1,18 +1,18 @@
-# DFlash Tool v2.0 用户手册
+# Wiggle Tool v2.2 用户手册
 
 ## 简介
-DFlash 是基于 TAS Client API 的 AURIX MCU Data Flash (DFlash) 操作命令行工具，支持 TC2xx/TC3xx 系列芯片。
+Wiggle 是基于 TAS Client API 的 AURIX MCU Data Flash (DFlash) 操作命令行工具，支持 TC2xx/TC3xx 系列芯片。
 
 ## 运行环境要求
 - Windows 10/11 x64
 - TAS Server 已启动并连接 miniWiggler 调试器
 - 目标芯片通过 miniWiggler 连接
-- DeviceConfigs/ 目录与 dflash.exe 同级放置
+- DeviceConfigs/ 目录与 wiggle.exe 同级放置
 
 ## 文件结构
 ```
 TDFlash/
-├── dflash.exe          # 主程序（静态链接，无 DLL 依赖）
+├── wiggle.exe          # 主程序（静态链接，无 DLL 依赖）
 ├── DeviceConfigs/      # 设备配置 JSON 文件
 ├── README.md           # 本文档
 └── test_report_v2.0.txt # 测试报告
@@ -22,16 +22,16 @@ TDFlash/
 
 | 子命令 | 功能 | 示例 |
 |--------|------|------|
-| list | 列出连接的设备 | `dflash list` |
-| read | 读取 DFlash 数据 | `dflash read --addr AF004000 --length 100` |
-| erase | 擦除 DFlash sector | `dflash erase --addr AF004000 --sectors 1` |
-| write | 从文件写入 DFlash | `dflash write --file data.hex` |
-| rewrite | 任意地址写入（R-M-W） | `dflash rewrite --addr AF004010 --data DEADBEEF --verify` |
-| restore | 从备份文件还原 | `dflash restore backup.hex` |
-| reset | 复位 MCU | `dflash reset` |
-| ucb read | 读取 UCB 区域 | `dflash ucb read --addr AF400000 --length 200` |
-| ucb write | 写入 UCB（高风险） | `dflash ucb write --file ucb_data.hex` |
-| ucb erase | 擦除 UCB（高风险） | `dflash ucb erase --addr AF400000` |
+| list | 列出连接的设备 | `wiggle list` |
+| read | 读取 DFlash 数据 | `wiggle read --addr AF004000 --length 100` |
+| erase | 擦除 DFlash sector | `wiggle erase --addr AF004000 --sectors 1` |
+| write | 从文件写入 DFlash | `wiggle write --file data.hex` |
+| rewrite | 任意地址写入（R-M-W） | `wiggle rewrite --addr AF004010 --data DEADBEEF --verify` |
+| restore | 从备份文件还原 | `wiggle restore backup.hex` |
+| reset | 复位 MCU | `wiggle reset` |
+| ucb read | 读取 UCB 区域 | `wiggle ucb read --addr AF400000 --length 200` |
+| ucb write | 写入 UCB（高风险） | `wiggle ucb write --file ucb_data.hex` |
+| ucb erase | 擦除 UCB（高风险） | `wiggle ucb erase --addr AF400000` |
 
 ## 全局参数
 
@@ -69,27 +69,28 @@ TDFlash/
 start_tas_server.bat
 
 # 2. 列出设备
-dflash list
+wiggle list
 
 # 3. 读取 DFlash 数据
-dflash read --addr AF004000 --length 100
+wiggle read --addr AF004000 --length 100
 
 # 4. 擦除一个 sector
-dflash erase --addr AF004000 --sectors 1
+wiggle erase --addr AF004000 --sectors 1
 
 # 5. 写入数据（带验证）
-dflash rewrite --addr AF004000 --data 1122334455667788 --verify
+wiggle rewrite --addr AF004000 --data 1122334455667788 --verify
 
 # 6. 带备份的写入
-dflash rewrite --addr AF004000 --data AABBCCDD --backup --verify
+wiggle rewrite --addr AF004000 --data AABBCCDD --backup --verify
 
 # 7. 复位芯片
-dflash reset
+wiggle reset
 ```
 
 ## 版本历史
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.2 | 2026-06 | 工具更名为 wiggle；调试命令、SVD 寄存器解码与 JSON 输出 |
 | 2.0 | 2026-05 | 新增 rewrite/ucb 子命令、--version、安全确认机制、C++17 |
 | 1.0 | 2026-04 | 初始版本，支持 erase/read/write/restore/list/reset |
