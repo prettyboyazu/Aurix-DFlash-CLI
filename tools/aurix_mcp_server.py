@@ -108,7 +108,8 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
 
     candidates = [
         script_dir / name,
-        script_dir / "wiggle" / name,   # MCP deployment layout: script + wiggle/ subdir
+        script_dir / "wiggle" / name,        # MCP deployment layout: script + wiggle/ subdir
+        script_dir / "AURIXFlasher" / name,  # MCP deployment layout: script + AURIXFlasher/ subdir
         parent / "wiggle" / name,
         parent / "data" / name,
         parent / "AURIXFlasher" / name,

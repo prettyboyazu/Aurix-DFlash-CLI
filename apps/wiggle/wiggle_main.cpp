@@ -948,15 +948,18 @@ static int doReset(int argc, char** argv)
 {
     CommonArgs args;
     bool halt = false;
+    bool hotAttach = false;
 
     for (int i = 0; i < argc; ) {
         int consumed = parseCommonOption(argc, argv, i, args);
         if (consumed > 0) { i += consumed; continue; }
         if (strcmp(argv[i], "--halt") == 0) { halt = true; i++; continue; }
+        if (strcmp(argv[i], "--hot") == 0) { hotAttach = true; i++; continue; }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: wiggle reset [options]\n\n"
                    "Options:\n"
                    "  --halt              Reset and halt (default: reset and run)\n"
+                   "  --hot               Hot attach without reset (preserves RAM/registers)\n"
                    "  --server <ip>       TAS server IP (default: localhost)\n"
                    "  --target <id>       Target identifier\n"
                    "  --json              Output as JSON\n");
@@ -1006,12 +1009,23 @@ static int doReset(int argc, char** argv)
         fprintf(stderr, "ERROR: %s\n", client.get_error_info()); return EXIT_SESSION_ERROR;
     }
 
-    tas_clnt_dco_et dco = halt ? TAS_CLNT_DCO_RESET_AND_HALT : TAS_CLNT_DCO_RESET;
-    JPRINTF("Resetting MCU (%s)...\n", halt ? "reset and halt" : "reset and run");
+    tas_clnt_dco_et dco;
+    const char* modeStr;
+    if (hotAttach) {
+        dco = TAS_CLNT_DCO_HOT_ATTACH;
+        modeStr = "hot attach";
+    } else if (halt) {
+        dco = TAS_CLNT_DCO_RESET_AND_HALT;
+        modeStr = "reset and halt";
+    } else {
+        dco = TAS_CLNT_DCO_RESET;
+        modeStr = "reset and run";
+    }
+    JPRINTF("Connecting to MCU (%s)...\n", modeStr);
     ret = client.device_connect(dco);
     if (ret != TAS_ERR_NONE) {
         if (g_json) return jsonError(EXIT_CONNECT_ERROR, client.get_error_info());
-        fprintf(stderr, "ERROR: Reset failed: %s\n", client.get_error_info());
+        fprintf(stderr, "ERROR: Connect failed: %s\n", client.get_error_info());
         return EXIT_CONNECT_ERROR;
     }
 
@@ -1027,11 +1041,14 @@ static int doReset(int argc, char** argv)
 
     if (g_json) {
         nljson j;
-        j["action"] = "reset";
-        j["mode"] = halt ? "halt" : "run";
+        j["action"] = hotAttach ? "hot_attach" : "reset";
+        j["mode"] = hotAttach ? "hot" : (halt ? "halt" : "run");
         return jsonOk(j);
     }
-    printf("  MCU reset successful.%s\n", halt ? " Device is halted." : " Normal execution resumed.");
+    if (hotAttach)
+        printf("  Hot attach successful. RAM and registers preserved.\n");
+    else
+        printf("  MCU reset successful.%s\n", halt ? " Device is halted." : " Normal execution resumed.");
     return EXIT_OK;
 }
 
@@ -2087,6 +2104,29 @@ static int doUcbWrite(int argc, char** argv)
             fprintf(stderr, "ERROR: UCB address 0x%08X not aligned to %u-byte record boundary\n",
                    seg.baseAddress, UCB_RECORD_SIZE);
             return EXIT_USAGE_ERROR;
+        }
+    }
+
+    // Validate UCB CONFIRMED word (offset 4 in each 32-byte record must be 0x00000000)
+    // A non-zero CONFIRMED word will permanently lock the chip!
+    for (const auto& seg : parseResult.segments) {
+        for (size_t off = 0; off + UCB_RECORD_SIZE <= seg.data.size(); off += UCB_RECORD_SIZE) {
+            // CONFIRMED word is at bytes [4..7] within each 32-byte record
+            uint32_t confirmed = seg.data[off + 4] |
+                                (static_cast<uint32_t>(seg.data[off + 5]) << 8) |
+                                (static_cast<uint32_t>(seg.data[off + 6]) << 16) |
+                                (static_cast<uint32_t>(seg.data[off + 7]) << 24);
+            if (confirmed != 0x00000000) {
+                uint32_t recAddr = seg.baseAddress + static_cast<uint32_t>(off);
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "UCB CONFIRMED word non-zero at 0x%08X: 0x%08X - this will LOCK the chip!",
+                    recAddr, confirmed);
+                if (g_json) return jsonError(EXIT_USAGE_ERROR, std::string(msg));
+                fprintf(stderr, "ERROR: %s\n", msg);
+                fprintf(stderr, "  This will PERMANENTLY LOCK the chip! Set bytes [4..7] to 0x00000000.\n");
+                return EXIT_USAGE_ERROR;
+            }
         }
     }
 
