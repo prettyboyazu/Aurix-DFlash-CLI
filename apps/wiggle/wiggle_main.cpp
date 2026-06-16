@@ -2107,24 +2107,29 @@ static int doUcbWrite(int argc, char** argv)
         }
     }
 
-    // Validate UCB CONFIRMED word (offset 4 in each 32-byte record must be 0x00000000)
-    // A non-zero CONFIRMED word will permanently lock the chip!
+    // Validate UCB CONFIRMATION code at sector+0x1F0 (NOT offset 4!)
+    // UCB sector size = 512 bytes. Confirmation code is at offset 0x1F0 within each sector.
+    // Values: 0x00000000=ERASED(safe), 0x43211234=UNLOCKED(safe), 0x57B5327F=CONFIRMED(LOCKS chip!)
+    static constexpr uint32_t UCB_SECTOR_SIZE = 512;
+    static constexpr uint32_t UCB_CONFIRM_OFFSET = 0x1F0;
+    static constexpr uint32_t UCB_CONFIRM_LOCKED = 0x57B5327F;
     for (const auto& seg : parseResult.segments) {
-        for (size_t off = 0; off + UCB_RECORD_SIZE <= seg.data.size(); off += UCB_RECORD_SIZE) {
-            // CONFIRMED word is at bytes [4..7] within each 32-byte record
-            uint32_t confirmed = seg.data[off + 4] |
-                                (static_cast<uint32_t>(seg.data[off + 5]) << 8) |
-                                (static_cast<uint32_t>(seg.data[off + 6]) << 16) |
-                                (static_cast<uint32_t>(seg.data[off + 7]) << 24);
-            if (confirmed != 0x00000000) {
-                uint32_t recAddr = seg.baseAddress + static_cast<uint32_t>(off);
+        for (uint32_t base = 0; base < seg.data.size(); base += UCB_SECTOR_SIZE) {
+            uint32_t confirmOff = base + UCB_CONFIRM_OFFSET;
+            if (confirmOff + 4 > seg.data.size()) continue;
+            uint32_t confirmCode = seg.data[confirmOff] |
+                                  (static_cast<uint32_t>(seg.data[confirmOff + 1]) << 8) |
+                                  (static_cast<uint32_t>(seg.data[confirmOff + 2]) << 16) |
+                                  (static_cast<uint32_t>(seg.data[confirmOff + 3]) << 24);
+            if (confirmCode == UCB_CONFIRM_LOCKED) {
+                uint32_t recAddr = seg.baseAddress + base;
                 char msg[256];
                 snprintf(msg, sizeof(msg),
-                    "UCB CONFIRMED word non-zero at 0x%08X: 0x%08X - this will LOCK the chip!",
-                    recAddr, confirmed);
+                    "UCB CONFIRMATION=0x57B5327F at sector 0x%08X - this will LOCK the chip!",
+                    recAddr);
                 if (g_json) return jsonError(EXIT_USAGE_ERROR, std::string(msg));
                 fprintf(stderr, "ERROR: %s\n", msg);
-                fprintf(stderr, "  This will PERMANENTLY LOCK the chip! Set bytes [4..7] to 0x00000000.\n");
+                fprintf(stderr, "  Use 0x43211234 (UNLOCKED) for development, or 0x00000000 (ERASED).\n");
                 return EXIT_USAGE_ERROR;
             }
         }

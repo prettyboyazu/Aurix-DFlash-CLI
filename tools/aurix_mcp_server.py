@@ -1151,6 +1151,7 @@ def aurix_pflash(
     connect: str = "",
     start: str = "",
     device_id: str = "",
+    confirm_risk: bool = False,
 ) -> str:
     """Program PFlash using AURIXFlasher.exe.
     This is for PFlash programming only. For DFlash, use wiggle_write.
@@ -1160,12 +1161,21 @@ def aurix_pflash(
         verify: Verify after programming (default: True)
         erase: Erase mode before programming: 'all' (full chip erase),
                'used' (erase only used sectors), '' (default AURIXFlasher behavior)
-        ucb: Enable UCB programming (default: False)
+        ucb: Enable UCB programming (default: False, HIGH RISK)
         connect: Connection mode: '0' (hot attach, no reset),
                  '1' (reset and halt), '' (default)
         start: After programming: 'on' (reset and run), 'off' (stay halted), '' (default)
         device_id: Device/DAP ID for multi-target setups (e.g. '0', '1')
+        confirm_risk: MUST be True when ucb=True. Acknowledges risk of locking device.
     """
+    # Double confirmation for UCB programming
+    if ucb and not confirm_risk:
+        return json.dumps({
+            "status": "error",
+            "message": "aurix_pflash with ucb=True requires confirm_risk=True. "
+                       "Writing UCB/BMHD may permanently lock the device. "
+                       "Set confirm_risk=True to acknowledge and proceed."
+        })
     args = ["-hex", hex_file]
     if verify:
         args += ["-v", "on"]
@@ -1274,6 +1284,7 @@ def wiggle_ucb(
     file_path: str = "",
     verify: bool = False,
     output_file: str = "",
+    confirm_risk: bool = False,
     server: str = "",
     target: str = "",
     device: str = "",
@@ -1289,6 +1300,7 @@ def wiggle_ucb(
         file_path: Input file for write (.hex or .bin)
         verify: Verify after operation (default: False)
         output_file: Output file for read (.hex or .bin)
+        confirm_risk: MUST be True for write/erase. Acknowledges risk of locking device.
     """
     cfg = dict(_config)
     if server: cfg["server"] = server
@@ -1297,6 +1309,15 @@ def wiggle_ucb(
 
     if action not in ("read", "write", "erase"):
         return json.dumps({"status": "error", "message": "action must be 'read', 'write', or 'erase'"})
+
+    # Double confirmation for high-risk operations
+    if action in ("write", "erase") and not confirm_risk:
+        return json.dumps({
+            "status": "error",
+            "message": "UCB " + action + " requires confirm_risk=True. "
+                       "This is a high-risk operation that may lock the device. "
+                       "Set confirm_risk=True to acknowledge and proceed."
+        })
 
     args = ["ucb", action]
     if address:
