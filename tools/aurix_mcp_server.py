@@ -69,18 +69,14 @@ DEFAULT_CONFIG = {
 
 def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str] = None,
             exe_name: Optional[str] = None) -> Optional[str]:
-    """Find executable relative to this script, in well-known install locations,
-    or on PATH. Returns absolute path or None.
+    """Find executable in well-known locations. Returns absolute path or None.
 
     Lookup order:
       1. env_var         — e.g. "AURIX_FLASHER_EXE" → use directly if set + file exists
       2. env_dir_var     — e.g. "AURIX_FLASHER_DIR"  → join with exe_name (or name)
-      3. script_dir / <name>
-      4. parent/wiggle/  <name>           (deploy layout for wiggle)
-      5. parent/data/    <name>           (repo layout)
-      6. parent/AURIXFlasher/ <name>      (deploy layout for the Infineon tool)
-      7. Infineon default install locations (Windows glob) — only when name starts with "AURIXFlasher"
-      8. PATH via shutil.which (scoop / choco / manual install)
+      3. Infineon default install locations (C:\\Infineon\\, Program Files)
+      4. script_dir and parent relative paths (MCP deployment layout)
+      5. PATH via shutil.which
     """
     script_dir = Path(__file__).resolve().parent
     parent = script_dir.parent
@@ -106,16 +102,7 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
             if candidate.is_file():
                 return str(candidate)
 
-    candidates = [
-        script_dir / name,
-        script_dir / "wiggle" / name,        # MCP deployment layout: script + wiggle/ subdir
-        script_dir / "AURIXFlasher" / name,  # MCP deployment layout: script + AURIXFlasher/ subdir
-        parent / "wiggle" / name,
-        parent / "data" / name,
-        parent / "AURIXFlasher" / name,
-    ]
-
-    # 5) Infineon default install location (Windows) — glob to cover any -<version>
+    # 3) Infineon default install location (Windows) — check BEFORE MCP dirs
     if sys.platform == "win32" and name.lower().startswith("aurixflasher"):
         import glob
         for pattern in (
@@ -125,13 +112,23 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
         ):
             for hit in glob.glob(pattern):
                 if os.path.isfile(hit):
-                    candidates.append(Path(hit))
+                    return hit
+
+    # 4) MCP deployment layout: script_dir and parent relative paths
+    candidates = [
+        script_dir / name,
+        script_dir / "wiggle" / name,
+        script_dir / "AURIXFlasher" / name,
+        parent / "wiggle" / name,
+        parent / "data" / name,
+        parent / "AURIXFlasher" / name,
+    ]
 
     for c in candidates:
         if c.exists() and c.is_file():
             return str(c)
 
-    # 6) Fallback: PATH lookup (scoop / choco / manual install may put it on PATH)
+    # 5) Fallback: PATH lookup (scoop / choco / manual install may put it on PATH)
     from shutil import which
     hit = which(name)
     if hit:
