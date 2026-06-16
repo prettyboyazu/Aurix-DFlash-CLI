@@ -436,7 +436,7 @@ def wiggle_erase(
     if verify:
         args.append("--verify")
 
-    return format_result(run_wiggle(args, cfg))
+    return format_result(run_wiggle(args, cfg, timeout=1800))
 
 
 @mcp.tool()
@@ -459,7 +459,7 @@ def wiggle_write(
     if verify:
         args.append("--verify")
 
-    return format_result(run_wiggle(args, cfg))
+    return format_result(run_wiggle(args, cfg, timeout=3600))
 
 
 @mcp.tool()
@@ -517,6 +517,545 @@ def wiggle_reg(
             args.append(value)
 
     return format_result(run_wiggle(args, cfg))
+
+
+# ---------------------------------------------------------------------------
+# Register Metadata Tools (Python-side, no wiggle.exe needed)
+# ---------------------------------------------------------------------------
+
+_reg_cache: dict = {}  # device -> parsed JSON
+
+
+def _find_register_defs_dir(cfg: dict) -> Optional[str]:
+    """Locate the RegisterDefs directory relative to wiggle.exe or script."""
+    candidates = []
+    wiggle = cfg.get("wiggle_exe")
+    if wiggle:
+        candidates.append(Path(wiggle).parent / "RegisterDefs")
+    script_dir = Path(__file__).resolve().parent
+    parent = script_dir.parent
+    candidates.extend([
+        script_dir / "wiggle" / "RegisterDefs",
+        parent / "wiggle" / "RegisterDefs",
+        parent / "data" / "RegisterDefs",
+    ])
+    for c in candidates:
+        if c.is_dir():
+            return str(c)
+    return None
+
+
+def _detect_device(cfg: dict) -> Optional[str]:
+    """Detect device by calling wiggle info, or from config."""
+    dev = cfg.get("device")
+    if dev:
+        return dev
+    # Try auto-detect via wiggle info
+    try:
+        result = run_wiggle(["info"], cfg, timeout=15)
+        if result.get("status") == "ok":
+            out = result.get("stdout", "")
+            # Parse "Device: TC33x" or similar from output
+            for line in out.splitlines():
+                if "device" in line.lower() and ":" in line:
+                    val = line.split(":", 1)[1].strip()
+                    if val.startswith("TC"):
+                        # Extract family: "TC33x_A_step" -> "TC33x"
+                        parts = val.split("_")
+                        return parts[0] if parts else val
+    except Exception:
+        pass
+    return None
+
+
+def _load_register_defs(device: str, cfg: dict) -> Optional[dict]:
+    """Load and cache RegisterDefs JSON for a device."""
+    if device in _reg_cache:
+        return _reg_cache[device]
+
+    defs_dir = _find_register_defs_dir(cfg)
+    if not defs_dir:
+        return None
+
+    # Try exact match first, then case-insensitive
+    target_file = Path(defs_dir) / f"{device}-full.json"
+    if not target_file.is_file():
+        # Case-insensitive search
+        for f in Path(defs_dir).glob("*-full.json"):
+            if f.stem.lower().startswith(device.lower()):
+                target_file = f
+                break
+        else:
+            return None
+
+    with open(target_file, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    _reg_cache[device] = data
+    return data
+
+
+# ── Fuzzy search: synonym table & scoring engine ─────────────────────
+
+# AI-friendly term → hardware peripheral/register abbreviations
+# Used for bidirectional matching: AI says "uart" ↔ finds ASCLIN
+_REG_SYNONYMS: dict[str, list[str]] = {
+    # Communication
+    "uart":     ["asclin", "serial"],
+    "serial":   ["asclin", "uart"],
+    "spi":      ["qspi", "asclin", "spi"],
+    "i2c":      ["i2c"],
+    "can":      ["can", "mcan"],
+    "lin":      ["asclin"],
+    # Timers / PWM
+    "timer":    ["gtm", "ccu6", "gpt120", "stm", "tom"],
+    "pwm":      ["gtm", "ccu6", "tom", "atom"],
+    "capture":  ["gtm", "ccu6"],
+    "counter":  ["ccu6", "gpt120", "stm"],
+    # Analog
+    "adc":      ["evadc", "adc"],
+    "dac":      ["dac"],
+    "analog":   ["evadc"],
+    # Memory / Flash
+    "flash":    ["dmu", "pfi", "pmu", "flash"],
+    "program":  ["dmu", "pfi"],
+    "eeprom":   ["dmu"],
+    "memory":   ["dmu", "pmu", "sbcu"],
+    # GPIO / Pins
+    "gpio":     ["p00","p02","p10","p11","p13","p14","p15",
+                 "p20","p21","p22","p23"],
+    "port":     ["p00","p02","p10","p11"],
+    # Clock / Reset
+    "clock":    ["scu", "ccu", "pll", "osc"],
+    "reset":    ["scu", "reset"],
+    "pll":      ["scu", "pll"],
+    # Interrupts
+    "interrupt": ["int", "src", "irq", "nvic"],
+    "irq":      ["int", "src", "irq"],
+    "vector":   ["int", "src"],
+    # DMA
+    "dma":      ["dma"],
+    "transfer": ["dma"],
+    # Watchdog
+    "watchdog": ["wdt", "smu"],
+    "wdt":      ["wdt", "smu"],
+    # Safety / Protection
+    "safety":   ["smu", "pms", "sbcu"],
+    "protect":  ["smu", "pms"],
+    # Debug
+    "debug":    ["cbs", "cpu", "mcu"],
+    "trace":    ["cbs", "cpu"],
+    "breakpoint": ["cbs", "cpu"],
+    # Ethernet
+    "ethernet": ["eth", "gmac"],
+    "eth":      ["eth", "gmac"],
+    # USB
+    "usb":      ["usb"],
+    # SENT protocol
+    "sent":     ["sent"],
+    # HSM (Hardware Security Module)
+    "security": ["hsm", "smu"],
+    "crypto":   ["hsm"],
+    "hsm":      ["hsm"],
+    # Core / CPU
+    "core":     ["cpu0", "cpu"],
+    "cpu":      ["cpu0", "cpu"],
+}
+
+
+def _tokenize(name: str) -> list[str]:
+    """Split register/peripheral name into searchable tokens.
+    'HF_STATUS' -> ['HF', 'STATUS']
+    'GTM_TOM0_CTRL' -> ['GTM', 'TOM', '0', 'CTRL']
+    """
+    import re as _re
+    # Split on _ first, then camelCase boundaries
+    parts = name.replace("_", " ").split()
+    tokens = []
+    for p in parts:
+        # Split camelCase: "hfStatus" -> ["hf", "Status"]
+        tokens.extend(_re.findall(r'[A-Z]+(?=[A-Z][a-z])|[A-Za-z]+|\d+', p))
+    return [t for t in tokens if t]
+
+
+def _score_match(keyword: str, name: str, desc: str) -> int:
+    """Score how well keyword matches a register name + description.
+    Returns 0 (no match) to 100 (perfect match).
+    Scoring requires the REGISTER ITSELF to be relevant;
+    peripheral-level matches only provide a small bonus.
+    """
+    kw = keyword.lower().strip()
+    name_lower = name.lower()
+    desc_lower = desc.lower()
+    tokens = _tokenize(name)
+    tokens_lower = [t.lower() for t in tokens]
+    score = 0
+
+    # 1. Exact full-name match
+    if name_lower == kw:
+        return 100
+
+    # 2. Full name starts with keyword
+    if name_lower.startswith(kw):
+        score = max(score, 90)
+
+    # 3. Keyword is substring of full name
+    if kw in name_lower:
+        score = max(score, 70)
+
+    # 4. Keyword matches a token exactly
+    if kw in tokens_lower:
+        score = max(score, 85)
+
+    # 5. Token starts with keyword (e.g. "stat" matches "STATUS")
+    for t in tokens_lower:
+        if t.startswith(kw) and len(kw) >= 3:
+            score = max(score, 65)
+            break
+
+    # 6. Keyword starts with a token (e.g. "status_reg" matches "STATUS")
+    for t in tokens_lower:
+        if len(t) >= 3 and kw.startswith(t):
+            score = max(score, 55)
+            break
+
+    # 7. Description contains keyword
+    if kw in desc_lower:
+        score = max(score, 60)
+
+    # 8. Each word in desc matches keyword
+    desc_words = desc_lower.split()
+    if kw in desc_words:
+        score = max(score, 65)
+
+    # 9. Synonym matching — token-level only, no substring
+    kw_base = kw.split()[0] if " " in kw else kw
+    synonyms = _REG_SYNONYMS.get(kw_base, [])
+    if synonyms:
+        for syn in synonyms:
+            syn_l = syn.lower()
+            # Synonym must match a register name TOKEN exactly
+            for t in tokens_lower:
+                if t == syn_l:
+                    score = max(score, 75)
+                    break
+
+    # 10. Reverse synonym: keyword is a hardware abbreviation,
+    #     check if the AI-friendly term matches a register token
+    for syn_key, syn_vals in _REG_SYNONYMS.items():
+        if kw_base == syn_key:
+            continue
+        if kw_base in [v.lower() for v in syn_vals]:
+            # Only match if syn_key appears as a token in the name
+            if syn_key.lower() in tokens_lower:
+                score = max(score, 70)
+            elif syn_key.lower() in desc_lower:
+                score = max(score, 55)
+
+    # 11. Fuzzy subsequence — only for keywords >= 4 chars, low score
+    if score < 30 and len(kw) >= 4:
+        ki = 0
+        for ch in name_lower:
+            if ki < len(kw) and ch == kw[ki]:
+                ki += 1
+        if ki == len(kw):
+            score = max(score, 20)
+
+    return score
+
+
+def _periph_relevance(keyword: str, periph_name: str, periph_desc: str) -> int:
+    """Score how relevant a peripheral is to the search keyword.
+    Checks name tokens AND synonym table for AI→hardware mapping.
+    Returns 0-100.
+    """
+    kw = keyword.lower().strip()
+    pname = periph_name.lower()
+    ptokens = [t.lower() for t in _tokenize(periph_name)]
+    score = 0
+
+    # Direct match
+    if pname == kw:
+        return 100
+    if pname.startswith(kw):
+        score = max(score, 85)
+    if kw in pname:
+        score = max(score, 70)
+    for t in ptokens:
+        if t == kw:
+            score = max(score, 85)
+        elif t.startswith(kw) and len(kw) >= 2:
+            score = max(score, 65)
+
+    # Description match
+    if kw in periph_desc.lower():
+        score = max(score, 50)
+
+    # Synonym match: keyword → hardware peripheral names
+    kw_base = kw.split()[0] if " " in kw else kw
+    for syn in _REG_SYNONYMS.get(kw_base, []):
+        syn_l = syn.lower()
+        if syn_l in ptokens:
+            score = max(score, 80)
+        elif syn_l == pname:
+            # Exact peripheral name match (e.g. "p00" == "p00")
+            score = max(score, 80)
+        elif pname.startswith(syn_l) or syn_l.startswith(pname):
+            # Prefix match (e.g. "p00" starts with "p0", or "asclin0" starts with "asclin")
+            if len(syn_l) >= 3:
+                score = max(score, 65)
+
+    # Reverse: keyword is hardware name, peripheral matches AI term
+    for syn_key, syn_vals in _REG_SYNONYMS.items():
+        if kw_base == syn_key:
+            continue
+        if kw_base in [v.lower() for v in syn_vals]:
+            if syn_key.lower() in ptokens:
+                score = max(score, 75)
+            elif syn_key.lower() in pname:
+                score = max(score, 60)
+
+    return score
+
+
+@mcp.tool()
+def reg_peripherals(device: str = "") -> str:
+    """List all peripherals of the target MCU with register counts.
+    Reads from SVD-derived RegisterDefs (no hardware connection needed).
+    If device is empty, auto-detects from config or hardware.
+    """
+    cfg = dict(_config)
+    if device:
+        cfg["device"] = device
+
+    dev = _detect_device(cfg)
+    if not dev:
+        return json.dumps({"status": "error",
+                           "message": "Device not specified and auto-detect failed. Set 'device' in config or pass device parameter."})
+
+    data = _load_register_defs(dev, cfg)
+    if not data:
+        return json.dumps({"status": "error",
+                           "message": f"No RegisterDefs found for {dev}. Check wiggle/RegisterDefs/ directory."})
+
+    summary = data.get("summary", {})
+    peripherals = []
+    for p in data.get("peripherals", []):
+        peripherals.append({
+            "name": p["name"],
+            "baseAddress": p.get("baseAddress", ""),
+            "registerCount": p.get("registerCount", len(p.get("registers", []))),
+            "desc": p.get("desc", ""),
+        })
+
+    return format_result({
+        "status": "ok",
+        "device": dev,
+        "svdSource": data.get("svdSource", ""),
+        "total_peripherals": summary.get("peripherals", len(peripherals)),
+        "total_registers": summary.get("registers", 0),
+        "total_fields": summary.get("fields", 0),
+        "peripherals": peripherals,
+    })
+
+
+@mcp.tool()
+def reg_fields(name: str, device: str = "") -> str:
+    """Show complete bit-field definition of a register.
+    Returns every field with its bit range, access type, description,
+    and enumerated values (if any).
+    name: Register name in 'PERIPHERAL.REGISTER' format (e.g. 'DMU.HF.STATUS')
+          or just register name if unique (e.g. 'CLC').
+    """
+    if not name:
+        return json.dumps({"status": "error", "message": "Register name required."})
+
+    cfg = dict(_config)
+    if device:
+        cfg["device"] = device
+
+    dev = _detect_device(cfg)
+    if not dev:
+        return json.dumps({"status": "error",
+                           "message": "Device not specified and auto-detect failed."})
+
+    data = _load_register_defs(dev, cfg)
+    if not data:
+        return json.dumps({"status": "error",
+                           "message": f"No RegisterDefs found for {dev}."})
+
+    # Parse name: "DMU.HF.STATUS" or "CLC"
+    parts = name.split(".")
+    if len(parts) >= 2:
+        target_periph = parts[0].upper()
+        target_reg = parts[-1].upper()
+    else:
+        target_periph = None
+        target_reg = parts[0].upper()
+
+    # Search for matching register
+    matches = []
+    for p in data.get("peripherals", []):
+        if target_periph and p["name"].upper() != target_periph:
+            continue
+        for r in p.get("registers", []):
+            if r["name"].upper() == target_reg:
+                matches.append(r)
+
+    if not matches:
+        # Fuzzy fallback: try scoring search when exact match fails
+        fuzzy_hits = []
+        for p in data.get("peripherals", []):
+            if target_periph and p["name"].upper() != target_periph:
+                continue
+            for r in p.get("registers", []):
+                full = f"{p['name']}.{r['name']}"
+                s = _score_match(target_reg, r["name"], r.get("desc", ""))
+                s2 = _score_match(target_reg, full, r.get("desc", ""))
+                best = max(s, s2)
+                if best >= 40:
+                    fuzzy_hits.append((best, p, r))
+        if fuzzy_hits:
+            fuzzy_hits.sort(key=lambda x: -x[0])
+            suggestions = []
+            for sc, p, r in fuzzy_hits[:10]:
+                suggestions.append({
+                    "name": f"{p['name']}.{r['name']}",
+                    "desc": r.get("desc", ""),
+                    "score": sc,
+                })
+            return format_result({
+                "status": "not_found_fuzzy",
+                "message": f"Exact register '{name}' not found, but similar registers found:",
+                "device": dev,
+                "suggestions": suggestions,
+                "hint": "Use the 'name' field from suggestions for exact lookup.",
+            })
+        return format_result({"status": "not_found",
+                              "message": f"Register '{name}' not found in {dev} RegisterDefs.",
+                              "hint": "Use reg_search to find register names."})
+
+    if len(matches) > 1 and not target_periph:
+        # Ambiguous — return list of matches
+        options = [{"peripheral": r["peripheral"], "name": r["name"],
+                     "address": r.get("address", "")} for r in matches]
+        return format_result({"status": "ambiguous",
+                              "message": f"Register '{name}' found in {len(matches)} peripherals. Specify as PERIPHERAL.{name}.",
+                              "matches": options[:20]})
+
+    reg = matches[0]
+    fields_out = []
+    for f in reg.get("fields", []):
+        entry = {
+            "name": f["name"],
+            "bits": f"[{f['msb']}:{f['lsb']}]" if f['msb'] != f['lsb'] else f"[{f['lsb']}]",
+            "access": f.get("access", ""),
+            "desc": f.get("desc", ""),
+        }
+        if f.get("values"):
+            entry["values"] = [{"value": v["value"], "desc": v.get("desc", "")}
+                               for v in f["values"]]
+        fields_out.append(entry)
+
+    return format_result({
+        "status": "ok",
+        "device": dev,
+        "register": reg.get("fullName", reg["name"]),
+        "peripheral": reg.get("peripheral", ""),
+        "address": reg.get("address", ""),
+        "offset": reg.get("offset", ""),
+        "size": reg.get("size", 32),
+        "access": reg.get("access", ""),
+        "resetValue": reg.get("resetValue", ""),
+        "desc": reg.get("desc", ""),
+        "fieldCount": len(fields_out),
+        "fields": fields_out,
+    })
+
+
+@mcp.tool()
+def reg_search(keyword: str, device: str = "", max_results: int = 50) -> str:
+    """Fuzzy search registers by keyword with relevance scoring.
+    Supports AI-friendly terms: 'uart' finds ASCLIN, 'gpio' finds P00/P10,
+    'flash' finds DMU, 'timer' finds GTM/CCU6, etc.
+    Searches register names, peripheral names, and descriptions.
+    Results sorted by relevance score (0-100).
+    keyword: Search term — can be hardware name ('WDT'), function ('watchdog'),
+             or partial name ('STAT', 'CLK', 'TIMER').
+    max_results: Maximum number of results (default 50).
+    """
+    if not keyword:
+        return json.dumps({"status": "error", "message": "Search keyword required."})
+
+    cfg = dict(_config)
+    if device:
+        cfg["device"] = device
+
+    dev = _detect_device(cfg)
+    if not dev:
+        return json.dumps({"status": "error",
+                           "message": "Device not specified and auto-detect failed."})
+
+    data = _load_register_defs(dev, cfg)
+    if not data:
+        return json.dumps({"status": "error",
+                           "message": f"No RegisterDefs found for {dev}."})
+
+    # Score all registers against keyword
+    # Strategy: register-level score is primary;
+    # peripheral-level match adds a bonus (AI searching "uart" → ASCLIN peripheral).
+    MIN_SCORE = 40  # Filter noise: only show meaningful matches
+    scored: list[tuple[int, dict]] = []
+    for p in data.get("peripherals", []):
+        periph_name = p["name"]
+        periph_desc = p.get("desc", "")
+        # Peripheral-level relevance (uses synonym-aware scoring)
+        periph_s = _periph_relevance(keyword, periph_name, periph_desc)
+        for r in p.get("registers", []):
+            reg_name = r["name"]
+            full_name = f"{periph_name}.{reg_name}"
+            desc = r.get("desc", "")
+
+            # Register-level score (name + desc, no synonym peripheral leak)
+            reg_s = _score_match(keyword, full_name, desc)
+
+            # Combined score
+            if reg_s > 0 and periph_s > 0:
+                # Both match: boost (cap at 100)
+                s = min(reg_s + periph_s // 3, 100)
+            elif reg_s > 0:
+                # Register matches but peripheral doesn't
+                s = reg_s
+            elif periph_s >= 65:
+                # Peripheral strongly matches (synonym/name)
+                # All registers in this peripheral are potentially relevant
+                s = periph_s // 2
+            else:
+                s = 0
+
+            if s >= MIN_SCORE:
+                scored.append((s, {
+                    "name": full_name,
+                    "address": r.get("address", ""),
+                    "size": r.get("size", 32),
+                    "access": r.get("access", ""),
+                    "desc": desc,
+                    "fieldCount": len(r.get("fields", [])),
+                    "score": s,
+                }))
+
+    # Sort by score descending, then by name for stable ordering
+    scored.sort(key=lambda x: (-x[0], x[1]["name"]))
+    results = [item for _, item in scored[:max_results]]
+
+    return format_result({
+        "status": "ok",
+        "device": dev,
+        "keyword": keyword,
+        "totalMatches": len(scored),
+        "matchCount": len(results),
+        "truncated": len(scored) > max_results,
+        "results": results,
+    })
 
 
 @mcp.tool()
@@ -698,7 +1237,7 @@ def wiggle_rewrite(
     if reset_mcu:
         args.append("--reset")
 
-    return format_result(run_wiggle(args, cfg))
+    return format_result(run_wiggle(args, cfg, timeout=1800))
 
 
 @mcp.tool()
@@ -725,7 +1264,7 @@ def wiggle_restore(
     if no_verify:
         args.append("--no-verify")
 
-    return format_result(run_wiggle(args, cfg))
+    return format_result(run_wiggle(args, cfg, timeout=3600))
 
 
 @mcp.tool()

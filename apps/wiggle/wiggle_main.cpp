@@ -136,6 +136,7 @@ static constexpr int EXIT_WRITE_VERIFY_ERROR = 20;  // Write verification failed
 static constexpr int EXIT_HEX_PARSE_ERROR    = 21;  // HEX file parse error
 static constexpr int EXIT_MISMATCH_ERROR     = 22;  // Compare found mismatches
 static constexpr int EXIT_NOT_FOUND          = 23;  // Search pattern not found
+static constexpr int EXIT_TRUNCATED          = 25;  // Results truncated (search match limit)
 
 static constexpr uint32_t WAIT_UNBUSY_TIMEOUT_MS  = 10000;
 static constexpr uint32_t POLL_INTERVAL_MS         = 10;
@@ -1271,7 +1272,7 @@ static int doWrite(int argc, char** argv)
     const char* inputFile = nullptr;
     uint32_t writeAddr = 0;
     bool hasAddr = false;
-    bool doVerify = false;
+    bool doVerify = true;  // Verify enabled by default (safe default, matches MCP contract)
 
     // Parse arguments
     for (int i = 0; i < argc; ) {
@@ -1287,13 +1288,16 @@ static int doWrite(int argc, char** argv)
         if (strcmp(argv[i], "--verify") == 0 || strcmp(argv[i], "-v") == 0) {
             doVerify = true; i++; continue;
         }
+        if (strcmp(argv[i], "--no-verify") == 0) {
+            doVerify = false; i++; continue;
+        }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: wiggle write --file <path> [--addr 0xAF...] [--verify] [options]\n\n");
+            printf("Usage: wiggle write --file <path> [--addr 0xAF...] [--no-verify] [options]\n\n");
             printf("Write data to DFlash from a HEX or BIN file.\n\n");
             printf("Options:\n");
             printf("  --file, -f <path>     Input file (.hex or .bin)\n");
             printf("  --addr, -a <hex>      Start address (required for .bin, optional for .hex)\n");
-            printf("  --verify, -v          Read back and verify after writing\n");
+            printf("  --no-verify           Skip read-back verification (verify is ON by default)\n");
             printf("  --device, -d <name>   Device name (e.g. TC23x)\n");
             printf("  --server, -s <ip>     TAS server IP (default: localhost)\n");
             printf("  --target, -t <id>     Target identifier\n");
@@ -3948,6 +3952,7 @@ static int doCompare(int argc, char** argv)
         j["total_bytes"] = totalBytes;
         j["mismatches"] = totalMismatches;
         j["match"] = (totalMismatches == 0);
+        if (totalMismatches > 0) return jsonError(EXIT_MISMATCH_ERROR, j);
         return jsonOk(j);
     }
     return (totalMismatches > 0) ? EXIT_MISMATCH_ERROR : EXIT_OK;
@@ -4050,9 +4055,9 @@ static int doSearch(int argc, char** argv)
                         j["matches"] = matchAddrs;
                         j["match_count"] = matchCount;
                         j["truncated"] = true;
-                        return jsonOk(j);
+                        return jsonError(EXIT_TRUNCATED, j);
                     }
-                    return EXIT_OK;
+                    return EXIT_TRUNCATED;
                 }
             }
         }
