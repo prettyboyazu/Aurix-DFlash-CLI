@@ -1015,6 +1015,16 @@ static int doReset(int argc, char** argv)
         return EXIT_CONNECT_ERROR;
     }
 
+    // TC4x rejection
+    const tas_con_info_st* conInfo = client.get_con_info();
+    if (conInfo) {
+        int tc4xRc = rejectTc4xDevice(conInfo);
+        if (tc4xRc != EXIT_OK) {
+            if (g_json) return jsonError(EXIT_DEVICE_ERROR, "TC4x devices are not supported");
+            return EXIT_DEVICE_ERROR;
+        }
+    }
+
     if (g_json) {
         nljson j;
         j["action"] = "reset";
@@ -2065,6 +2075,17 @@ static int doUcbWrite(int argc, char** argv)
             if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address not aligned to page boundary");
             fprintf(stderr, "ERROR: Address 0x%08X not aligned to %u-byte page boundary\n",
                    seg.baseAddress, DFLASH_PAGE_SIZE);
+            return EXIT_USAGE_ERROR;
+        }
+    }
+
+    // Check 32-byte UCB record alignment
+    static constexpr uint32_t UCB_RECORD_SIZE = 32;
+    for (const auto& seg : parseResult.segments) {
+        if (seg.baseAddress % UCB_RECORD_SIZE != 0) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "UCB address not aligned to 32-byte record boundary");
+            fprintf(stderr, "ERROR: UCB address 0x%08X not aligned to %u-byte record boundary\n",
+                   seg.baseAddress, UCB_RECORD_SIZE);
             return EXIT_USAGE_ERROR;
         }
     }
@@ -3485,15 +3506,19 @@ static int doDump(int argc, char** argv)
         nljson j;
         j["address"] = addr;
         j["bytes"] = bytesRead;
-        std::string hexData;
-        hexData.reserve(bytesRead * 2);
-        for (uint32_t i = 0; i < bytesRead; ++i) {
-            char hex[3];
-            snprintf(hex, sizeof(hex), "%02X", buf[i]);
-            hexData += hex;
+        if (outFile) {
+            // Large dump saved to file: omit hex data from JSON to avoid bloat
+            j["output_file"] = outFile;
+        } else {
+            std::string hexData;
+            hexData.reserve(bytesRead * 2);
+            for (uint32_t i = 0; i < bytesRead; ++i) {
+                char hex[3];
+                snprintf(hex, sizeof(hex), "%02X", buf[i]);
+                hexData += hex;
+            }
+            j["data"] = hexData;
         }
-        j["data"] = hexData;
-        if (outFile) j["output_file"] = outFile;
         return jsonOk(j);
     }
 
@@ -3530,6 +3555,7 @@ static int doPoke(int argc, char** argv)
     uint32_t value = 0;
     int width = 32;
     bool hasAddr = false, hasVal = false;
+    bool dangerous = false;
 
     for (int i = 0; i < argc; ) {
         int consumed = parseCommonOption(argc, argv, i, args);
@@ -3537,9 +3563,13 @@ static int doPoke(int argc, char** argv)
         if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
             width = atoi(argv[i + 1]); i += 2; continue;
         }
+        if (strcmp(argv[i], "--dangerous") == 0) {
+            dangerous = true; i++; continue;
+        }
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: wiggle poke <addr> <value> [--width 8|16|32|64] [options]\n\n");
+            printf("Usage: wiggle poke <addr> <value> [--width 8|16|32|64] [--dangerous] [options]\n\n");
             printf("  Write a value to a memory address and verify with readback.\n");
+            printf("  --dangerous   Required flag to acknowledge risk of raw memory writes.\n");
             return EXIT_OK;
         }
         if (!hasAddr) { if (!parseAddress(argv[i], addr)) return EXIT_USAGE_ERROR; hasAddr = true; i++; continue; }
@@ -3556,6 +3586,14 @@ static int doPoke(int argc, char** argv)
     if (!hasAddr || !hasVal) {
         if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address and value required");
         fprintf(stderr, "ERROR: Address and value required\n");
+        return EXIT_USAGE_ERROR;
+    }
+
+    // Safety: require --dangerous flag for raw memory writes
+    if (!dangerous) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "poke requires --dangerous flag to acknowledge risk of raw memory writes");
+        fprintf(stderr, "ERROR: poke is a dangerous operation that writes directly to memory.\n");
+        fprintf(stderr, "  Add --dangerous to acknowledge the risk.\n");
         return EXIT_USAGE_ERROR;
     }
 
