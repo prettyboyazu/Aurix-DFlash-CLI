@@ -1075,7 +1075,7 @@ def wiggle_poke(
     if target: cfg["target"] = target
     if device: cfg["device"] = device
 
-    args = ["poke", address, value, "--width", str(width)]
+    args = ["poke", address, value, "--width", str(width), "--dangerous"]
     return format_result(run_wiggle(args, cfg))
 
 
@@ -1145,7 +1145,7 @@ def wiggle_reset(
 
 
 @mcp.tool()
-def wiggle_pflash(
+def aurix_pflash(
     hex_file: str,
     verify: bool = True,
     erase: str = "",
