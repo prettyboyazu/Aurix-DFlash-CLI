@@ -126,6 +126,7 @@ static constexpr int EXIT_BACKUP_ERROR       = 8;   // Backup failed
 static constexpr int EXIT_FLASH_STATUS_ERROR = 11;  // Flash status clear failed
 static constexpr int EXIT_ERASE_CMD_ERROR    = 12;  // Erase command failed
 static constexpr int EXIT_ERASE_TIMEOUT      = 14;  // Erase timeout
+static constexpr int EXIT_WRITE_TIMEOUT      = 24;  // Write page timeout
 static constexpr int EXIT_ERASE_FLAGS        = 15;  // Error flags detected
 static constexpr int EXIT_FLASH_RESET_ERROR  = 16;  // Reset to read mode failed
 static constexpr int EXIT_VERIFY_ERROR       = 17;  // Verification failed
@@ -428,10 +429,10 @@ static bool writePageCmd(CTasClientRw& client, uint64_t flashCmdBase, uint32_t p
 }
 
 //********************************************************************************************************************
-//  Check flash error flags after erase
+//  Check flash error flags after erase or write
 //********************************************************************************************************************
 
-static bool checkEraseErrors(CTasClientRw& client, bool isTc3x)
+static bool checkFlashErrors(CTasClientRw& client, bool isTc3x)
 {
     uint64_t errorAddr = isTc3x ? DMU_HF_ERRSR_ADDR : FLASH0_FSR_ADDR;
     uint32_t pverBit   = isTc3x ? TC3X_PVER_BIT     : TC2X_PVER_BIT;
@@ -1232,10 +1233,10 @@ static int writeSegmentPages(CTasClientRw& client, bool isTc3x, uint64_t flashCm
         elapsedMs = 0;
         if (!waitUnbusyD0(client, isTc3x, elapsedMs)) {
             fprintf(stderr, "\nERROR: Write timeout at page 0x%08X\n", pageAddr);
-            return EXIT_ERASE_TIMEOUT;
+            return EXIT_WRITE_TIMEOUT;
         }
         // 7. Check errors
-        if (!checkEraseErrors(client, isTc3x)) {
+        if (!checkFlashErrors(client, isTc3x)) {
             fprintf(stderr, "\nERROR: Write error flags at page 0x%08X\n", pageAddr);
             return EXIT_WRITE_CMD_ERROR;
         }
@@ -1303,11 +1304,12 @@ static int doWrite(int argc, char** argv)
         return EXIT_USAGE_ERROR;
     }
 
+    g_json = args.jsonOutput;
+
     if (!inputFile) {
         if (g_json) return jsonError(EXIT_USAGE_ERROR, "--file is required");
         fprintf(stderr, "ERROR: --file is required\n"); return EXIT_USAGE_ERROR;
     }
-    g_json = args.jsonOutput;
 
     // --- Determine file type and parse ---
     std::string filePath(inputFile);
@@ -1324,6 +1326,7 @@ static int doWrite(int argc, char** argv)
         parseResult = parseIntelHex(filePath);
     } else {
         if (!hasAddr) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "--addr is required for binary files");
             fprintf(stderr, "ERROR: --addr is required for binary files\n");
             return EXIT_USAGE_ERROR;
         }
@@ -1331,6 +1334,7 @@ static int doWrite(int argc, char** argv)
     }
 
     if (!parseResult.success) {
+        if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, parseResult.errorMsg);
         fprintf(stderr, "ERROR: Failed to parse '%s': %s\n", inputFile, parseResult.errorMsg.c_str());
         return EXIT_HEX_PARSE_ERROR;
     }
@@ -1338,6 +1342,7 @@ static int doWrite(int argc, char** argv)
         fprintf(stderr, "WARNING: %s\n", parseResult.warningMsg.c_str());
 
     if (parseResult.segments.empty()) {
+        if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, "No data found in file");
         fprintf(stderr, "ERROR: No data found in '%s'\n", inputFile);
         return EXIT_HEX_PARSE_ERROR;
     }
@@ -1366,12 +1371,14 @@ static int doWrite(int argc, char** argv)
     for (const auto& seg : parseResult.segments) {
         if (seg.data.empty()) continue;
         if (seg.baseAddress < flashCfg.baseAddress || seg.baseAddress > dflashEndAddr) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Segment address out of DFlash range");
             fprintf(stderr, "ERROR: Segment address 0x%08X out of DFlash range (0x%08X - 0x%08X)\n",
                    seg.baseAddress, flashCfg.baseAddress, dflashEndAddr);
             return EXIT_USAGE_ERROR;
         }
         uint32_t segEnd = seg.baseAddress + static_cast<uint32_t>(seg.data.size()) - 1;
         if (segEnd > dflashEndAddr) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Segment exceeds DFlash boundary");
             fprintf(stderr, "ERROR: Segment exceeds DFlash boundary (end=0x%08X, max=0x%08X)\n",
                    segEnd, dflashEndAddr);
             return EXIT_USAGE_ERROR;
@@ -1382,6 +1389,7 @@ static int doWrite(int argc, char** argv)
     // Check page alignment
     for (const auto& seg : parseResult.segments) {
         if (seg.baseAddress % DFLASH_PAGE_SIZE != 0) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address not page-aligned");
             fprintf(stderr, "ERROR: Address 0x%08X not aligned to %u-byte page boundary\n",
                    seg.baseAddress, DFLASH_PAGE_SIZE);
             return EXIT_USAGE_ERROR;
@@ -1396,15 +1404,16 @@ static int doWrite(int argc, char** argv)
         // Round up to page boundary
         uint32_t prevEndPage = (prevEnd + DFLASH_PAGE_SIZE - 1) & ~(DFLASH_PAGE_SIZE - 1);
         if (parseResult.segments[s].baseAddress < prevEndPage) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Segment page-boundary overlap");
             fprintf(stderr, "ERROR: Segment %zu at 0x%08X overlaps with previous segment's page boundary (0x%08X)\n",
                    s, parseResult.segments[s].baseAddress, prevEndPage);
             return EXIT_USAGE_ERROR;
         }
     }
 
-    printf("  Device: %s (%s), DFlash: %u KB\n",
+    JPRINTF("  Device: %s (%s), DFlash: %u KB\n",
            flashCfg.deviceName.c_str(), flashCfg.family.c_str(), flashCfg.totalSize / 1024);
-    printf("  Write:  %u bytes (%u pages) in %zu segment(s)\n\n",
+    JPRINTF("  Write:  %u bytes (%u pages) in %zu segment(s)\n\n",
            totalWriteBytes, totalWriteBytes / DFLASH_PAGE_SIZE, parseResult.segments.size());
 
     // --- Write loop ---
@@ -1419,7 +1428,7 @@ static int doWrite(int argc, char** argv)
     uint32_t pagesWritten = 0;
     auto startTime = std::chrono::steady_clock::now();
 
-    printf("Writing DFlash:\n");
+    JPRINTF("Writing DFlash:\n");
 
     for (const auto& seg : parseResult.segments) {
         int writeResult = writeSegmentPages(ctx.client, flashCfg.isTc3x, flashCmdBase,
@@ -1428,14 +1437,14 @@ static int doWrite(int argc, char** argv)
         if (writeResult != EXIT_OK) return writeResult;
     }
 
-    printf("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
+    JPRINTF("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
     auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startTime).count();
-    printf("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
+    JPRINTF("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
 
     // --- Verify ---
     if (doVerify) {
-        printf("\nVerifying write:\n");
+        JPRINTF("\nVerifying write:\n");
         uint32_t verifyErrors = 0;
         for (const auto& seg : parseResult.segments) {
             std::vector<uint8_t> readBuf(seg.data.size(), 0);
@@ -1443,23 +1452,25 @@ static int doWrite(int argc, char** argv)
             tas_return_et vret = ctx.client.read(seg.baseAddress, readBuf.data(),
                                             static_cast<uint32_t>(seg.data.size()), &bytesRead);
             if (vret != TAS_ERR_NONE && vret != TAS_ERR_RW_READ) {
+                if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Verify read failed");
                 fprintf(stderr, "  ERROR: Read failed at 0x%08X\n", seg.baseAddress);
                 return EXIT_WRITE_VERIFY_ERROR;
             }
             for (size_t i = 0; i < seg.data.size() && i < bytesRead; i++) {
                 if (readBuf[i] != seg.data[i]) {
                     if (verifyErrors < 10)
-                        printf("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
+                        JPRINTF("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
                                seg.baseAddress + static_cast<uint32_t>(i), seg.data[i], readBuf[i]);
                     verifyErrors++;
                 }
             }
         }
         if (verifyErrors > 0) {
-            printf("  FAILED: %u bytes mismatch\n", verifyErrors);
+            if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Verification failed");
+            JPRINTF("  FAILED: %u bytes mismatch\n", verifyErrors);
             return EXIT_WRITE_VERIFY_ERROR;
         }
-        printf("  PASSED: all %u bytes verified\n", totalWriteBytes);
+        JPRINTF("  PASSED: all %u bytes verified\n", totalWriteBytes);
     }
 
     JPRINTF("\nDFlash write completed successfully.\n");
@@ -1512,11 +1523,16 @@ static int doRestore(int argc, char** argv)
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    if (!inputFile) { fprintf(stderr, "ERROR: --file is required\n"); return EXIT_USAGE_ERROR; }
+    if (!inputFile) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--file is required");
+        fprintf(stderr, "ERROR: --file is required\n");
+        return EXIT_USAGE_ERROR;
+    }
 
-    printf("TAS Wiggle Tool - Restore\n");
-    printf("=========================\n\n");
+    JPRINTF("TAS Wiggle Tool - Restore\n");
+    JPRINTF("=========================\n\n");
 
     // Load file data
     std::string filePath(inputFile);
@@ -1535,6 +1551,7 @@ static int doRestore(int argc, char** argv)
     if (!isBinFile) {
         parseResult = parseIntelHex(filePath);
         if (!parseResult.success) {
+            if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, parseResult.errorMsg);
             fprintf(stderr, "ERROR: Failed to parse '%s': %s\n", inputFile, parseResult.errorMsg.c_str());
             return EXIT_HEX_PARSE_ERROR;
         }
@@ -1543,9 +1560,14 @@ static int doRestore(int argc, char** argv)
     } else {
         // Load binary file with placeholder address 0 (will be set after device detection)
         std::ifstream ifs(inputFile, std::ios::binary | std::ios::ate);
-        if (!ifs) { fprintf(stderr, "ERROR: Cannot open '%s'\n", inputFile); return EXIT_IO_ERROR; }
+        if (!ifs) {
+            if (g_json) return jsonError(EXIT_IO_ERROR, std::string("Cannot open '") + inputFile + "'");
+            fprintf(stderr, "ERROR: Cannot open '%s'\n", inputFile);
+            return EXIT_IO_ERROR;
+        }
         size_t fileSize = static_cast<size_t>(ifs.tellg());
         if (fileSize == 0) {
+            if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, "File is empty");
             fprintf(stderr, "ERROR: File is empty: %s\n", filePath.c_str());
             return EXIT_HEX_PARSE_ERROR;
         }
@@ -1564,13 +1586,14 @@ static int doRestore(int argc, char** argv)
     }
 
     if (parseResult.segments.empty()) {
+        if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, "No data found in file");
         fprintf(stderr, "ERROR: No data found in '%s'\n", inputFile);
         return EXIT_HEX_PARSE_ERROR;
     }
 
     size_t totalFileBytes = 0;
     for (const auto& seg : parseResult.segments) totalFileBytes += seg.data.size();
-    printf("  File: %s (%zu bytes)\n", inputFile, totalFileBytes);
+    JPRINTF("  File: %s (%zu bytes)\n", inputFile, totalFileBytes);
 
     // --- Common initialization ---
     RESOLVE_CTX(ctx, "WiggleRestore", TAS_CLNT_DCO_RESET_AND_HALT);
@@ -1588,6 +1611,7 @@ static int doRestore(int argc, char** argv)
         uint32_t segEnd = seg.baseAddress + static_cast<uint32_t>(seg.data.size()) - 1;
         uint32_t dflashEnd = flashCfg.baseAddress + flashCfg.totalSize - 1;
         if (seg.baseAddress < flashCfg.baseAddress || segEnd > dflashEnd) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Data range exceeds DFlash boundary");
             fprintf(stderr, "ERROR: Data range 0x%08X-0x%08X exceeds DFlash (0x%08X-0x%08X)\n",
                    seg.baseAddress, segEnd, flashCfg.baseAddress, dflashEnd);
             return EXIT_USAGE_ERROR;
@@ -1601,15 +1625,16 @@ static int doRestore(int argc, char** argv)
         // Round up to page boundary
         uint32_t prevEndPage = (prevEnd + DFLASH_PAGE_SIZE - 1) & ~(DFLASH_PAGE_SIZE - 1);
         if (parseResult.segments[s].baseAddress < prevEndPage) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Segment page boundary overlap");
             fprintf(stderr, "ERROR: Segment %zu at 0x%08X overlaps with previous segment's page boundary (0x%08X)\n",
                    s, parseResult.segments[s].baseAddress, prevEndPage);
             return EXIT_USAGE_ERROR;
         }
     }
 
-    printf("  Device: %s (%s), DFlash: %u KB\n",
+    JPRINTF("  Device: %s (%s), DFlash: %u KB\n",
            flashCfg.deviceName.c_str(), flashCfg.family.c_str(), flashCfg.totalSize / 1024);
-    printf("  Restore: %zu bytes to 0x%08X\n\n",
+    JPRINTF("  Restore: %zu bytes to 0x%08X\n\n",
            totalFileBytes, parseResult.segments[0].baseAddress);
 
     const uint64_t flashCmdBase = static_cast<uint64_t>(flashCfg.baseAddress);
@@ -1629,28 +1654,33 @@ static int doRestore(int argc, char** argv)
     uint32_t eraseBytes = eraseEnd - eraseStart;
     uint32_t numSectors = (eraseBytes + flashCfg.sectorSize - 1) / flashCfg.sectorSize;
 
-    printf("Step 1/3: Erasing %u sectors at 0x%08X...\n", numSectors, eraseStart);
+    JPRINTF("Step 1/3: Erasing %u sectors at 0x%08X...\n", numSectors, eraseStart);
 
     if (!clearFlashStatus(ctx.client, flashCmdBase)) {
+        if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, "Clear status failed");
         fprintf(stderr, "ERROR: Clear status failed\n"); return EXIT_FLASH_STATUS_ERROR;
     }
     if (!eraseMultipleSectors(ctx.client, flashCmdBase, eraseStart, numSectors)) {
+        if (g_json) return jsonError(EXIT_ERASE_CMD_ERROR, "Erase command failed");
         fprintf(stderr, "ERROR: Erase command failed\n"); return EXIT_ERASE_CMD_ERROR;
     }
     uint32_t elapsedMs = 0;
     if (!waitUnbusyD0(ctx.client, flashCfg.isTc3x, elapsedMs)) {
+        if (g_json) return jsonError(EXIT_ERASE_TIMEOUT, "Erase timeout");
         fprintf(stderr, "ERROR: Erase timeout\n"); return EXIT_ERASE_TIMEOUT;
     }
-    if (!checkEraseErrors(ctx.client, flashCfg.isTc3x)) {
+    if (!checkFlashErrors(ctx.client, flashCfg.isTc3x)) {
+        if (g_json) return jsonError(EXIT_ERASE_FLAGS, "Error flags detected");
         return EXIT_ERASE_FLAGS;
     }
     if (!resetToRead(ctx.client, flashCmdBase)) {
+        if (g_json) return jsonError(EXIT_FLASH_RESET_ERROR, "Reset to read failed");
         fprintf(stderr, "ERROR: Reset to read failed\n"); return EXIT_FLASH_RESET_ERROR;
     }
-    printf("  Erase completed in %u ms\n\n", elapsedMs);
+    JPRINTF("  Erase completed in %u ms\n\n", elapsedMs);
 
     // --- Step 2: Write page by page ---
-    printf("Step 2/3: Writing %zu bytes...\n", totalFileBytes);
+    JPRINTF("Step 2/3: Writing %zu bytes...\n", totalFileBytes);
     uint32_t totalPages = 0;
     for (const auto& seg : parseResult.segments) {
         totalPages += (static_cast<uint32_t>(seg.data.size()) + DFLASH_PAGE_SIZE - 1) / DFLASH_PAGE_SIZE;
@@ -1665,14 +1695,14 @@ static int doRestore(int argc, char** argv)
         if (writeResult != EXIT_OK) return writeResult;
     }
 
-    printf("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
+    JPRINTF("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
     auto writeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - writeStart).count();
-    printf("  Write completed in %lld ms\n", static_cast<long long>(writeElapsed));
+    JPRINTF("  Write completed in %lld ms\n", static_cast<long long>(writeElapsed));
 
     // --- Step 3: Verify ---
     if (doVerify) {
-        printf("\nStep 3/3: Verifying restore...\n");
+        JPRINTF("\nStep 3/3: Verifying restore...\n");
         uint32_t verifyErrors = 0;
         const uint32_t verifyChunkSize = flashCfg.sectorSize;  // Read in sector-sized chunks
         std::vector<uint8_t> readBuf(verifyChunkSize, 0);
@@ -1684,13 +1714,14 @@ static int doRestore(int argc, char** argv)
                 tas_return_et vret = ctx.client.read(seg.baseAddress + offset, readBuf.data(),
                                                 chunkLen, &bytesRead);
                 if (vret != TAS_ERR_NONE && vret != TAS_ERR_RW_READ) {
+                    if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Read failed during verify");
                     fprintf(stderr, "  ERROR: Read failed at 0x%08X\n", seg.baseAddress + offset);
                     return EXIT_WRITE_VERIFY_ERROR;
                 }
                 for (uint32_t i = 0; i < bytesRead && i < chunkLen; i++) {
                     if (readBuf[i] != seg.data[offset + i]) {
                         if (verifyErrors < 10)
-                            printf("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
+                            JPRINTF("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
                                    seg.baseAddress + offset + i, seg.data[offset + i], readBuf[i]);
                         verifyErrors++;
                     }
@@ -1698,15 +1729,25 @@ static int doRestore(int argc, char** argv)
             }
         }
         if (verifyErrors > 0) {
-            printf("  FAILED: %u bytes mismatch\n", verifyErrors);
+            if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Verify failed");
+            JPRINTF("  FAILED: %u bytes mismatch\n", verifyErrors);
             return EXIT_WRITE_VERIFY_ERROR;
         }
-        printf("  PASSED: all %zu bytes verified\n", totalFileBytes);
+        JPRINTF("  PASSED: all %zu bytes verified\n", totalFileBytes);
     } else {
-        printf("\nStep 3/3: Verification skipped (use default or remove --no-verify)\n");
+        JPRINTF("\nStep 3/3: Verification skipped (use default or remove --no-verify)\n");
     }
 
-    printf("\nDFlash restore completed successfully.\n");
+    JPRINTF("\nDFlash restore completed successfully.\n");
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "restore";
+        j["file"] = std::string(inputFile);
+        j["total_bytes"] = totalFileBytes;
+        j["verified"] = doVerify;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -1753,20 +1794,23 @@ static int doUcbRead(int argc, char** argv)
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    printf("TAS Wiggle Tool - UCB Read\n");
-    printf("==========================\n");
+    JPRINTF("TAS Wiggle Tool - UCB Read\n");
+    JPRINTF("==========================\n");
 
     RESOLVE_CTX(ctx, "WiggleUcbRead", TAS_CLNT_DCO_HOT_ATTACH);
 
     // Reject TC2x
     if (!ctx.flashCfg.isTc3x) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, "UCB commands only support TC3XX devices");
         fprintf(stderr, "ERROR: UCB commands only support TC3XX devices.\n");
         return EXIT_DEVICE_ERROR;
     }
 
     // Check UCB config valid
     if (ctx.flashCfg.ucb.baseAddress == 0) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, "No UCB configuration found for this device");
         fprintf(stderr, "ERROR: No UCB configuration found for this device.\n");
         return EXIT_DEVICE_ERROR;
     }
@@ -1780,19 +1824,21 @@ static int doUcbRead(int argc, char** argv)
     // Validate range within UCB
     uint32_t ucbEndAddr = ucb.baseAddress + ucb.totalSize - 1;
     if (readAddr < ucb.baseAddress || readAddr > ucbEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address out of UCB range");
         fprintf(stderr, "ERROR: Address 0x%08X out of UCB range (0x%08X - 0x%08X)\n",
                 readAddr, ucb.baseAddress, ucbEndAddr);
         return EXIT_USAGE_ERROR;
     }
     if (static_cast<uint64_t>(readAddr) + readLength - 1 > ucbEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Range exceeds UCB boundary");
         fprintf(stderr, "ERROR: Range exceeds UCB boundary (max 0x%08X)\n", ucbEndAddr);
         return EXIT_USAGE_ERROR;
     }
 
-    printf("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
-    printf("  UCB:    0x%08X - 0x%08X (%u bytes, %u sectors of %u bytes)\n",
+    JPRINTF("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    JPRINTF("  UCB:    0x%08X - 0x%08X (%u bytes, %u sectors of %u bytes)\n",
            ucb.baseAddress, ucbEndAddr, ucb.totalSize, ucb.numSectors, ucb.sectorSize);
-    printf("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
+    JPRINTF("  Read:   0x%08X - 0x%08X (%u bytes)\n\n", readAddr, readAddr + readLength - 1, readLength);
 
     // Read in sector-sized chunks
     const uint32_t chunkSize = ucb.sectorSize;
@@ -1809,10 +1855,9 @@ static int doUcbRead(int argc, char** argv)
             return EXIT_IO_ERROR;
         }
         totalRead += bytesRead;
-        printf("  Read %u/%u bytes\r", totalRead, readLength);
-        fflush(stdout);
+        if (!g_json) { printf("  Read %u/%u bytes\r", totalRead, readLength); fflush(stdout); }
     }
-    printf("\n  Read complete: %u bytes\n", totalRead);
+    JPRINTF("\n  Read complete: %u bytes\n", totalRead);
 
     // Output
     if (outputFile != nullptr) {
@@ -1826,18 +1871,41 @@ static int doUcbRead(int argc, char** argv)
 
         if (ext == "bin") {
             std::ofstream ofs(outputFile, std::ios::binary);
-            if (!ofs) { fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile); return EXIT_IO_ERROR; }
+            if (!ofs) {
+                if (g_json) return jsonError(EXIT_IO_ERROR, std::string("Cannot open '") + outputFile + "'");
+                fprintf(stderr, "ERROR: Cannot open '%s'\n", outputFile);
+                return EXIT_IO_ERROR;
+            }
             ofs.write(reinterpret_cast<const char*>(allData.data()), totalRead);
-            printf("  Saved binary: %s (%u bytes)\n", outputFile, totalRead);
+            JPRINTF("  Saved binary: %s (%u bytes)\n", outputFile, totalRead);
         } else {
-            if (!saveToIntelHex(outputFile, readAddr, allData)) return EXIT_IO_ERROR;
-            printf("  Saved Intel HEX: %s\n", outputFile);
+            if (!saveToIntelHex(outputFile, readAddr, allData)) {
+                if (g_json) return jsonError(EXIT_IO_ERROR, "Failed to save Intel HEX");
+                return EXIT_IO_ERROR;
+            }
+            JPRINTF("  Saved Intel HEX: %s\n", outputFile);
         }
-    } else {
+    } else if (!g_json) {
         printf("\n");
         hexDumpXxd(allData.data(), totalRead, readAddr);
     }
 
+    if (g_json) {
+        nljson j;
+        j["action"] = "ucb_read";
+        j["address"] = readAddr;
+        j["bytes"] = totalRead;
+        std::string hexData;
+        hexData.reserve(totalRead * 2);
+        for (uint32_t i = 0; i < totalRead; ++i) {
+            char hex[3];
+            snprintf(hex, sizeof(hex), "%02X", allData[i]);
+            hexData += hex;
+        }
+        j["data"] = hexData;
+        if (outputFile) j["output_file"] = std::string(outputFile);
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -1883,12 +1951,17 @@ static int doUcbWrite(int argc, char** argv)
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    if (!inputFile) { fprintf(stderr, "ERROR: --file is required\n"); return EXIT_USAGE_ERROR; }
+    if (!inputFile) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--file is required");
+        fprintf(stderr, "ERROR: --file is required\n");
+        return EXIT_USAGE_ERROR;
+    }
 
-    printf("TAS Wiggle Tool - UCB Write\n");
-    printf("===========================\n");
-    printf("WARNING: UCB write is a high-risk operation. Incorrect data may lock the device.\n\n");
+    JPRINTF("TAS Wiggle Tool - UCB Write\n");
+    JPRINTF("===========================\n");
+    JPRINTF("WARNING: UCB write is a high-risk operation. Incorrect data may lock the device.\n\n");
 
     // Parse input file
     std::string filePath(inputFile);
@@ -1904,6 +1977,7 @@ static int doUcbWrite(int argc, char** argv)
         parseResult = parseIntelHex(filePath);
     } else {
         if (!hasAddr) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "--addr is required for binary files");
             fprintf(stderr, "ERROR: --addr is required for binary files\n");
             return EXIT_USAGE_ERROR;
         }
@@ -1911,12 +1985,14 @@ static int doUcbWrite(int argc, char** argv)
     }
 
     if (!parseResult.success) {
+        if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, parseResult.errorMsg);
         fprintf(stderr, "ERROR: Failed to parse '%s': %s\n", inputFile, parseResult.errorMsg.c_str());
         return EXIT_HEX_PARSE_ERROR;
     }
     if (!parseResult.warningMsg.empty())
         fprintf(stderr, "WARNING: %s\n", parseResult.warningMsg.c_str());
     if (parseResult.segments.empty()) {
+        if (g_json) return jsonError(EXIT_HEX_PARSE_ERROR, "No data found in file");
         fprintf(stderr, "ERROR: No data found in '%s'\n", inputFile);
         return EXIT_HEX_PARSE_ERROR;
     }
@@ -1935,12 +2011,14 @@ static int doUcbWrite(int argc, char** argv)
 
     // Reject TC2x
     if (!ctx.flashCfg.isTc3x) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, "UCB commands only support TC3XX devices");
         fprintf(stderr, "ERROR: UCB commands only support TC3XX devices.\n");
         return EXIT_DEVICE_ERROR;
     }
 
     // Check UCB config valid
     if (ctx.flashCfg.ucb.baseAddress == 0) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, "No UCB configuration found for this device");
         fprintf(stderr, "ERROR: No UCB configuration found for this device.\n");
         return EXIT_DEVICE_ERROR;
     }
@@ -1953,12 +2031,14 @@ static int doUcbWrite(int argc, char** argv)
     for (const auto& seg : parseResult.segments) {
         if (seg.data.empty()) continue;
         if (seg.baseAddress < ucb.baseAddress || seg.baseAddress > ucbEndAddr) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Segment address out of UCB range");
             fprintf(stderr, "ERROR: Segment address 0x%08X out of UCB range (0x%08X - 0x%08X)\n",
                    seg.baseAddress, ucb.baseAddress, ucbEndAddr);
             return EXIT_USAGE_ERROR;
         }
         uint32_t segEnd = seg.baseAddress + static_cast<uint32_t>(seg.data.size()) - 1;
         if (segEnd > ucbEndAddr) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Segment exceeds UCB boundary");
             fprintf(stderr, "ERROR: Segment exceeds UCB boundary (end=0x%08X, max=0x%08X)\n",
                    segEnd, ucbEndAddr);
             return EXIT_USAGE_ERROR;
@@ -1969,37 +2049,43 @@ static int doUcbWrite(int argc, char** argv)
     // Check page alignment
     for (const auto& seg : parseResult.segments) {
         if (seg.baseAddress % DFLASH_PAGE_SIZE != 0) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address not aligned to page boundary");
             fprintf(stderr, "ERROR: Address 0x%08X not aligned to %u-byte page boundary\n",
                    seg.baseAddress, DFLASH_PAGE_SIZE);
             return EXIT_USAGE_ERROR;
         }
     }
 
-    printf("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
-    printf("  UCB:    0x%08X - 0x%08X (%u bytes)\n", ucb.baseAddress, ucbEndAddr, ucb.totalSize);
-    printf("  Write:  %u bytes (%u pages) in %zu segment(s)\n\n",
+    JPRINTF("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    JPRINTF("  UCB:    0x%08X - 0x%08X (%u bytes)\n", ucb.baseAddress, ucbEndAddr, ucb.totalSize);
+    JPRINTF("  Write:  %u bytes (%u pages) in %zu segment(s)\n\n",
            totalWriteBytes, totalWriteBytes / DFLASH_PAGE_SIZE, parseResult.segments.size());
 
     // --- High-risk warning + confirmation ---
-    printf("\n");
-    printf("  *** HIGH RISK OPERATION ***\n");
-    printf("  Writing incorrect UCB data may permanently lock the chip!\n");
-    printf("  Target: %u bytes in %zu segment(s)\n", totalWriteBytes, parseResult.segments.size());
-    printf("\n");
-    printf("  Type 'yes' to confirm: ");
-    fflush(stdout);
+    if (g_json) {
+        // Auto-confirm in JSON mode (MCP caller controls confirmation)
+        JPRINTF("  [JSON mode: auto-confirmed]\n");
+    } else {
+        printf("\n");
+        printf("  *** HIGH RISK OPERATION ***\n");
+        printf("  Writing incorrect UCB data may permanently lock the chip!\n");
+        printf("  Target: %u bytes in %zu segment(s)\n", totalWriteBytes, parseResult.segments.size());
+        printf("\n");
+        printf("  Type 'yes' to confirm: ");
+        fflush(stdout);
 
-    char confirm[16] = {0};
-    if (!fgets(confirm, sizeof(confirm), stdin)) {
-        printf("\nAborted (no input).\n");
-        return EXIT_USAGE_ERROR;
-    }
-    // Strip trailing newline/CR
-    size_t cl = strlen(confirm);
-    while (cl > 0 && (confirm[cl - 1] == '\n' || confirm[cl - 1] == '\r')) confirm[--cl] = '\0';
-    if (strcmp(confirm, "yes") != 0) {
-        printf("  Aborted.\n");
-        return EXIT_USAGE_ERROR;
+        char confirm[16] = {0};
+        if (!fgets(confirm, sizeof(confirm), stdin)) {
+            printf("\nAborted (no input).\n");
+            return EXIT_USAGE_ERROR;
+        }
+        // Strip trailing newline/CR
+        size_t cl = strlen(confirm);
+        while (cl > 0 && (confirm[cl - 1] == '\n' || confirm[cl - 1] == '\r')) confirm[--cl] = '\0';
+        if (strcmp(confirm, "yes") != 0) {
+            printf("  Aborted.\n");
+            return EXIT_USAGE_ERROR;
+        }
     }
 
     // --- Write loop (no erase, direct page programming) ---
@@ -2014,7 +2100,7 @@ static int doUcbWrite(int argc, char** argv)
     uint32_t pagesWritten = 0;
     auto startTime = std::chrono::steady_clock::now();
 
-    printf("Writing UCB:\n");
+    JPRINTF("Writing UCB:\n");
 
     for (const auto& seg : parseResult.segments) {
         int writeResult = writeSegmentPages(ctx.client, ctx.flashCfg.isTc3x, flashCmdBase,
@@ -2023,14 +2109,14 @@ static int doUcbWrite(int argc, char** argv)
         if (writeResult != EXIT_OK) return writeResult;
     }
 
-    printf("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
+    JPRINTF("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
     auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startTime).count();
-    printf("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
+    JPRINTF("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
 
     // --- Verify ---
     if (doVerify) {
-        printf("\nVerifying UCB write:\n");
+        JPRINTF("\nVerifying UCB write:\n");
         uint32_t verifyErrors = 0;
         for (const auto& seg : parseResult.segments) {
             uint32_t segSize = static_cast<uint32_t>(seg.data.size());
@@ -2042,13 +2128,14 @@ static int doUcbWrite(int argc, char** argv)
                 tas_return_et vret = ctx.client.read(seg.baseAddress + offset, readBuf.data(),
                                                 chunkLen, &bytesRead);
                 if (vret != TAS_ERR_NONE && vret != TAS_ERR_RW_READ) {
+                    if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Read failed during verify");
                     fprintf(stderr, "  ERROR: Read failed at 0x%08X\n", seg.baseAddress + offset);
                     return EXIT_WRITE_VERIFY_ERROR;
                 }
                 for (uint32_t i = 0; i < bytesRead && i < chunkLen; i++) {
                     if (readBuf[i] != seg.data[offset + i]) {
                         if (verifyErrors < 10)
-                            printf("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
+                            JPRINTF("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
                                    seg.baseAddress + offset + i, seg.data[offset + i], readBuf[i]);
                         verifyErrors++;
                     }
@@ -2056,13 +2143,25 @@ static int doUcbWrite(int argc, char** argv)
             }
         }
         if (verifyErrors > 0) {
-            printf("  FAILED: %u bytes mismatch\n", verifyErrors);
+            if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Verify failed");
+            JPRINTF("  FAILED: %u bytes mismatch\n", verifyErrors);
             return EXIT_WRITE_VERIFY_ERROR;
         }
-        printf("  PASSED: all %u bytes verified\n", totalWriteBytes);
+        JPRINTF("  PASSED: all %u bytes verified\n", totalWriteBytes);
     }
 
-    printf("\nUCB write completed successfully.\n");
+    JPRINTF("\nUCB write completed successfully.\n");
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "ucb_write";
+        j["file"] = std::string(inputFile);
+        j["total_bytes"] = totalWriteBytes;
+        j["pages"] = totalPages;
+        j["elapsed_ms"] = static_cast<long long>(totalElapsed);
+        if (doVerify) j["verified"] = true;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -2112,22 +2211,25 @@ static int doUcbErase(int argc, char** argv)
         fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
         return EXIT_USAGE_ERROR;
     }
+    g_json = args.jsonOutput;
 
-    printf("TAS Wiggle Tool - UCB Erase\n");
-    printf("===========================\n");
-    printf("WARNING: UCB erase is a HIGH-RISK operation. May permanently lock the chip.\n\n");
+    JPRINTF("TAS Wiggle Tool - UCB Erase\n");
+    JPRINTF("===========================\n");
+    JPRINTF("WARNING: UCB erase is a HIGH-RISK operation. May permanently lock the chip.\n\n");
 
     // --- Common initialization ---
     RESOLVE_CTX(ctx, "WiggleUcbErase", TAS_CLNT_DCO_RESET_AND_HALT);
 
     // Reject TC2x
     if (!ctx.flashCfg.isTc3x) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, "UCB commands only support TC3XX devices");
         fprintf(stderr, "ERROR: UCB commands only support TC3XX devices.\n");
         return EXIT_DEVICE_ERROR;
     }
 
     // Check UCB config valid
     if (ctx.flashCfg.ucb.baseAddress == 0) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, "No UCB configuration found for this device");
         fprintf(stderr, "ERROR: No UCB configuration found for this device.\n");
         return EXIT_DEVICE_ERROR;
     }
@@ -2140,6 +2242,7 @@ static int doUcbErase(int argc, char** argv)
 
     // Validate address within UCB range
     if (eraseAddr < ucb.baseAddress || eraseAddr > ucbEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address out of UCB range");
         fprintf(stderr, "ERROR: Address 0x%08X out of UCB range (0x%08X - 0x%08X)\n",
                 eraseAddr, ucb.baseAddress, ucbEndAddr);
         return EXIT_USAGE_ERROR;
@@ -2148,7 +2251,7 @@ static int doUcbErase(int argc, char** argv)
     // Auto-align address to sector boundary (sectorSize must be power of 2)
     uint32_t alignedAddr = eraseAddr & ~(ucb.sectorSize - 1);
     if (alignedAddr != eraseAddr) {
-        printf("  Address aligned: 0x%08X -> 0x%08X (%u-byte sector boundary)\n",
+        JPRINTF("  Address aligned: 0x%08X -> 0x%08X (%u-byte sector boundary)\n",
                eraseAddr, alignedAddr, ucb.sectorSize);
         eraseAddr = alignedAddr;
     }
@@ -2156,20 +2259,22 @@ static int doUcbErase(int argc, char** argv)
     // Range check
     uint64_t eraseBytesU64 = static_cast<uint64_t>(numSectors) * ucb.sectorSize;
     if (eraseBytesU64 > UINT32_MAX) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Erase size exceeds 4GB (overflow)");
         fprintf(stderr, "ERROR: Erase size exceeds 4GB (overflow)\n");
         return EXIT_USAGE_ERROR;
     }
     uint32_t eraseSize = static_cast<uint32_t>(eraseBytesU64);
     if (static_cast<uint64_t>(eraseAddr) + eraseSize - 1 > ucbEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Range exceeds UCB boundary");
         fprintf(stderr, "ERROR: Range exceeds UCB boundary (end=0x%08llX, max=0x%08X)\n",
                 static_cast<unsigned long long>(eraseAddr) + eraseSize - 1, ucbEndAddr);
         return EXIT_USAGE_ERROR;
     }
 
-    printf("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
-    printf("  UCB:    0x%08X - 0x%08X (%u bytes, %u sectors of %u bytes)\n",
+    JPRINTF("  Device: %s (%s)\n", ctx.flashCfg.deviceName.c_str(), ctx.flashCfg.family.c_str());
+    JPRINTF("  UCB:    0x%08X - 0x%08X (%u bytes, %u sectors of %u bytes)\n",
            ucb.baseAddress, ucbEndAddr, ucb.totalSize, ucb.numSectors, ucb.sectorSize);
-    printf("  Erase:  0x%08X, %u sector(s) (%u bytes)\n\n",
+    JPRINTF("  Erase:  0x%08X, %u sector(s) (%u bytes)\n\n",
            eraseAddr, numSectors, eraseSize);
 
     // --- Locked UCB regions (cannot be erased - chip-level protection) ---
@@ -2178,6 +2283,7 @@ static int doUcbErase(int argc, char** argv)
     for (const auto& locked : lockedRegions) {
         // Overlap check: !(eraseEnd < locked.start || eraseAddr > locked.end)
         if (!(eraseEnd < locked.start || eraseAddr > locked.end)) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Erase range overlaps locked region");
             fprintf(stderr, "ERROR: Erase range 0x%08X-0x%08X overlaps locked region 0x%08X-0x%08X (%s)\n",
                     eraseAddr, eraseEnd, locked.start, locked.end, locked.name);
             fprintf(stderr, "  These sectors are chip-level protected and cannot be erased.\n");
@@ -2186,70 +2292,94 @@ static int doUcbErase(int argc, char** argv)
     }
 
     // --- High-risk warning + confirmation ---
-    printf("WARNING: UCB erase is a HIGH-RISK operation!\n");
-    printf("  Erasing security-related UCB sectors may permanently lock the chip.\n");
-    printf("  Target: 0x%08X, %u sector(s)\n", eraseAddr, numSectors);
-    printf("Type 'yes' to continue: ");
-    fflush(stdout);
+    if (g_json) {
+        // Auto-confirm in JSON mode (MCP caller controls confirmation)
+        JPRINTF("  [JSON mode: auto-confirmed]\n");
+    } else {
+        printf("WARNING: UCB erase is a HIGH-RISK operation!\n");
+        printf("  Erasing security-related UCB sectors may permanently lock the chip.\n");
+        printf("  Target: 0x%08X, %u sector(s)\n", eraseAddr, numSectors);
+        printf("Type 'yes' to continue: ");
+        fflush(stdout);
 
-    char confirm[16] = {0};
-    if (!fgets(confirm, sizeof(confirm), stdin)) {
-        printf("\nAborted (no input).\n");
-        return EXIT_USAGE_ERROR;
-    }
-    // Strip trailing newline/CR
-    size_t cl = strlen(confirm);
-    while (cl > 0 && (confirm[cl - 1] == '\n' || confirm[cl - 1] == '\r')) confirm[--cl] = '\0';
-    if (strcmp(confirm, "yes") != 0) {
-        printf("Aborted by user.\n");
-        return EXIT_USAGE_ERROR;
+        char confirm[16] = {0};
+        if (!fgets(confirm, sizeof(confirm), stdin)) {
+            printf("\nAborted (no input).\n");
+            return EXIT_USAGE_ERROR;
+        }
+        // Strip trailing newline/CR
+        size_t cl = strlen(confirm);
+        while (cl > 0 && (confirm[cl - 1] == '\n' || confirm[cl - 1] == '\r')) confirm[--cl] = '\0';
+        if (strcmp(confirm, "yes") != 0) {
+            printf("Aborted by user.\n");
+            return EXIT_USAGE_ERROR;
+        }
     }
 
     // --- Erase sequence ---
     const uint64_t flashCmdBase = static_cast<uint64_t>(ctx.flashCfg.baseAddress);
 
-    printf("\nStep 1/5: Clearing flash status...                ");
+    JPRINTF("\nStep 1/5: Clearing flash status...                ");
     if (!clearFlashStatus(ctx.client, flashCmdBase)) {
-        printf("FAILED\n"); return EXIT_FLASH_STATUS_ERROR;
+        if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, "Clear status failed");
+        JPRINTF("FAILED\n"); return EXIT_FLASH_STATUS_ERROR;
     }
-    printf("OK\n");
+    JPRINTF("OK\n");
 
-    printf("Step 2/5: Executing erase command...              ");
+    JPRINTF("Step 2/5: Executing erase command...              ");
     if (!eraseMultipleSectors(ctx.client, flashCmdBase, eraseAddr, numSectors)) {
-        printf("FAILED\n"); return EXIT_ERASE_CMD_ERROR;
+        if (g_json) return jsonError(EXIT_ERASE_CMD_ERROR, "Erase command failed");
+        JPRINTF("FAILED\n"); return EXIT_ERASE_CMD_ERROR;
     }
-    printf("OK\n");
+    JPRINTF("OK\n");
 
-    printf("Step 3/5: Waiting for erase to complete...        ");
+    JPRINTF("Step 3/5: Waiting for erase to complete...        ");
     uint32_t elapsedMs = 0;
     if (!waitUnbusyD0(ctx.client, ctx.flashCfg.isTc3x, elapsedMs)) {
-        printf("TIMEOUT\n"); return EXIT_ERASE_TIMEOUT;
+        if (g_json) return jsonError(EXIT_ERASE_TIMEOUT, "Erase timeout");
+        JPRINTF("TIMEOUT\n"); return EXIT_ERASE_TIMEOUT;
     }
-    printf("OK (%u ms)\n", elapsedMs);
+    JPRINTF("OK (%u ms)\n", elapsedMs);
 
-    printf("Step 4/5: Checking error flags...                 ");
-    if (!checkEraseErrors(ctx.client, ctx.flashCfg.isTc3x)) { return EXIT_ERASE_FLAGS; }
-    printf("OK\n");
+    JPRINTF("Step 4/5: Checking error flags...                 ");
+    if (!checkFlashErrors(ctx.client, ctx.flashCfg.isTc3x)) {
+        if (g_json) return jsonError(EXIT_ERASE_FLAGS, "Error flags detected");
+        return EXIT_ERASE_FLAGS;
+    }
+    JPRINTF("OK\n");
 
-    printf("Step 5/5: Reset to read mode...                   ");
+    JPRINTF("Step 5/5: Reset to read mode...                   ");
     if (!resetToRead(ctx.client, flashCmdBase)) {
-        printf("FAILED\n"); return EXIT_FLASH_RESET_ERROR;
+        if (g_json) return jsonError(EXIT_FLASH_RESET_ERROR, "Reset to read failed");
+        JPRINTF("FAILED\n"); return EXIT_FLASH_RESET_ERROR;
     }
-    printf("OK\n");
+    JPRINTF("OK\n");
 
-    printf("\nErase complete: %u sector(s) at 0x%08X (%u ms)\n",
+    JPRINTF("\nErase complete: %u sector(s) at 0x%08X (%u ms)\n",
            numSectors, eraseAddr, elapsedMs);
 
     // --- Verify ---
     if (doVerify) {
-        printf("\nVerifying UCB erase:\n");
+        JPRINTF("\nVerifying UCB erase:\n");
         if (!verifyErase(ctx.client, eraseAddr, numSectors, ucb.sectorSize)) {
-            printf("\nUCB erase completed with verification ERRORS.\n");
+            if (g_json) return jsonError(EXIT_VERIFY_ERROR, "Erase verification failed");
+            JPRINTF("\nUCB erase completed with verification ERRORS.\n");
             return EXIT_VERIFY_ERROR;
         }
     }
 
-    printf("\nUCB erase completed successfully.\n");
+    JPRINTF("\nUCB erase completed successfully.\n");
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "ucb_erase";
+        j["address"] = eraseAddr;
+        j["sectors"] = numSectors;
+        j["total_bytes"] = eraseSize;
+        j["elapsed_ms"] = elapsedMs;
+        if (doVerify) j["verified"] = true;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -2357,14 +2487,14 @@ static int doErase(int argc, char** argv, bool legacyMode)
     uint32_t dflashEndAddr = flashCfg.baseAddress + flashCfg.totalSize - 1;
     uint32_t totalSectors = flashCfg.numSectors;
 
-    printf("  Device: %s (%s)\n", displayName, flashCfg.family.c_str());
-    printf("  DFlash: %u KB total, %u sectors, sector size %u KB\n",
+    JPRINTF("  Device: %s (%s)\n", displayName, flashCfg.family.c_str());
+    JPRINTF("  DFlash: %u KB total, %u sectors, sector size %u KB\n",
            flashCfg.totalSize / 1024, totalSectors, flashCfg.sectorSize / 1024);
-    printf("  Range:  0x%08X - 0x%08X\n", flashCfg.baseAddress, dflashEndAddr);
+    JPRINTF("  Range:  0x%08X - 0x%08X\n", flashCfg.baseAddress, dflashEndAddr);
 
     // ---- --info mode: just print info and exit ----
     if (infoOnly) {
-        printf("\nDevice info displayed. No erase performed.\n");
+        JPRINTF("\nDevice info displayed. No erase performed.\n");
         return EXIT_OK;
     }
 
@@ -2377,13 +2507,14 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // ---- Auto-align address ----
     uint32_t alignedAddr = sectorAddr & ~(flashCfg.sectorSize - 1);
     if (alignedAddr != sectorAddr) {
-        printf("  Address aligned: 0x%08X -> 0x%08X (%u KB boundary)\n",
+        JPRINTF("  Address aligned: 0x%08X -> 0x%08X (%u KB boundary)\n",
                sectorAddr, alignedAddr, flashCfg.sectorSize / 1024);
         sectorAddr = alignedAddr;
     }
 
     // ---- Validate range ----
     if (sectorAddr < flashCfg.baseAddress || sectorAddr >= flashCfg.baseAddress + flashCfg.totalSize) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address out of range");
         fprintf(stderr, "ERROR: Address 0x%08X out of range (0x%08X - 0x%08X)\n",
                sectorAddr, flashCfg.baseAddress, dflashEndAddr);
         return EXIT_USAGE_ERROR;
@@ -2391,77 +2522,94 @@ static int doErase(int argc, char** argv, bool legacyMode)
     // Overflow protection (theoretical: DFlash max 1MB, uint32_t max 4GB - always safe)
     uint64_t eraseBytesU64 = static_cast<uint64_t>(numSectors) * flashCfg.sectorSize;
     if (eraseBytesU64 > UINT32_MAX) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Erase size exceeds 4GB (overflow)");
         fprintf(stderr, "ERROR: Erase size exceeds 4GB (overflow)\n");
         return EXIT_USAGE_ERROR;
     }
     uint32_t eraseSize = static_cast<uint32_t>(eraseBytesU64);
 
     if (static_cast<uint64_t>(sectorAddr) + eraseSize - 1 > dflashEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Range exceeds DFlash boundary");
         fprintf(stderr, "ERROR: Range exceeds DFlash boundary (max 0x%08X)\n", dflashEndAddr);
         return EXIT_USAGE_ERROR;
     }
 
     // ---- Backup ----
     if (backupFile != nullptr) {
-        printf("\nBackup:\n");
-        if (!backupFlash(ctx.client, sectorAddr, eraseSize, flashCfg.sectorSize, backupFile)) return EXIT_BACKUP_ERROR;
+        JPRINTF("\nBackup:\n");
+        if (!backupFlash(ctx.client, sectorAddr, eraseSize, flashCfg.sectorSize, backupFile)) {
+            if (g_json) return jsonError(EXIT_BACKUP_ERROR, "Backup failed");
+            return EXIT_BACKUP_ERROR;
+        }
     }
 
     // ---- Print erase parameters ----
-    printf("\nErasing DFlash:\n");
-    printf("  Address:  0x%08X\n", sectorAddr);
-    printf("  Sectors:  %u (%u KB)\n\n", numSectors, eraseSize / 1024);
+    JPRINTF("\nErasing DFlash:\n");
+    JPRINTF("  Address:  0x%08X\n", sectorAddr);
+    JPRINTF("  Sectors:  %u (%u KB)\n\n", numSectors, eraseSize / 1024);
 
     // ---- Flash command base = DFlash base address (TC2x/TC3x convention) ----
     const uint64_t flashCmdBase = static_cast<uint64_t>(flashCfg.baseAddress);
 
     // ---- Step 1: Clear status ----
-    printf("Step 1/5: Clearing flash status...                ");
+    JPRINTF("Step 1/5: Clearing flash status...                ");
     if (!clearFlashStatus(ctx.client, flashCmdBase)) {
-        printf("FAILED\n"); return EXIT_FLASH_STATUS_ERROR;
+        if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, "Clear status failed");
+        JPRINTF("FAILED\n"); return EXIT_FLASH_STATUS_ERROR;
     }
-    printf("OK\n");
+    JPRINTF("OK\n");
 
     // ---- Step 2: Erase (atomic) ----
-    printf("Step 2/5: Executing erase command...              ");
+    JPRINTF("Step 2/5: Executing erase command...              ");
     if (!eraseMultipleSectors(ctx.client, flashCmdBase, sectorAddr, numSectors)) {
-        printf("FAILED\n"); return EXIT_ERASE_CMD_ERROR;
+        if (g_json) return jsonError(EXIT_ERASE_CMD_ERROR, "Erase command failed");
+        JPRINTF("FAILED\n"); return EXIT_ERASE_CMD_ERROR;
     }
-    printf("OK\n");
+    JPRINTF("OK\n");
 
     // ---- Step 3: Wait unbusy ----
-    printf("Step 3/5: Waiting for erase to complete...        ");
+    JPRINTF("Step 3/5: Waiting for erase to complete...        ");
     uint32_t elapsedMs = 0;
-    if (!waitUnbusyD0(ctx.client, flashCfg.isTc3x, elapsedMs)) { printf("TIMEOUT\n"); return EXIT_ERASE_TIMEOUT; }
-    printf("OK (%u ms)\n", elapsedMs);
+    if (!waitUnbusyD0(ctx.client, flashCfg.isTc3x, elapsedMs)) {
+        if (g_json) return jsonError(EXIT_ERASE_TIMEOUT, "Erase timeout");
+        JPRINTF("TIMEOUT\n"); return EXIT_ERASE_TIMEOUT;
+    }
+    JPRINTF("OK (%u ms)\n", elapsedMs);
 
     // ---- Step 4: Check error flags ----
-    printf("Step 4/5: Checking error flags...                 ");
-    if (!checkEraseErrors(ctx.client, flashCfg.isTc3x)) { return EXIT_ERASE_FLAGS; }
-    printf("OK\n");
+    JPRINTF("Step 4/5: Checking error flags...                 ");
+    if (!checkFlashErrors(ctx.client, flashCfg.isTc3x)) {
+        if (g_json) return jsonError(EXIT_ERASE_FLAGS, "Error flags detected");
+        return EXIT_ERASE_FLAGS;
+    }
+    JPRINTF("OK\n");
 
     // ---- Step 5: Reset to read ----
-    printf("Step 5/5: Reset to read mode...                   ");
-    if (!resetToRead(ctx.client, flashCmdBase)) { printf("FAILED\n"); return EXIT_FLASH_RESET_ERROR; }
-    printf("OK\n");
+    JPRINTF("Step 5/5: Reset to read mode...                   ");
+    if (!resetToRead(ctx.client, flashCmdBase)) {
+        if (g_json) return jsonError(EXIT_FLASH_RESET_ERROR, "Reset to read failed");
+        JPRINTF("FAILED\n"); return EXIT_FLASH_RESET_ERROR;
+    }
+    JPRINTF("OK\n");
 
     // ---- Verify ----
     if (doVerify) {
-        printf("\nVerifying erase:\n");
+        JPRINTF("\nVerifying erase:\n");
         if (!verifyErase(ctx.client, sectorAddr, numSectors, flashCfg.sectorSize)) {
-            printf("\nDFlash erase completed with verification ERRORS.\n");
+            if (g_json) return jsonError(EXIT_VERIFY_ERROR, "Erase verification failed");
+            JPRINTF("\nDFlash erase completed with verification ERRORS.\n");
             return EXIT_VERIFY_ERROR;
         }
     }
 
     // ---- Reset MCU ----
     if (doReset) {
-        printf("\nResetting MCU...\n");
+        JPRINTF("\nResetting MCU...\n");
         tas_return_et r = ctx.client.device_connect(TAS_CLNT_DCO_RESET);
         if (r != TAS_ERR_NONE) {
-            printf("  WARN: Reset failed: %s\n", ctx.client.get_error_info());
+            JPRINTF("  WARN: Reset failed: %s\n", ctx.client.get_error_info());
         } else {
-            printf("  MCU reset. Normal execution resumed.\n");
+            JPRINTF("  MCU reset. Normal execution resumed.\n");
         }
     }
 
@@ -2599,17 +2747,22 @@ static int doRewrite(int argc, char** argv)
         return EXIT_USAGE_ERROR;
     }
 
+    g_json = args.jsonOutput;
+
     // Mutual exclusion check
     if (inputFile && dataStr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--file and --data are mutually exclusive");
         fprintf(stderr, "ERROR: --file and --data are mutually exclusive\n");
         return EXIT_USAGE_ERROR;
     }
     if (!inputFile && !dataStr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Either --file or --data is required");
         fprintf(stderr, "ERROR: Either --file or --data is required\n");
         printRewriteUsage();
         return EXIT_USAGE_ERROR;
     }
     if (dataStr && !hasAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--addr is required when using --data");
         fprintf(stderr, "ERROR: --addr is required when using --data\n");
         return EXIT_USAGE_ERROR;
     }
@@ -2686,14 +2839,15 @@ static int doRewrite(int argc, char** argv)
     }
 
     if (newData.empty()) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "No data to write");
         fprintf(stderr, "ERROR: No data to write\n");
         return EXIT_USAGE_ERROR;
     }
 
     uint32_t dataLen = static_cast<uint32_t>(newData.size());
 
-    printf("TAS Wiggle Tool - Rewrite (Read-Modify-Write)\n");
-    printf("==============================================\n\n");
+    JPRINTF("TAS Wiggle Tool - Rewrite (Read-Modify-Write)\n");
+    JPRINTF("==============================================\n\n");
 
     // --- Common initialization ---
     RESOLVE_CTX(ctx, "WiggleRewrite", TAS_CLNT_DCO_RESET_AND_HALT);
@@ -2705,6 +2859,7 @@ static int doRewrite(int argc, char** argv)
     // --- Safety checks ---
     // DFlash address range check
     if (writeAddr < flashCfg.baseAddress || writeAddr > dflashEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Address out of DFlash range");
         fprintf(stderr, "ERROR: Address 0x%08X out of DFlash range (0x%08X - 0x%08X)\n",
                 writeAddr, flashCfg.baseAddress, dflashEndAddr);
         return EXIT_USAGE_ERROR;
@@ -2713,6 +2868,7 @@ static int doRewrite(int argc, char** argv)
     // Overflow protection
     uint64_t writeEndU64 = static_cast<uint64_t>(writeAddr) + dataLen;
     if (writeEndU64 - 1 > dflashEndAddr) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Write range exceeds DFlash boundary");
         fprintf(stderr, "ERROR: Write range exceeds DFlash boundary (end=0x%08llX, max=0x%08X)\n",
                 static_cast<unsigned long long>(writeEndU64 - 1), dflashEndAddr);
         return EXIT_USAGE_ERROR;
@@ -2729,6 +2885,7 @@ static int doRewrite(int argc, char** argv)
     uint32_t writeEnd = writeAddr + dataLen - 1;
     for (const auto& locked : lockedRegions) {
         if (!(writeEnd < locked.start || writeAddr > locked.end)) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "Write range overlaps locked region");
             fprintf(stderr, "ERROR: Write range 0x%08X-0x%08X overlaps locked region 0x%08X-0x%08X (%s)\n",
                     writeAddr, writeEnd, locked.start, locked.end, locked.name);
             fprintf(stderr, "  These regions are chip-level protected and cannot be modified.\n");
@@ -2738,18 +2895,18 @@ static int doRewrite(int argc, char** argv)
 
     // Large operation warning
     if (numSectors > 10) {
-        printf("  WARNING: Rewrite affects %u sectors (>10). This may take a while.\n", numSectors);
+        JPRINTF("  WARNING: Rewrite affects %u sectors (>10). This may take a while.\n", numSectors);
     }
 
     const char* displayName = args.deviceName ? args.deviceName : flashCfg.deviceName.c_str();
-    printf("  Device:  %s (%s), DFlash: %u KB\n",
+    JPRINTF("  Device:  %s (%s), DFlash: %u KB\n",
            displayName, flashCfg.family.c_str(), flashCfg.totalSize / 1024);
-    printf("  Write:   0x%08X - 0x%08X (%u bytes)\n", writeAddr, writeEnd, dataLen);
-    printf("  Sectors: 0x%08X - 0x%08X (%u sectors, %u bytes)\n\n",
+    JPRINTF("  Write:   0x%08X - 0x%08X (%u bytes)\n", writeAddr, writeEnd, dataLen);
+    JPRINTF("  Sectors: 0x%08X - 0x%08X (%u sectors, %u bytes)\n\n",
            sectorStart, sectorEnd - 1, numSectors, totalSectorBytes);
 
     // --- Step 2: Read original sector data ---
-    printf("Step 1/5: Reading %u sector(s) from 0x%08X...\n", numSectors, sectorStart);
+    JPRINTF("Step 1/5: Reading %u sector(s) from 0x%08X...\n", numSectors, sectorStart);
     std::vector<uint8_t> sectorData(totalSectorBytes, 0);
     uint32_t totalRead = 0;
     const uint32_t chunkSize = sectorSize;
@@ -2760,12 +2917,13 @@ static int doRewrite(int argc, char** argv)
         uint32_t bytesRead = 0;
         tas_return_et r = ctx.client.read(sectorStart + offset, sectorData.data() + offset, thisChunk, &bytesRead);
         if (r != TAS_ERR_NONE && r != TAS_ERR_RW_READ) {
+            if (g_json) return jsonError(EXIT_IO_ERROR, "Sector read failed");
             fprintf(stderr, "ERROR: Read failed at 0x%08X: %s\n", sectorStart + offset, ctx.client.get_error_info());
             return EXIT_IO_ERROR;
         }
         totalRead += bytesRead;
     }
-    printf("  Read %u bytes OK\n", totalRead);
+    JPRINTF("  Read %u bytes OK\n", totalRead);
 
     // --- Step 3: Optional backup ---
     if (doBackup) {
@@ -2779,23 +2937,24 @@ static int doRewrite(int argc, char** argv)
             autoBackupName = nameBuf;
             backupFilePath = autoBackupName.c_str();
         }
-        printf("\nStep 2/5: Backing up to %s...\n", backupFilePath);
+        JPRINTF("\nStep 2/5: Backing up to %s...\n", backupFilePath);
         if (!backupFlash(ctx.client, sectorStart, totalSectorBytes, sectorSize, backupFilePath)) {
+            if (g_json) return jsonError(EXIT_BACKUP_ERROR, "Backup failed");
             fprintf(stderr, "ERROR: Backup failed, aborting rewrite\n");
             return EXIT_BACKUP_ERROR;
         }
     } else {
-        printf("Step 2/5: Backup skipped (use --backup to enable)\n");
+        JPRINTF("Step 2/5: Backup skipped (use --backup to enable)\n");
     }
 
     // --- Step 4: Merge new data ---
-    printf("\nStep 3/5: Merging %u bytes at offset 0x%X...\n", dataLen, writeAddr - sectorStart);
+    JPRINTF("\nStep 3/5: Merging %u bytes at offset 0x%X...\n", dataLen, writeAddr - sectorStart);
     uint32_t mergeOffset = writeAddr - sectorStart;
     memcpy(sectorData.data() + mergeOffset, newData.data(), dataLen);
-    printf("  Merge complete\n");
+    JPRINTF("  Merge complete\n");
 
     // --- Step 5: Erase and write back ---
-    printf("\nStep 4/5: Erasing %u sector(s) at 0x%08X...\n", numSectors, sectorStart);
+    JPRINTF("\nStep 4/5: Erasing %u sector(s) at 0x%08X...\n", numSectors, sectorStart);
     if (!clearFlashStatus(ctx.client, flashCmdBase)) {
         fprintf(stderr, "ERROR: Clear flash status failed\n");
         return EXIT_FLASH_STATUS_ERROR;
@@ -2809,17 +2968,17 @@ static int doRewrite(int argc, char** argv)
         fprintf(stderr, "ERROR: Erase timeout\n");
         return EXIT_ERASE_TIMEOUT;
     }
-    if (!checkEraseErrors(ctx.client, flashCfg.isTc3x)) {
+    if (!checkFlashErrors(ctx.client, flashCfg.isTc3x)) {
         return EXIT_ERASE_FLAGS;
     }
     if (!resetToRead(ctx.client, flashCmdBase)) {
         fprintf(stderr, "ERROR: Reset to read mode failed\n");
         return EXIT_FLASH_RESET_ERROR;
     }
-    printf("  Erase completed in %u ms\n", elapsedMs);
+    JPRINTF("  Erase completed in %u ms\n", elapsedMs);
 
     // Write back merged sector data
-    printf("\nStep 5/5: Writing back %u bytes to 0x%08X...\n", totalSectorBytes, sectorStart);
+    JPRINTF("\nStep 5/5: Writing back %u bytes to 0x%08X...\n", totalSectorBytes, sectorStart);
     uint32_t totalPages = (totalSectorBytes + DFLASH_PAGE_SIZE - 1) / DFLASH_PAGE_SIZE;
     uint32_t pagesWritten = 0;
     auto startTime = std::chrono::steady_clock::now();
@@ -2829,14 +2988,14 @@ static int doRewrite(int argc, char** argv)
                                         pagesWritten, totalPages, startTime);
     if (writeResult != EXIT_OK) return writeResult;
 
-    printf("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
+    JPRINTF("\r  Progress: %u/%u pages (100%%)                    \n", totalPages, totalPages);
     auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startTime).count();
-    printf("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
+    JPRINTF("  Write completed in %lld ms\n", static_cast<long long>(totalElapsed));
 
     // --- Verify ---
     if (doVerify) {
-        printf("\nVerifying rewrite:\n");
+        JPRINTF("\nVerifying rewrite:\n");
         uint32_t verifyErrors = 0;
         std::vector<uint8_t> readBuf(chunkSize, 0);
 
@@ -2846,37 +3005,52 @@ static int doRewrite(int argc, char** argv)
             uint32_t bytesRead = 0;
             tas_return_et vret = ctx.client.read(writeAddr + offset, readBuf.data(), thisChunk, &bytesRead);
             if (vret != TAS_ERR_NONE && vret != TAS_ERR_RW_READ) {
+                if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Verify read failed");
                 fprintf(stderr, "  ERROR: Verify read failed at 0x%08X\n", writeAddr + offset);
                 return EXIT_WRITE_VERIFY_ERROR;
             }
             for (uint32_t i = 0; i < bytesRead && i < thisChunk; i++) {
                 if (readBuf[i] != newData[offset + i]) {
                     if (verifyErrors < 10)
-                        printf("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
+                        JPRINTF("  FAIL at 0x%08X: expected 0x%02X, got 0x%02X\n",
                                writeAddr + offset + i, newData[offset + i], readBuf[i]);
                     verifyErrors++;
                 }
             }
         }
         if (verifyErrors > 0) {
-            printf("  FAILED: %u bytes mismatch\n", verifyErrors);
+            if (g_json) return jsonError(EXIT_WRITE_VERIFY_ERROR, "Verification failed");
+            JPRINTF("  FAILED: %u bytes mismatch\n", verifyErrors);
             return EXIT_WRITE_VERIFY_ERROR;
         }
-        printf("  PASSED: all %u bytes verified\n", dataLen);
+        JPRINTF("  PASSED: all %u bytes verified\n", dataLen);
     }
 
     // --- Reset MCU ---
     if (doResetMcu) {
-        printf("\nResetting MCU...\n");
+        JPRINTF("\nResetting MCU...\n");
         tas_return_et r = ctx.client.device_connect(TAS_CLNT_DCO_RESET);
         if (r != TAS_ERR_NONE) {
-            printf("  WARN: Reset failed: %s\n", ctx.client.get_error_info());
+            JPRINTF("  WARN: Reset failed: %s\n", ctx.client.get_error_info());
         } else {
-            printf("  MCU reset. Normal execution resumed.\n");
+            JPRINTF("  MCU reset. Normal execution resumed.\n");
         }
     }
 
-    printf("\nDFlash rewrite completed successfully.\n");
+    JPRINTF("\nDFlash rewrite completed successfully.\n");
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "rewrite";
+        j["address"] = writeAddr;
+        j["data_bytes"] = dataLen;
+        j["sectors"] = numSectors;
+        j["sector_bytes"] = totalSectorBytes;
+        j["elapsed_ms"] = static_cast<long long>(totalElapsed);
+        if (doVerify) j["verified"] = true;
+        if (doBackup) j["backed_up"] = true;
+        return jsonOk(j);
+    }
     return EXIT_OK;
 }
 
@@ -3045,6 +3219,7 @@ static int doReg(int argc, char** argv)
     }
 
     if (!regName) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Register name or address required");
         fprintf(stderr, "ERROR: Register name or address required\n");
         return EXIT_USAGE_ERROR;
     }
@@ -3063,6 +3238,7 @@ static int doReg(int argc, char** argv)
             svdReg = ctx.svd.findByAddress(addr);
         }
     } else {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "Invalid register name or address");
         return EXIT_USAGE_ERROR;
     }
 
@@ -3070,7 +3246,10 @@ static int doReg(int argc, char** argv)
         // Write register
         uint32_t val = 0;
         try { val = static_cast<uint32_t>(std::stoul(writeVal, nullptr, 0)); }
-        catch (...) { fprintf(stderr, "ERROR: Invalid value '%s'\n", writeVal); return EXIT_USAGE_ERROR; }
+        catch (...) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, std::string("Invalid value '") + writeVal + "'");
+            fprintf(stderr, "ERROR: Invalid value '%s'\n", writeVal); return EXIT_USAGE_ERROR;
+        }
 
         tas_return_et ret = ctx.client.write32(addr, val);
         if (ret != TAS_ERR_NONE) {
@@ -3237,6 +3416,7 @@ static int doDump(int argc, char** argv)
             // Intel HEX format
             std::ofstream ofs(outStr, std::ios::binary);
             if (!ofs.is_open()) {
+                if (g_json) return jsonError(EXIT_IO_ERROR, std::string("Cannot create file '") + outFile + "'");
                 fprintf(stderr, "ERROR: Cannot create file '%s'\n", outFile);
                 return EXIT_IO_ERROR;
             }
@@ -3272,17 +3452,18 @@ static int doDump(int argc, char** argv)
             // EOF record
             ofs << ":00000001FF\r\n";
             ofs.close();
-            printf("Saved %u bytes to %s (Intel HEX)\n", bytesRead, outFile);
+            JPRINTF("Saved %u bytes to %s (Intel HEX)\n", bytesRead, outFile);
         } else {
             // Raw binary
             std::ofstream ofs(outStr, std::ios::binary);
             if (!ofs.is_open()) {
+                if (g_json) return jsonError(EXIT_IO_ERROR, std::string("Cannot create file '") + outFile + "'");
                 fprintf(stderr, "ERROR: Cannot create file '%s'\n", outFile);
                 return EXIT_IO_ERROR;
             }
             ofs.write(reinterpret_cast<const char*>(buf.data()), bytesRead);
             ofs.close();
-            printf("Saved %u bytes to %s\n", bytesRead, outFile);
+            JPRINTF("Saved %u bytes to %s\n", bytesRead, outFile);
         }
     }
 
@@ -3735,19 +3916,20 @@ static int doCompare(int argc, char** argv)
         uint32_t bytesRead = 0;
         tas_return_et ret = ctx.client.read(segAddr, flashData.data(), segLen, &bytesRead);
         if (ret != TAS_ERR_NONE) {
+            if (g_json) return jsonError(EXIT_FLASH_STATUS_ERROR, ctx.client.get_error_info());
             fprintf(stderr, "ERROR: Read failed at 0x%08llX: %s\n",
                     (unsigned long long)segAddr, ctx.client.get_error_info());
             return EXIT_FLASH_STATUS_ERROR;
         }
 
-        printf("Comparing %s with memory @ 0x%08X (%u bytes)...\n",
+        JPRINTF("Comparing %s with memory @ 0x%08X (%u bytes)...\n",
                filePath, seg.baseAddress, bytesRead);
 
         uint32_t mismatches = 0;
         for (uint32_t j = 0; j < bytesRead; ++j) {
             if (seg.data[j] != flashData[j]) {
                 if (mismatches < 20) {
-                    printf("  [0x%08llX] expected=0x%02X actual=0x%02X\n",
+                    JPRINTF("  [0x%08llX] expected=0x%02X actual=0x%02X\n",
                            (unsigned long long)(segAddr + j), seg.data[j], flashData[j]);
                 }
                 mismatches++;
@@ -3755,7 +3937,7 @@ static int doCompare(int argc, char** argv)
         }
         totalMismatches += mismatches;
         totalBytes += bytesRead;
-        if (mismatches > 20) printf("  ... (%u more mismatches)\n", mismatches - 20);
+        if (mismatches > 20) JPRINTF("  ... (%u more mismatches)\n", mismatches - 20);
     }
 
     JPRINTF("  Result: %u mismatches in %u bytes\n", totalMismatches, totalBytes);

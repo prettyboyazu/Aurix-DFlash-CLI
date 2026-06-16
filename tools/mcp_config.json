@@ -1,5 +1,5 @@
 {
-    "wiggle_exe": "D:\\wiggle_MCP\\wiggle\\wiggle.exe",
+    "wiggle_exe": null,
     "aurix_flasher_exe": null,
     "server": "localhost",
     "target": null,

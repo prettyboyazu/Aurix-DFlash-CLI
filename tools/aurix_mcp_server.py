@@ -108,6 +108,7 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
 
     candidates = [
         script_dir / name,
+        script_dir / "wiggle" / name,   # MCP deployment layout: script + wiggle/ subdir
         parent / "wiggle" / name,
         parent / "data" / name,
         parent / "AURIXFlasher" / name,
@@ -647,6 +648,141 @@ def wiggle_pflash(
 
 
 @mcp.tool()
+def wiggle_rewrite(
+    file_path: str = "",
+    address: str = "",
+    data: str = "",
+    backup: bool = False,
+    backup_path: str = "",
+    verify: bool = True,
+    reset_mcu: bool = False,
+    server: str = "",
+    target: str = "",
+    device: str = "",
+) -> str:
+    """Write to DFlash at arbitrary address using Read-Modify-Write.
+    Automatically handles sector alignment by reading, merging, erasing,
+    and writing back entire sectors.
+
+    Data source (mutually exclusive):
+      file_path: Input file (.hex or .bin)
+      data: Hex data string (e.g. 'DEADBEEF', '0102030405060708')
+
+    Args:
+        file_path: Input file path (.hex or .bin)
+        address: Start address in hex (required for .bin and data)
+        data: Hex data string (alternative to file_path)
+        backup: Backup affected sectors before rewrite
+        backup_path: Backup file path (auto-generated if empty and backup=True)
+        verify: Read back and verify after writing (default: True)
+        reset_mcu: Reset MCU after rewrite (default: False)
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    if device: cfg["device"] = device
+
+    args = ["rewrite"]
+    if file_path:
+        args += ["-f", file_path]
+    if address:
+        args += ["-a", address]
+    if data:
+        args += ["--data", data]
+    if backup:
+        args.append("--backup")
+        if backup_path:
+            args.append(backup_path)
+    if verify:
+        args.append("--verify")
+    if reset_mcu:
+        args.append("--reset")
+
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_restore(
+    file_path: str,
+    no_verify: bool = False,
+    server: str = "",
+    target: str = "",
+    device: str = "",
+) -> str:
+    """Restore DFlash from a backup file (erase + write + verify).
+    This is a destructive operation that erases the target area first.
+
+    Args:
+        file_path: Backup file to restore (.bin or .hex)
+        no_verify: Skip verification after restore (default: False)
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    if device: cfg["device"] = device
+
+    args = ["restore", "-f", file_path]
+    if no_verify:
+        args.append("--no-verify")
+
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_ucb(
+    action: str,
+    address: str = "",
+    length: str = "",
+    sectors: int = 1,
+    file_path: str = "",
+    verify: bool = False,
+    output_file: str = "",
+    server: str = "",
+    target: str = "",
+    device: str = "",
+) -> str:
+    """UCB (User Configuration Block) operations. TC3XX only.
+    WARNING: UCB write/erase are high-risk operations that may lock the device.
+
+    Args:
+        action: 'read', 'write', or 'erase'
+        address: Start address in hex (optional, defaults to UCB base)
+        length: Length in hex (for read, defaults to entire UCB)
+        sectors: Number of sectors to erase (for erase, default: 1)
+        file_path: Input file for write (.hex or .bin)
+        verify: Verify after operation (default: False)
+        output_file: Output file for read (.hex or .bin)
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    if device: cfg["device"] = device
+
+    if action not in ("read", "write", "erase"):
+        return json.dumps({"status": "error", "message": "action must be 'read', 'write', or 'erase'"})
+
+    args = ["ucb", action]
+    if address:
+        args += ["-a", address]
+    if action == "read":
+        if length:
+            args += ["-l", length]
+        if output_file:
+            args += ["-o", output_file]
+    elif action == "write":
+        if not file_path:
+            return json.dumps({"status": "error", "message": "file_path required for UCB write"})
+        args += ["-f", file_path]
+    elif action == "erase":
+        if sectors:
+            args += ["-s", str(sectors)]
+    if verify:
+        args.append("--verify")
+
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
 def wiggle_read(
     address: str,
     length: str,
@@ -701,7 +837,7 @@ def build_project(clean: bool = False) -> str:
                 # Windows batch or PowerShell scripts
                 clean_cmd = bcfg.get("clean_command", "")
                 if clean_cmd:
-                    command = clean_cmd + " && " + command
+                    command = clean_cmd + " && " + command if sys.platform != "win32" else clean_cmd + " & " + command
 
     runner = BuildRunner()
     result = runner.run(command, work_dir, timeout)
@@ -848,7 +984,7 @@ def lookup_address(address: str, source: str = "all") -> str:
         return json.dumps({"status": "error", "message": "Address required."})
 
     try:
-        addr = int(address, 16) if address.startswith("0x") else int(address, 16)
+        addr = int(address, 16)
     except ValueError:
         return json.dumps({"status": "error",
                            "message": f"Invalid hex address: {address}"})
