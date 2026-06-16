@@ -164,6 +164,15 @@ static int jsonError(int code, const std::string& msg) {
     return code;
 }
 
+// Overload: accept structured JSON data (for compare/search error results)
+static int jsonErrorData(int code, const nljson& data) {
+    nljson out = data;
+    out["status"] = "error";
+    out["code"] = code;
+    printf("%s\n", out.dump().c_str());
+    return code;
+}
+
 // Conditional printf: only prints when NOT in JSON mode
 #define JPRINTF(...) do { if (!g_json) printf(__VA_ARGS__); } while(0)
 
@@ -3952,7 +3961,7 @@ static int doCompare(int argc, char** argv)
         j["total_bytes"] = totalBytes;
         j["mismatches"] = totalMismatches;
         j["match"] = (totalMismatches == 0);
-        if (totalMismatches > 0) return jsonError(EXIT_MISMATCH_ERROR, j);
+        if (totalMismatches > 0) return jsonErrorData(EXIT_MISMATCH_ERROR, j);
         return jsonOk(j);
     }
     return (totalMismatches > 0) ? EXIT_MISMATCH_ERROR : EXIT_OK;
@@ -4055,7 +4064,7 @@ static int doSearch(int argc, char** argv)
                         j["matches"] = matchAddrs;
                         j["match_count"] = matchCount;
                         j["truncated"] = true;
-                        return jsonError(EXIT_TRUNCATED, j);
+                        return jsonErrorData(EXIT_TRUNCATED, j);
                     }
                     return EXIT_TRUNCATED;
                 }

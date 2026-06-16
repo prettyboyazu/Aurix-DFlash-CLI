@@ -730,3 +730,291 @@ mcp.wiggle_reset(halt=False)                            # 6. 恢复
 - 端到端 4 个工作流压力测试（DFlash 烧写 / 调试崩溃 / UCB 处理 / build+flash+debug 一体化）
 *评审耗时*：~90 分钟
 *评审独立性说明*：本评审**完全基于当前代码状态独立做出**，未参考任何历史评审结论
+
+
+---
+
+---
+
+# 增量评审 v3.1（基于 2026-06-16 12:06 代码状态）
+
+**评审触发**：用户在 v3 评审后做了 2 个 commit：
+- `b0de4f5` (11:21) "二轮评审修复 + MCP 工具扩展至 22 个"
+- `37c52d6` (12:06) "REVIEW.md修复 + 寄存器模糊搜索引擎"
+
+**评审时间**：2026-06-16 12:08
+**评审方式**：基于实际代码 + git diff 增量评审，**不重做静态代码评审**——只看新写/改的内容
+
+---
+
+## A. v3 Top 15 修复跟踪
+
+| v3 Top # | 项 | 状态 | 证据 |
+|---|---|---|---|
+| **P0 #1** | MCP `subprocess.run(shell=True)` → `shell=False` | ❌ **未修** | `tools/aurix_mcp_server.py` `BuildRunner.run` 仍 `shell=True`（build_analysis.py 也是） |
+| **P0 #2** | MCP 加 `wiggle_ucb_*` 三个工具 | ✅ **已修** | 新增 `wiggle_ucb(action="read|write|erase", ...)` 聚合工具（L1270-1321） |
+| **P0 #3** | MCP 加 6 个调试工具（halt/go/cpu_reg/break/step/bt） | ❌ **未修** | MCP 22 工具里**无调试控制类**（halt/go/step/break/cpu_reg/bt 都不存在） |
+| **P0 #4** | UCB 写 32 字节 record 对齐 + CONFIRMED word 校验 | ❌ **未修** | `doUcbWrite` 在 wiggle_main.cpp 仍只检查 page alignment，**无 32 字节 record / 0x55FE CONFIRMED 校验** |
+| **P0 #5** | `doList`/`doReset` 走 `initTool` + `RESOLVE_CTX` | ❌ **未修** | 仍手写 init 流程，TC4x 不拒绝，`--hot` 在 doReset 被忽略 |
+| **P1 #6** | MCP per-tool timeout | ✅ **部分修** | `wiggle_rewrite` timeout=1800s，`wiggle_restore` timeout=3600s；但**erase/erase_all 仍是默认 120s** |
+| **P1 #7** | `wiggle_search` truncated 加 `EXIT_TRUNCATED` | ⚠️ **编译能过 + 运行时 bug** | 加了 `EXIT_TRUNCATED=25`，但用 `jsonError(EXIT_TRUNCATED, j)` 调用 `nljson` 对象——详见 §B |
+| **P1 #8** | `wiggle_compare` mismatch 时 JSON 模式返 `EXIT_MISMATCH_ERROR` | ⚠️ **编译能过 + 运行时 bug** | `jsonError(EXIT_MISMATCH_ERROR, j)` 同上问题 |
+| **P1 #9** | wiggle CLI `doWrite` 默认 `--verify=true` | ✅ **已修** | `bool doVerify = true` 默认开，加 `--no-verify` flag |
+| **P1 #10** | `wiggle_poke` 加 `--dangerous` flag | ❌ **未修** | `doPoke` 仍裸写，无 SRAM/Flash 区检查 |
+| **P2 #11** | 删除 `g_haltMethod`/`g_bp[8]` 全局 | ❌ **未修** | 仍全局变量 |
+| **P2 #12** | `doUcbErase` 加 `--force` flag | ❌ **未修** | MCP `wiggle_ucb(action="erase")` **仍需 stdin 喂 "yes"**——MCP 自动化仍阻塞 |
+| **P2 #13** | MCP `wiggle_dump` 大块走 `output_file` | ❌ **未修** | `wiggle_read` / `wiggle_dump` 默认仍走 JSON hex string |
+| **P2 #14** | MCP `wiggle_pflash` 重命名为 `aurix_pflash` | ❌ **未修** | 仍叫 `wiggle_pflash` |
+| **P2 #15** | parser cache per-project 隔离 | ❌ **未修** | `_map_parser` 等仍 module-level 单例 |
+
+**修复率**：15 项中
+- **✅ 完全修 3 项**：#2（UCB 工具聚合）、#6（部分 timeout）、#9（doWrite verify 默认）
+- **⚠️ 修但有 bug 2 项**：#7 #8（运行时 type_error）
+- **❌ 未修 10 项**
+
+**TOP P0 三项（命令注入 / UCB 校验 / 调试工具）里 1 个修了（聚合 UCB 工具），2 个未动（命令注入仍是 RCE、UCB 校验仍是锁芯片风险）**
+
+---
+
+## B. [CRITICAL] `jsonError(int, const std::string&)` vs `nljson` 调用 —— **运行时 type_error 坑**
+
+**位置**：
+- `wiggle_main.cpp` L151-164 `jsonOk(const nljson&)` / `jsonError(int, const std::string&)`
+- 调用方 L3955 `return jsonError(EXIT_MISMATCH_ERROR, j);` ← `j` 是 `nljson`
+- 调用方 L4058 `return jsonError(EXIT_TRUNCATED, j);` ← `j` 是 `nljson`
+
+### B.1 编译验证
+
+`g++ -std=c++17 -Wall -Wextra` 编译 **通过**——因为 `nlohmann::basic_json` 有 `operator std::string()` 隐式转换（**仅当对象本身是 string 类型**），非 string 类型**不**有 `operator std::string()`，但有 `operator const char*()` 和 `string()` 模板成员……实际上让编译器找到了 `operator std::string()` 这个 free function。
+
+**结论**：编译能过。**但运行时跑炸**。
+
+### B.2 运行时验证（已实测）
+
+我建了一个最小复现（已删除）：
+
+```cpp
+nljson j;
+j["action"] = "ucb_write";
+return jsonError(22, j);   // 运行时炸
+```
+
+**实际输出**：
+```
+terminate called after throwing an instance of 'nlohmann::json_abi_v3_11_3::detail::type_error'
+  what():  [json.exception.type_error.302] type must be string, but is object
+Exit: 3
+```
+
+**根因**：`nljson` 是 object 类型的 JSON，调用 `operator std::string()` 时抛 `type_error.302` 异常。
+
+### B.3 触发路径
+
+**v3.1 当前代码下会触发的两条路径**：
+
+1. **`doCompare` mismatch + `--json` 模式**（L3955）：
+   ```cpp
+   nljson j;
+   j["file"] = filePath;
+   j["total_bytes"] = totalBytes;
+   j["mismatches"] = totalMismatches;
+   j["match"] = (totalMismatches == 0);
+   if (totalMismatches > 0) return jsonError(EXIT_MISMATCH_ERROR, j);  // ❌ 炸
+   return jsonOk(j);
+   ```
+   - 用户场景：`wiggle compare file.hex -a 0xAF000000 --json` 对比失败 → **抛异常，进程崩溃**
+
+2. **`doSearch` truncated + `--json` 模式**（L4058）：
+   ```cpp
+   nljson j;
+   j["address"] = addr;
+   j["length"] = length;
+   j["matches"] = matchAddrs;
+   j["match_count"] = matchCount;
+   j["truncated"] = true;
+   return jsonError(EXIT_TRUNCATED, j);  // ❌ 炸
+   ```
+   - 用户场景：`wiggle search <addr> <len> <pattern> --json` 找到 ≥1000 个 match → **抛异常，进程崩溃**
+
+### B.4 验证当前 build 状态
+
+| 文件 | 时间 |
+|---|---|
+| `wiggle_main.cpp` | 2026-06-16 12:04:47（最新修改） |
+| `build/apps/wiggle/Release/wiggle.exe` | 2026-06-16 10:20:12（**未重新编译**） |
+
+**当前部署的 wiggle.exe 不含这两个修复**——所以现在跑 `doCompare --json mismatch` 还是旧行为（`jsonOk`），不会触发新 bug。
+
+**一旦重新编译**，两个新场景立即炸。
+
+### B.5 修复方案（按推荐度）
+
+**方案 1**（推荐）：给 `jsonError` 加 nljson 重载
+```cpp
+static int jsonError(int code, const nljson& data) {
+    nljson out = data;
+    out["status"] = "error";
+    out["code"] = code;
+    printf("%s\n", out.dump().c_str());
+    return code;
+}
+```
+这样 `jsonError(EXIT_MISMATCH_ERROR, j)` 自动走新重载，把 data 复制后塞 status/code，**正常工作**。
+
+**方案 2**：调用方先 dump 成 string
+```cpp
+return jsonError(EXIT_MISMATCH_ERROR, j.dump());  // ✅ 但 message 是 string 不是 object
+```
+失去结构，message 字段是 JSON string。
+
+**方案 3**：加 `static_cast<std::string>(j.dump())` 显式转换
+等价方案 2。
+
+**建议**：用方案 1（重载），一次性解决所有类似 case。
+
+---
+
+## C. 新增 MCP 工具评审（v3 评 → v3.1 实测）
+
+### C.1 `reg_peripherals` / `reg_fields` / `reg_search` —— **A-**
+
+commit 信息提到的"寄存器模糊搜索引擎"——3 个新工具的实现：
+
+- `_tokenize()` / `_score_match()` / `_periph_relevance()` 三层打分（L665-820）
+- `MIN_SCORE = 40` 过滤噪音
+- AI-friendly 同义词表：'uart' → ASCLIN、'flash' → DMU、'timer' → GTM/CCU6
+- `reg_fields` exact match 失败时 fuzzy fallback
+- `reg_search` 综合 register + peripheral 加权
+
+**优点**：
+- **模糊匹配语义化**：`MAX(peripheral_score, register_score) + boost when both match`——是工程化搜索而非简单 substring
+- **三层兜底**：exact match → fuzzy fallback → ambiguous list（多 peripheral 时返 list 让用户 disambiguate）
+- **`status: not_found_fuzzy` 字段** + suggestions 列表——AI agent 能理解"找不到但有类似"语义
+- **`score` 字段** 透明度高——AI 看 80 分 vs 40 分就知道可信度
+
+**问题**：
+- **`_periph_relevance` 同义词表是硬编码**——'uart'/'flash'/'timer'/'gpio'/'watchdog' 等，新 peripheral 不自动支持
+- **`_score_match` 算法依赖 keyword 字符匹配**——对"含有 typo" 的 query（"ushart" → "usart"）不友好
+- **`reg_search` 不支持 description-only search**——只能搜名字+desc，不能指定搜哪一类
+
+**整体评价**：commit `37c52d6` 的核心新增，**这是 MCP 工具集最有价值的扩展之一**——把 wiggle 从"按地址读写"升级为"按语义查寄存器"。
+
+### C.2 `wiggle_rewrite` / `wiggle_restore` / `wiggle_ucb` / `wiggle_read` —— **B+**
+
+把 v3 评审里点名的"未暴露 wiggle 命令"补齐：
+
+| 工具 | 对应 wiggle CLI | 评价 |
+|---|---|---|
+| `wiggle_rewrite` | `wiggle rewrite` | ✅ timeout=1800s，加了 `backup_path` 显式参数 |
+| `wiggle_restore` | `wiggle restore` | ✅ timeout=3600s，参数对应 `--no-verify` |
+| `wiggle_ucb` | `wiggle ucb read/write/erase` | ✅ 聚合单工具，TC3x 限制写在 docstring |
+| `wiggle_read` | `wiggle read` | ✅ 之前确实缺，现补齐 |
+
+**优点**：
+- **per-tool timeout 已差异化**（write/restore 1 小时，rewrite 30 分钟），P1 #6 部分完成
+- **参数命名 snake_case**（file_path/backup_path/reset_mcu）—— Pythonic 但与 wiggle CLI 的 `--file/-f` 不完全对应，agent 调用要小心
+
+**问题**：
+- **`wiggle_ucb` 仍是聚合单工具**——3 个 action（read/write/erase）通过 `action: str` 区分，比 3 个独立工具更紧凑但 type safety 差（MCP 没有 enum 类型）
+- **`wiggle_ucb(action="erase")` 调用时仍需 stdin 喂 "yes"**——**P2 #12 未修**，MCP 自动化阻塞没解除
+- **`wiggle_ucb(action="write")` 仍接受任意文件，无 32 字节 record 对齐检查**——**P0 #4 未修**
+
+### C.3 端到端工作流状态更新
+
+| v3 §3 工作流 | v3 状态 | v3.1 状态 | 改善点 |
+|---|---|---|---|
+| 3.2.1 DFlash 烧写 | timeout 必失败 | 部分 timeout 修复（write 1h, restore 1h），但 erase 仍 120s | ⬆️ |
+| 3.2.2 调试崩溃 MCU | 6 个调试工具 0% | **仍 0%** | ❌ 未变 |
+| 3.2.3 UCB 处理 | UCB 三命令 0% | UCB 工具加，但 yes 确认阻塞 + record 校验缺失 | ⬆️/❌ |
+| 3.2.4 build+flash+debug | 调试 0% | 寄存器查询 100% 但调试控制 0% | ⬆️（查询）/❌（控制） |
+
+---
+
+## D. Build 状态警告
+
+| 文件 | 时间 | 状态 |
+|---|---|---|
+| `wiggle_main.cpp` | 2026-06-16 **12:04:47** | 最新（含 #7 #8 改动） |
+| `build/apps/wiggle/Release/wiggle.exe` | 2026-06-16 **10:20:12** | **过期 1 小时 44 分钟** |
+| `build/CMakeFiles/.../wiggle.dir/wiggle_main.cpp.obj` | **不存在** | **从未 incremental rebuild** |
+
+**结论**：两次 commit 之后**没有任何 incremental rebuild**——所有修改都没有编译验证。
+
+**风险**：
+- §B 的两个 `jsonError(nljson)` type_error 会在下次 build 后立即生效
+- 用户实测 `wiggle compare file.hex -a 0xAF000000 --json` mismatch 路径会崩
+- CI / HIL 测试如果跑 `doCompare --json mismatch` 也会崩
+
+**建议**：
+1. 先修 §B 的两个 `jsonError` 重载（方案 1）
+2. 然后 `cmake --build build --config Release` 重新编译
+3. 跑一遍 unit test 确认两个 JSON mode 路径正常
+
+---
+
+## E. v3 Top 15 更新版（v3.1 状态）
+
+| # | 项 | v3 优先级 | v3.1 状态 | 备注 |
+|---|---|---|---|---|
+| 1 | `subprocess.run(shell=True)` → `shell=False` | P0 | ❌ 未修 | 命令注入 RCE 仍在 |
+| 2 | UCB MCP 工具 | P0 | ✅ 修了（聚合） | 但 record 校验仍缺 |
+| 3 | 6 个调试工具 | P0 | ❌ 未修 | 调试工作流仍 0% |
+| 4 | UCB 32 字节 record 对齐 + CONFIRMED 校验 | P0 | ❌ 未修 | UCB 锁芯片风险 |
+| 5 | `doList`/`doReset` 走 `initTool` | P0 | ❌ 未修 | init 重复 + TC4x 不拒绝 |
+| **6** | **修 `jsonError(nljson)` type_error bug** | **NEW P0** | — | §B 详述 |
+| **7** | **rebuild + run unit test** | **NEW P0** | — | §D 详述 |
+| 8 | MCP per-tool timeout | P1 | ⬆️ 部分修 | write 1h / restore 1h；erase 仍 120s |
+| 9 | `wiggle_search` truncated 加 `EXIT_TRUNCATED` | P1 | ⚠️ 修了但有 bug | 触发 §B 问题 |
+| 10 | `wiggle_compare` mismatch JSON mode | P1 | ⚠️ 修了但有 bug | 触发 §B 问题 |
+| 11 | wiggle CLI `doWrite` 默认 verify | P1 | ✅ 修了 | 还加了 `--no-verify` flag |
+| 12 | `wiggle_poke` `--dangerous` flag | P1 | ❌ 未修 | poke 仍裸写 |
+| 13 | 删除 `g_haltMethod`/`g_bp[8]` 全局 | P2 | ❌ 未修 | |
+| 14 | `doUcbErase` `--force` flag | P2 | ❌ 未修 | MCP UCB erase 仍需喂 "yes" |
+| 15 | MCP `wiggle_dump` 大块走 `output_file` | P2 | ❌ 未修 | |
+| 16 | MCP `wiggle_pflash` → `aurix_pflash` | P2 | ❌ 未修 | |
+| 17 | parser cache per-project 隔离 | P3 | ❌ 未修 | |
+
+**新的 P0**：
+- **#6 `jsonError(nljson)` 重载**——下一次 build 后立即炸
+- **#7 rebuild + 测试**——确认 §B 修复 + 实际 build 通过
+
+---
+
+## F. 评分更新
+
+| 维度 | v3 | v3.1 | 变化 |
+|---|---|---|---|
+| wiggle 源码 | B+ | B+ | 无 |
+| wiggle 健壮性 | B+ | B | -1（jsonError 运行时 bug） |
+| MCP server 完整性 | B- | B+ | +1（UCB 工具 + reg_search 模糊搜索 + 3 个 wiggle 命令补齐） |
+| MCP server 安全 | C+ | C+ | 无 |
+| 端到端集成 | C+ | C+ | 无（修复未编译生效） |
+| **可发布状态** | N/A | **D+** | **-新维度**（两次 commit 后从未 build 验证，发布前必须重新编译 + 测试） |
+
+---
+
+## G. 一句话总结 v3.1
+
+**v3 → v3.1 改动**：
+- ✅ 加了 4 个新 MCP 工具（`reg_peripherals` / `reg_fields` / `reg_search` / `wiggle_rewrite` / `wiggle_restore` / `wiggle_ucb` / `wiggle_read`）+ 修了 doWrite 默认 verify + 加了 EXIT_TRUNCATED + 加了 doCompare JSON mismatch exit code
+- ❌ **引入 2 个运行时 type_error bug**（jsonError(nljson) 隐式转换）——下次 build 后立即炸
+- ❌ **未编译验证**——wiggle.exe 过期 1 小时 44 分钟
+- ❌ **核心安全 P0 仍 3 项未修**（命令注入 / UCB record 校验 / 调试 6 工具缺位）
+
+**建议优先级**：
+1. **立刻**：修 §B 的 `jsonError` 重载
+2. **立刻**：rebuild wiggle.exe + 跑 unit test
+3. **本周**：P0 #4（UCB record 校验）+ P0 #1（命令注入）
+4. **下周**：P0 #3（6 个调试工具）+ P0 #5（doList/doReset 走 initTool）
+
+---
+
+*评审人*：Mavis (mavis)
+*评审方法*：
+- `git log -2 --stat` + `git diff HEAD~2..HEAD -- apps/wiggle/wiggle_main.cpp`
+- 抽样读 wiggle_main.cpp 关键行（L151-164 jsonError/jsonOk / L1265-1295 doWrite / L3950-3960 doCompare / L4050-4065 doSearch / L1190-1345 MCP 新工具）
+- 通读 tools/aurix_mcp_server.py 1611 行（22 个 tool 全部梳理）
+- 编译验证：`g++ -std=c++17 -Wall -Wextra` 复现 `jsonError(nljson)` 行为
+- 运行时验证：写最小复现 + 实测 `terminate called ... type_error.302`
+*评审耗时*：~30 分钟（基于已有 v3 评审基础，增量部分快速定位）
+*对比基础*：v3 评审（2026-06-16 11:20:33）+ 2 个新 commit（b0de4f5 / 37c52d6）
