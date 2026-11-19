@@ -4226,12 +4226,26 @@ static int debugLoadElf(const DebugArgs& da)
     return EXIT_OK;
 }
 
+// 代码地址符号查找：仅区间命中才标注（避免远距前驱符号误标）；
+// PFlash 物理 0xAx 与 TASKING 链接 cached 视图 0x8x 互为别名，双视图尝试。
+static const wiggle_dbg::ElfSymbol* symFindCode(uint32_t addr, uint32_t& off)
+{
+    if (!g_elfTable.isLoaded()) return nullptr;
+    const wiggle_dbg::ElfSymbol* s = g_elfTable.findByAddr(addr, off);
+    if (s && s->size > 0 && off < s->size) return s;
+    if (addr >= 0xA0000000u && addr < 0xB0000000u) {
+        uint32_t off2 = 0;
+        const wiggle_dbg::ElfSymbol* s2 = g_elfTable.findByAddr(addr - 0x20000000u, off2);
+        if (s2 && s2->size > 0 && off2 < s2->size) { off = off2; return s2; }
+    }
+    return nullptr;
+}
+
 // 符号标注 "<name+0xOFF>"；未加载/未命中返回空串
 static std::string symAnnotate(uint32_t addr)
 {
-    if (!g_elfTable.isLoaded()) return "";
     uint32_t off = 0;
-    const wiggle_dbg::ElfSymbol* s = g_elfTable.findByAddr(addr, off);
+    const wiggle_dbg::ElfSymbol* s = symFindCode(addr, off);
     if (!s) return "";
     char buf[160];
     snprintf(buf, sizeof(buf), " <%s+0x%X>", s->name.c_str(), off);
@@ -4755,8 +4769,7 @@ static int doBt(int argc, char** argv)
             f["pc"] = frames[i].pc;
             f["csa"] = frames[i].csa;
             uint32_t off = 0;
-            const wiggle_dbg::ElfSymbol* s =
-                g_elfTable.isLoaded() ? g_elfTable.findByAddr(frames[i].pc, off) : nullptr;
+            const wiggle_dbg::ElfSymbol* s = symFindCode(frames[i].pc, off);
             if (s) { f["symbol"] = s->name; f["offset"] = off; }
             j["frames"].push_back(f);
         }

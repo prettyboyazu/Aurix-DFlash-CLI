@@ -383,17 +383,28 @@ wiggle sym name main --elf app.elf
 wiggle sym list IfxCpu --elf app.elf
 ```
 
-**Platform capability notes** (verified on TriBoard TC36x + TasServer V2.0):
+**Platform capability notes** (verified on TriBoard TC36x and real ACM TC367 PCB,
+both via TasServer V2.0):
 
-- `halt`: BRKIN and DBGSR-set-halt are unavailable on TriBoard; the tool falls
-  back to `reset-and-halt` and **warns that running context is lost**. On probes
+- `halt`: BRKIN and DBGSR-set-halt are unavailable on these probe chains; the tool
+  falls back to `reset-and-halt` and **warns that running context is lost**. On probes
   with working DBGSR halt or a connected BRKIN line, halt is non-destructive.
 - `go` / `step`: require resume. Platforms where `DBGSR.CLR_HALT` writes are
   ineffective return exit code 27 with a clear diagnostic — use `wiggle reset`
   to restart execution. The tool never silently resets to fake a resume.
+- Root cause (measured): the TAS Server/DAS chain selectively discards writes to
+  debug-control registers (DBGSR/EXEVT writes ignored, while TRiEVT in the same
+  region is writable), and keeps `DBGSR.DE=0` (CDC disabled) while running.
+  Per TriCore Vol1, HALT writes and trigger events are gated by DE, so on such
+  chains breakpoints can be programmed but never fire while running. Run-control
+  becomes fully functional on chains that enable CDC / allow DBGSR writes.
 - `cpu_reg` / `bt`: work whenever the CPU is halted (including after
   `reset --halt` or the halt fallback). Backtrace walks the CSA chain with
   cycle detection and a 64-frame cap.
+- Breakpoint addresses are execution (linker) addresses: TASKING cached-view
+  `0x8x` symbols match the executed PC; symbol annotation auto-translates
+  physical `0xAx` ↔ cached `0x8x` PFlash aliases. Note: reset clears TRiEVT,
+  so set breakpoints after reset.
 
 ---
 
