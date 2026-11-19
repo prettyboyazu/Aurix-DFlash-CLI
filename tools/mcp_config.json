@@ -5,7 +5,6 @@
     "target": null,
     "device": null,
     "timeout": 120,
-
     "build": {
         "command": null,
         "work_dir": null,
@@ -18,5 +17,6 @@
         "mdf_file": null,
         "hex_file": null,
         "toolchain": null
-    }
+    },
+    "das_home": null
 }

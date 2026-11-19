@@ -4559,6 +4559,11 @@ static nljson serveCliPassthrough(const std::vector<std::string>& args)
     WIG_DUP2(_fileno(cap), _fileno(stdout));
     std::vector<char*> argv;
     for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    // 透传统一 JSON 输出，避免 handler 重置 g_json 后多行 JSON 解析失败
+    bool hasJson = false;
+    for (const auto& a : args) if (a == "--json") hasJson = true;
+    std::string jsonFlag = "--json";
+    if (!hasJson) argv.push_back(const_cast<char*>(jsonFlag.c_str()));
     int rc = dispatchCli(static_cast<int>(argv.size()), argv.empty() ? nullptr : argv.data());
     fflush(stdout);
     WIG_DUP2(saved, _fileno(stdout));
