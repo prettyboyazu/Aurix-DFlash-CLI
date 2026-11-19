@@ -80,6 +80,10 @@ private:
     void cmdReg(const nljson& req, nljson& resp);
     void cmdVar(const nljson& req, nljson& resp);
     void cmdBt(const nljson& req, nljson& resp);
+    void cmdDisasm(const nljson& req, nljson& resp);
+    void cmdStepOver(const nljson& req, nljson& resp);
+    void cmdStepOut(const nljson& req, nljson& resp);
+    void cmdSample(const nljson& req, nljson& resp);
     void cmdSym(const nljson& req, nljson& resp);
     void cmdReset(const nljson& req, nljson& resp);
     void cmdSearch(const nljson& req, nljson& resp);

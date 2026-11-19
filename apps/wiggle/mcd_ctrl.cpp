@@ -322,6 +322,20 @@ bool run(const Session& s, std::string& err)
     return true;
 }
 
+bool stopGlobal(const Session& s, std::string& err)
+{
+    mcd_return_et rc = g_api.stop(s.core, 1);
+    if (rc != MCD_RET_ACT_NONE) { err = "stop(global): " + errDetail(s.core, rc); return false; }
+    return waitState(s, MCD_CORE_STATE_DEBUG, err);
+}
+
+bool runGlobal(const Session& s, std::string& err)
+{
+    mcd_return_et rc = g_api.run(s.core, 1);
+    if (rc != MCD_RET_ACT_NONE) { err = "run(global): " + errDetail(s.core, rc); return false; }
+    return true;
+}
+
 bool stateFull(const Session& s, uint32_t& st, uint32_t& trigId, std::string& info)
 {
     if (!s.core) return false;

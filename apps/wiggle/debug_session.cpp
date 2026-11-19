@@ -33,10 +33,25 @@
 
 #include "tricore_defs.h"
 #include "hex_parser.h"
+#include "tricore_disasm.h"
 
 namespace wiggle_dbg {
 
 DebugSession g_debug;
+
+// 地址视图归一（TC2xx/TC3xx 实战）：DSPR 0xD0 别名→0x70；PFlash cached 0x80→物理 0xA0。
+// 仅用于数据读写/反汇编；IP 断点地址保持执行视图（PC 为 cached），不归一。
+static uint64_t normData(uint64_t a)
+{
+    if ((a & 0xF0000000u) == 0xD0000000u) return a - 0x60000000u;
+    if ((a & 0xF0000000u) == 0x80000000u) return a + 0x20000000u;
+    return a;
+}
+static uint64_t normRam(uint64_t a)
+{
+    if ((a & 0xF0000000u) == 0xD0000000u) return a - 0x60000000u;
+    return a;
+}
 
 static void sleepMs(uint32_t ms)
 {
@@ -154,9 +169,10 @@ void DebugSession::cmdHaltGoStep(const nljson& req, nljson& resp)
     int cpu = req.value("cpu", 0);
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
     std::string cmd = req.value("cmd", "");
+    bool global = req.value("global", false);
     bool ok = true;
-    if (cmd == "halt") ok = wiggle_mcd::stop(mcd_, err);
-    else if (cmd == "go") ok = wiggle_mcd::run(mcd_, err);
+    if (cmd == "halt") ok = global ? wiggle_mcd::stopGlobal(mcd_, err) : wiggle_mcd::stop(mcd_, err);
+    else if (cmd == "go") ok = global ? wiggle_mcd::runGlobal(mcd_, err) : wiggle_mcd::run(mcd_, err);
     else if (cmd == "step") ok = wiggle_mcd::step(mcd_, req.value("n", 1), err);
     uint32_t st = 0, tid = 0;
     std::string info;
@@ -195,6 +211,7 @@ void DebugSession::cmdTrig(const nljson& req, nljson& resp)
             addr = s->value;
             range = s->size > 0 ? s->size - 1 : 0;
         }
+        if (cmd == "watch") addr = normRam(addr);
         uint32_t id = 0;
         if (wiggle_mcd::createTrig(mcd_, type, addr, range, id, err)) {
             trigs_.push_back({id, type, addr, range});
@@ -241,7 +258,7 @@ void DebugSession::cmdRead(const nljson& req, nljson& resp)
     std::string err;
     int cpu = req.value("cpu", 0);
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
-    uint64_t addr = req.value("addr", 0ULL);
+    uint64_t addr = normData(req.value("addr", 0ULL));
     uint32_t len = req.value("len", 0);
     if (len == 0 || len > 0x100000) {
         resp["status"] = "error"; resp["message"] = "len must be 1..100000"; return;
@@ -266,7 +283,7 @@ void DebugSession::cmdWrite(const nljson& req, nljson& resp)
     std::string err;
     int cpu = req.value("cpu", 0);
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
-    uint64_t addr = req.value("addr", 0ULL);
+    uint64_t addr = normData(req.value("addr", 0ULL));
     std::string hex = req.value("data", "");
     if (hex.size() % 2 != 0) { resp["status"] = "error"; resp["message"] = "even hex length required"; return; }
     std::vector<uint8_t> buf(hex.size() / 2);
@@ -349,7 +366,7 @@ void DebugSession::cmdVar(const nljson& req, nljson& resp)
     std::string name = req.value("name", "");
     const ElfSymbol* s = elf_.findByName(name);
     if (!s) { resp["status"] = "error"; resp["message"] = "symbol not found: " + name; return; }
-    uint64_t addr = s->value;
+    uint64_t addr = normData(s->value);
     uint32_t size = s->size ? s->size : 4;
     resp["name"] = name;
     resp["addr"] = addr;
@@ -592,6 +609,146 @@ void DebugSession::cmdInfo(const nljson& req, nljson& resp)
     } else { resp["status"] = "error"; resp["message"] = "unknown what"; }
 }
 
+void DebugSession::cmdDisasm(const nljson& req, nljson& resp)
+{
+    std::string err;
+    int cpu = req.value("cpu", 0);
+    if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    uint64_t in = req.value("addr", 0ULL);
+    uint64_t addr = normData(in);
+    uint32_t count = req.value("count", 10);
+    if (count == 0 || count > 256) count = 10;
+    std::vector<uint8_t> buf(count * 4 + 4);
+    if (!wiggle_mcd::readMem(mcd_, addr, buf.data(), count * 4, err)) {
+        if (!wiggle_mcd::readMem(mcd_, in, buf.data(), count * 4, err)) {
+            resp["status"] = "error"; resp["message"] = err; return;
+        }
+        addr = in;
+    }
+    resp["status"] = "ok";
+    resp["insns"] = nljson::array();
+    uint32_t off = 0;
+    for (uint32_t i = 0; i < count && off + 2 <= count * 4; i++) {
+        DisasmInsn d = tricoreDecode(static_cast<uint32_t>(addr + off), buf.data() + off, count * 4 - off);
+        nljson e;
+        e["addr"] = addr + off;
+        e["length"] = d.length;
+        e["mnemonic"] = d.mnemonic;
+        e["raw"] = d.raw;
+        e["is32"] = d.is32;
+        resp["insns"].push_back(e);
+        off += d.length;
+    }
+}
+
+// 等待核进入 DEBUG（step-over/out 用），超时返回 false
+static bool waitDebug(wiggle_mcd::Session& s, uint32_t timeoutMs)
+{
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        uint32_t st = 0, tid = 0;
+        std::string info;
+        if (wiggle_mcd::stateFull(s, st, tid, info) && st == MCD_CORE_STATE_DEBUG) return true;
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (ms >= timeoutMs) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+void DebugSession::cmdStepOver(const nljson& req, nljson& resp)
+{
+    std::string err;
+    int cpu = req.value("cpu", 0);
+    if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    uint32_t st = 0, tid = 0;
+    std::string info;
+    wiggle_mcd::stateFull(mcd_, st, tid, info);
+    if (st != MCD_CORE_STATE_DEBUG) { resp["status"] = "error"; resp["message"] = "halt first"; return; }
+    uint32_t pc = 0;
+    readU32(csfr(cpu, OFF_PC), pc, err);
+    uint8_t code[4];
+    if (!wiggle_mcd::readMem(mcd_, normData(pc), code, 4, err)) {
+        resp["status"] = "error"; resp["message"] = err; return;
+    }
+    DisasmInsn d = tricoreDecode(pc, code, 4);
+    uint32_t target = pc + d.length;  // call 的返回地址=PC+len，故 BP@PC+len 即 step-over
+    uint32_t id = 0;
+    if (!wiggle_mcd::createTrig(mcd_, MCD_TRIG_TYPE_IP, target, 0, id, err)) {
+        resp["status"] = "error"; resp["message"] = err; return;
+    }
+    wiggle_mcd::run(mcd_, err);
+    bool hit = waitDebug(mcd_, 2000);
+    wiggle_mcd::removeTrig(mcd_, id, err);
+    if (!hit) wiggle_mcd::stop(mcd_, err);  // 分支跳走未命中，收回控制权
+    uint32_t npc = 0;
+    readU32(csfr(cpu, OFF_PC), npc, err);
+    resp["status"] = "ok";
+    resp["pc"] = npc;
+    resp["target"] = target;
+    resp["hit"] = hit;
+    std::string sym = symAnnotate(npc);
+    if (!sym.empty()) resp["pc_symbol"] = sym;
+}
+
+void DebugSession::cmdStepOut(const nljson& req, nljson& resp)
+{
+    std::string err;
+    int cpu = req.value("cpu", 0);
+    if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    uint32_t st = 0, tid = 0;
+    std::string info;
+    wiggle_mcd::stateFull(mcd_, st, tid, info);
+    if (st != MCD_CORE_STATE_DEBUG) { resp["status"] = "error"; resp["message"] = "halt first"; return; }
+    uint32_t ra = 0;
+    readU32(csfr(cpu, OFF_A0 + 11 * 4), ra, err);  // A11=返回地址
+    uint32_t id = 0;
+    if (!wiggle_mcd::createTrig(mcd_, MCD_TRIG_TYPE_IP, ra, 0, id, err)) {
+        resp["status"] = "error"; resp["message"] = err; return;
+    }
+    wiggle_mcd::run(mcd_, err);
+    bool hit = waitDebug(mcd_, 2000);
+    wiggle_mcd::removeTrig(mcd_, id, err);
+    if (!hit) wiggle_mcd::stop(mcd_, err);
+    uint32_t npc = 0;
+    readU32(csfr(cpu, OFF_PC), npc, err);
+    resp["status"] = "ok";
+    resp["pc"] = npc;
+    resp["return_addr"] = ra;
+    resp["hit"] = hit;
+    std::string sym = symAnnotate(npc);
+    if (!sym.empty()) resp["pc_symbol"] = sym;
+}
+
+void DebugSession::cmdSample(const nljson& req, nljson& resp)
+{
+    std::string err;
+    int cpu = req.value("cpu", 0);
+    if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    uint64_t addr = normData(req.value("addr", 0ULL));
+    if (req.contains("sym")) {
+        const ElfSymbol* s = elf_.findByName(req.value("sym", ""));
+        if (!s) { resp["status"] = "error"; resp["message"] = "symbol not found"; return; }
+        addr = normData(s->value);
+    }
+    uint32_t size = req.value("size", 4);
+    if (size == 0 || size > 8) size = 4;
+    uint32_t interval = req.value("interval_ms", 100);
+    uint8_t b0[8] = {0}, b1[8] = {0};
+    if (!wiggle_mcd::readMem(mcd_, addr, b0, size, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+    if (!wiggle_mcd::readMem(mcd_, addr, b1, size, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    uint64_t v0 = 0, v1 = 0;
+    for (uint32_t i = 0; i < size; i++) { v0 |= static_cast<uint64_t>(b0[i]) << (8 * i); v1 |= static_cast<uint64_t>(b1[i]) << (8 * i); }
+    resp["status"] = "ok";
+    resp["addr"] = addr;
+    resp["value0"] = v0;
+    resp["value1"] = v1;
+    resp["delta"] = v1 - v0;
+    resp["interval_ms"] = interval;
+    resp["consistent"] = (v0 == v1);  // 撕裂读防护：双次采样一致才采信
+}
+
 bool DebugSession::dispatch(const nljson& req, nljson& resp)
 {
     std::string cmd = req.value("cmd", "");
@@ -604,6 +761,10 @@ bool DebugSession::dispatch(const nljson& req, nljson& resp)
     else if (cmd == "reg" || cmd == "cpu_reg") cmdReg(req, resp);
     else if (cmd == "var") cmdVar(req, resp);
     else if (cmd == "bt") cmdBt(req, resp);
+    else if (cmd == "disasm") cmdDisasm(req, resp);
+    else if (cmd == "stepover") cmdStepOver(req, resp);
+    else if (cmd == "stepout") cmdStepOut(req, resp);
+    else if (cmd == "sample") cmdSample(req, resp);
     else if (cmd == "sym") cmdSym(req, resp);
     else if (cmd == "reset") cmdReset(req, resp);
     else if (cmd == "search") cmdSearch(req, resp);

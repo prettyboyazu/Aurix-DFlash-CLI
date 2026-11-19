@@ -36,6 +36,8 @@ set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/mcd_ctrl.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/debug_session.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/debug_session.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tricore_disasm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tricore_disasm.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wiggle.rc"

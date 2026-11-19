@@ -4163,14 +4163,15 @@ static int runDebugReq(const nljson& req)
 
 static int doHalt(int argc, char** argv)
 {
-    DebugArgs da;
+    DebugArgs da;bool global=false;
     for (int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
-        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle halt [--cpu n] [--elf f]\n");return EXIT_OK;}
+        if(!strcmp(argv[i],"--global")){global=true;i++;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle halt [--cpu n] [--global] [--elf f]\n");return EXIT_OK;}
         fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
     g_json=da.common.jsonOutput;
     int rc=debugCheckCpu(da);if(rc)return rc;
     rc=debugLoadElf(da);if(rc)return rc;
-    nljson req;req["cmd"]="halt";req["cpu"]=da.cpu;
+    nljson req;req["cmd"]="halt";req["cpu"]=da.cpu;req["global"]=global;
     return runDebugReq(req);
 }
 
@@ -4269,6 +4270,68 @@ static int doVar(int argc, char** argv)
     rc=debugLoadElf(da);if(rc)return rc;
     nljson req;req["cmd"]="var";req["action"]=action;req["name"]=name;req["cpu"]=da.cpu;
     if(val)req["value"]=strtoull(val,nullptr,16);
+    return runDebugReq(req);
+}
+
+static int doDisasm(int argc, char** argv)
+{
+    DebugArgs da;uint64_t addr=0;bool hasAddr=false;int count=10;
+    for(int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle disasm <addr> [count] [--elf f]\n");return EXIT_OK;}
+        if(!strcmp(argv[i],"--count")&&i+1<argc){count=atoi(argv[i+1]);i+=2;continue;}
+        if(argv[i][0]=='-'){fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+        if(!hasAddr){addr=strtoull(argv[i],nullptr,16);hasAddr=true;}else count=atoi(argv[i]);
+        i++;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
+    if(!hasAddr){fprintf(stderr,"ERROR: address required\n");return EXIT_USAGE_ERROR;}
+    nljson req;req["cmd"]="disasm";req["addr"]=addr;req["count"]=count;req["cpu"]=da.cpu;
+    return runDebugReq(req);
+}
+
+static int doStepOver(int argc, char** argv)
+{
+    DebugArgs da;
+    for(int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle stepover [--elf f]\n");return EXIT_OK;}
+        fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
+    nljson req;req["cmd"]="stepover";req["cpu"]=da.cpu;
+    return runDebugReq(req);
+}
+
+static int doStepOut(int argc, char** argv)
+{
+    DebugArgs da;
+    for(int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle stepout [--elf f]\n");return EXIT_OK;}
+        fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
+    nljson req;req["cmd"]="stepout";req["cpu"]=da.cpu;
+    return runDebugReq(req);
+}
+
+static int doSample(int argc, char** argv)
+{
+    DebugArgs da;const char*sym=nullptr;uint64_t addr=0;bool hasAddr=false;int interval=100;int size=4;
+    for(int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle sample <addr|--sym name> [--interval ms] [--size n]\n");return EXIT_OK;}
+        if(!strcmp(argv[i],"--sym")&&i+1<argc){sym=argv[i+1];i+=2;continue;}
+        if(!strcmp(argv[i],"--interval")&&i+1<argc){interval=atoi(argv[i+1]);i+=2;continue;}
+        if(!strcmp(argv[i],"--size")&&i+1<argc){size=atoi(argv[i+1]);i+=2;continue;}
+        if(argv[i][0]=='-'){fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+        addr=strtoull(argv[i],nullptr,16);hasAddr=true;i++;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
+    nljson req;req["cmd"]="sample";req["cpu"]=da.cpu;req["interval_ms"]=interval;req["size"]=size;
+    if(sym)req["sym"]=sym;else if(hasAddr)req["addr"]=addr;
+    else{fprintf(stderr,"ERROR: addr or --sym required\n");return EXIT_USAGE_ERROR;}
     return runDebugReq(req);
 }
 
@@ -4371,6 +4434,10 @@ static int doShell(int argc, char** argv)
         else if (cmd == "sym") doSym(subArgc, subArgvPtr);
         else if (cmd == "watch") doWatch(subArgc, subArgvPtr);
         else if (cmd == "var") doVar(subArgc, subArgvPtr);
+        else if (cmd == "disasm") doDisasm(subArgc, subArgvPtr);
+        else if (cmd == "stepover" || cmd == "so") doStepOver(subArgc, subArgvPtr);
+        else if (cmd == "stepout" || cmd == "su") doStepOut(subArgc, subArgvPtr);
+        else if (cmd == "sample") doSample(subArgc, subArgvPtr);
         else printf("Unknown command '%s'. Type 'help' for list.\n", cmd.c_str());
         fflush(stdout);  // Ensure output is flushed to pipe for MCP integration
     }
@@ -4605,6 +4672,10 @@ static int dispatchCli(int argc, char** argv)
     if (first == "break" || first == "bp") return doBreak(argc - 1, argv + 1);
     if (first == "watch") return doWatch(argc - 1, argv + 1);
     if (first == "var") return doVar(argc - 1, argv + 1);
+    if (first == "disasm") return doDisasm(argc - 1, argv + 1);
+    if (first == "stepover" || first == "so") return doStepOver(argc - 1, argv + 1);
+    if (first == "stepout" || first == "su") return doStepOut(argc - 1, argv + 1);
+    if (first == "sample") return doSample(argc - 1, argv + 1);
     if (first == "step" || first == "s") return doStep(argc - 1, argv + 1);
     if (first == "bt" || first == "backtrace") return doBt(argc - 1, argv + 1);
     if (first == "sym") return doSym(argc - 1, argv + 1);

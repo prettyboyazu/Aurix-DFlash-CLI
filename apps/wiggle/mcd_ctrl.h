@@ -53,6 +53,9 @@ bool stateFull(const Session& s, uint32_t& st, uint32_t& trigId, std::string& in
 
 // 非破坏性 halt：stop + 轮询至 DEBUG/HALT（2s 超时）
 bool stop(const Session& s, std::string& err);
+// 全局 halt/run（所有核，多核同步）
+bool stopGlobal(const Session& s, std::string& err);
+bool runGlobal(const Session& s, std::string& err);
 // resume：run 发出即成功（watch 活跃时可能立即再命中，属正常调试行为）
 bool run(const Session& s, std::string& err);
 // 硬件单步 n 条指令 + 轮询至 DEBUG

@@ -153,6 +153,10 @@ wiggle <subcommand> [options]
 | `watch` | | Data watchpoints (read/write/rw), by address or symbol |
 | `var` | | Variable read/write by symbol name (ELF closed-loop) |
 | `step` | `s` | Single-step one instruction |
+| `stepover` | `so` | Step over (run to PC+insn_len / call return) |
+| `stepout` | `su` | Step out (run to return address A11) |
+| `disasm` | | TriCore disassembly (native C++ decoder, length HW-validated) |
+| `sample` | | Live double-sampling (torn-read protection / counter rate) |
 | `bt` | `backtrace` | Call-stack backtrace via CSA chain |
 | `sym` | | ELF symbol load/list/addr/name (native C++ parser) |
 
@@ -446,6 +450,19 @@ MCP server (Python thin wrapper: tools / risk gates / transport)
   `0x8x` symbols match the executed PC; symbol annotation auto-translates
   physical `0xAx` ↔ cached `0x8x` PFlash aliases. Reset clears triggers.
 
+**Advanced features** (from TC2xx/TC3xx field experience):
+
+- `disasm` / `stepover` / `stepout`: native C++ TriCore decoder; instruction
+  length (16/32) validated against hardware single-step. Mnemonics are a common
+  subset; uncovered opcodes render as `.hword/.word` (never misleading).
+  `stepover` on a taken branch may not hit its temp BP (`hit:false`) and re-halts.
+- `sample`: double-sampling with `consistent` flag (torn-read protection) and
+  `delta/interval_ms` for counter-rate measurement; always `reset --run` before
+  timing (a halted CPU's counters are frozen).
+- Address-view normalization for data R/W: DSPR `0xD0…`→`0x70…`, PFlash
+  `0x80…`→`0xA0…` (IP breakpoint addresses stay in execution view).
+- `halt --global` / MCP `global_halt`: multi-core synchronous stop (MCD).
+
 ---
 
 ## JSON Output Mode
@@ -545,6 +562,9 @@ unavailable.
 | `wiggle_break` | Instruction breakpoints add/del/list/clear |
 | `wiggle_watch` | Data watchpoints (read/write/rw) add/del/list/clear, by addr or symbol |
 | `wiggle_var` | Variable read/write by symbol name (ELF closed-loop) |
+| `wiggle_disasm` | TriCore disassembly (native decoder) |
+| `wiggle_stepover` / `wiggle_stepout` | Step over / out |
+| `wiggle_sample` | Live double-sampling (torn-read / rate) |
 | `wiggle_cpu_reg` | Core register read/write/dump |
 | `wiggle_bt` | Symbolized call-stack backtrace |
 | `wiggle_mem_read` | Continuous memory read (hex, up to 1 MB) |
