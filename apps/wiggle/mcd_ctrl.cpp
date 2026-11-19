@@ -99,6 +99,13 @@ bool loadDll(std::string& err)
     if (g_loaded) return true;
 
     std::vector<std::string> paths;
+    // 独立部署优先：exe 同目录的 mcdxdas.dll（随包携带），其次 DAS 安装路径
+    char exePath[MAX_PATH] = {0};
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+        std::string ep(exePath);
+        size_t slash = ep.find_last_of("\\/");
+        if (slash != std::string::npos) paths.push_back(ep.substr(0, slash) + "\\mcdxdas.dll");
+    }
     const char* dasHome = getenv("DAS_HOME");
     if (dasHome) paths.push_back(std::string(dasHome) + "/clients/mcdxdas.dll");
     paths.push_back("C:/Program Files/DAS64/clients/mcdxdas.dll");

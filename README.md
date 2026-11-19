@@ -794,6 +794,15 @@ conan install . -o python=True
 - [TAS DFlash Tool Reference](docs/tas_dflash_erase_tool.md) — complete command reference, erase sequence, register architecture, ECC handling
 - [AURIX CAN BSL Guide](docs/aurix_can_bsl_guide.md) — bootloader setup reference
 
+## Standalone deployment
+
+A self-contained bundle (no DAS/TASKING install required) can be assembled as
+`wiggle_MCP/`: `wiggle/wiggle.exe` + bundled `mcdxdas.dll` + VC runtime (loaded
+from the exe dir first), `servers/tas_server_console.exe` + `FTD2XX.dll` + VC
+runtime, `DeviceConfigs/`, `RegisterDefs/`, and the Python MCP layer. MCD is
+integrated by dynamic-loading the bundled `mcdxdas.dll`, which talks to the
+bundled TAS server over localhost:2000. See `DEPLOY.md` in the bundle.
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
