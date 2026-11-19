@@ -36,6 +36,7 @@
 #include "svd_loader.h"
 #include "debug_ctrl.h"
 #include "elf_symbols.h"
+#include "mcd_ctrl.h"
 
 #include <cstdio>
 #include <cstring>
@@ -4300,28 +4301,52 @@ static int doHalt(int argc, char** argv)
     rc = debugLoadElf(da);
     if (rc != EXIT_OK) return rc;
 
+    std::string diag;
+    std::string method;
+    std::string warning;
+    bool ok = false;
+
+    // MCD 优先（独占 access HW，关闭后 TAS 才能接入）：非破坏性 stop
+    wiggle_mcd::Session ms;
+    std::string merr;
+    if (wiggle_mcd::open(da.cpu, ms, merr)) {
+        uint32_t st = 0;
+        std::string sinfo;
+        if (wiggle_mcd::state(ms, st, sinfo) &&
+            (st == MCD_CORE_STATE_DEBUG || st == MCD_CORE_STATE_HALTED)) {
+            method = "already_halted";
+            ok = true;
+        } else if (wiggle_mcd::stop(ms, merr)) {
+            method = "mcd";
+            ok = true;
+        }
+        wiggle_mcd::close(ms);
+    }
+
     RESOLVE_CTX(ctx, "WiggleHalt", TAS_CLNT_DCO_HOT_ATTACH);
 
-    std::string diag;
-    wiggle_dbg::HaltResult r = wiggle_dbg::haltCpu(ctx.client, da.cpu, diag);
+    if (!ok && !merr.empty())
+        fprintf(stderr, "NOTE: MCD path unavailable: %s\n", merr.c_str());
+    if (!ok) {
+        wiggle_dbg::HaltResult r = wiggle_dbg::haltCpu(ctx.client, da.cpu, diag);
+        if (r == wiggle_dbg::HaltResult::Failed) {
+            if (g_json) return jsonError(EXIT_DEVICE_ERROR, diag);
+            fprintf(stderr, "ERROR: %s\n", diag.c_str());
+            return EXIT_DEVICE_ERROR;
+        }
+        switch (r) {
+            case wiggle_dbg::HaltResult::AlreadyHalted: method = "already_halted"; break;
+            case wiggle_dbg::HaltResult::HaltedBrkin:   method = "brkin"; break;
+            case wiggle_dbg::HaltResult::HaltedReset:   method = "reset"; break;
+            default: method = "dbgsr"; break;
+        }
+        if (r == wiggle_dbg::HaltResult::HaltedReset) warning = diag;
+    }
+
     uint32_t dbgsr = 0, pc = 0;
     wiggle_dbg::isHalted(ctx.client, da.cpu, dbgsr);
     ctx.client.read32(wiggle_dbg::csfr(da.cpu, wiggle_dbg::OFF_PC), &pc);
-
-    if (r == wiggle_dbg::HaltResult::Failed) {
-        if (g_json) return jsonError(EXIT_DEVICE_ERROR, diag);
-        fprintf(stderr, "ERROR: %s\n", diag.c_str());
-        return EXIT_DEVICE_ERROR;
-    }
-    const char* method = "dbgsr";
-    switch (r) {
-        case wiggle_dbg::HaltResult::AlreadyHalted: method = "already_halted"; break;
-        case wiggle_dbg::HaltResult::HaltedBrkin:   method = "brkin"; break;
-        case wiggle_dbg::HaltResult::HaltedReset:   method = "reset"; break;
-        default: break;
-    }
-    if (r == wiggle_dbg::HaltResult::HaltedReset)
-        fprintf(stderr, "WARNING: %s\n", diag.c_str());
+    if (!warning.empty()) fprintf(stderr, "WARNING: %s\n", warning.c_str());
 
     if (g_json) {
         nljson j;
@@ -4330,13 +4355,13 @@ static int doHalt(int argc, char** argv)
         j["method"] = method;
         j["dbgsr"] = dbgsr;
         j["pc"] = pc;
-        if (r == wiggle_dbg::HaltResult::HaltedReset) j["warning"] = diag;
+        if (!warning.empty()) j["warning"] = warning;
         std::string sym = symAnnotate(pc);
         if (!sym.empty()) j["pc_symbol"] = sym;
         return jsonOk(j);
     }
     printf("CPU%d halted (method: %s). DBGSR=0x%08X PC=0x%08X%s\n",
-           da.cpu, method, dbgsr, pc, symAnnotate(pc).c_str());
+           da.cpu, method.c_str(), dbgsr, pc, symAnnotate(pc).c_str());
     return EXIT_OK;
 }
 
@@ -4359,6 +4384,30 @@ static int doGo(int argc, char** argv)
     g_json = args.jsonOutput;
     int rc = debugCheckCpu(da);
     if (rc != EXIT_OK) return rc;
+
+    // MCD 优先（独占 access HW）：非破坏性 run
+    wiggle_mcd::Session ms;
+    std::string merr;
+    if (wiggle_mcd::open(da.cpu, ms, merr)) {
+        uint32_t st = 0;
+        std::string sinfo;
+        bool already = wiggle_mcd::state(ms, st, sinfo) && st == MCD_CORE_STATE_RUNNING;
+        bool rok = already || wiggle_mcd::run(ms, merr);
+        wiggle_mcd::close(ms);
+        if (rok) {
+            if (g_json) {
+                nljson j;
+                j["action"] = "go";
+                j["cpu"] = da.cpu;
+                j["method"] = "mcd";
+                j["state"] = already ? "already_running" : "running";
+                return jsonOk(j);
+            }
+            printf("CPU%d %s (via MCD).\n", da.cpu, already ? "already running" : "resumed");
+            return EXIT_OK;
+        }
+    }
+    if (!merr.empty()) fprintf(stderr, "NOTE: MCD path unavailable: %s\n", merr.c_str());
 
     RESOLVE_CTX(ctx, "WiggleGo", TAS_CLNT_DCO_HOT_ATTACH);
 
@@ -4698,6 +4747,32 @@ static int doStep(int argc, char** argv)
     if (rc != EXIT_OK) return rc;
     rc = debugLoadElf(da);
     if (rc != EXIT_OK) return rc;
+
+    // MCD 优先（独占 access HW）：硬件单步
+    wiggle_mcd::Session ms;
+    std::string merr;
+    if (wiggle_mcd::open(da.cpu, ms, merr)) {
+        bool sok = wiggle_mcd::step(ms, 1, merr);
+        wiggle_mcd::close(ms);
+        if (sok) {
+            RESOLVE_CTX(ctx, "WiggleStep", TAS_CLNT_DCO_HOT_ATTACH);
+            uint32_t pc = 0;
+            ctx.client.read32(wiggle_dbg::csfr(da.cpu, wiggle_dbg::OFF_PC), &pc);
+            if (g_json) {
+                nljson j;
+                j["action"] = "step";
+                j["cpu"] = da.cpu;
+                j["method"] = "mcd";
+                j["pc"] = pc;
+                std::string sym = symAnnotate(pc);
+                if (!sym.empty()) j["pc_symbol"] = sym;
+                return jsonOk(j);
+            }
+            printf("Stepped to PC=0x%08X%s (via MCD)\n", pc, symAnnotate(pc).c_str());
+            return EXIT_OK;
+        }
+    }
+    if (!merr.empty()) fprintf(stderr, "NOTE: MCD path unavailable: %s\n", merr.c_str());
 
     RESOLVE_CTX(ctx, "WiggleStep", TAS_CLNT_DCO_HOT_ATTACH);
     rc = debugRequireHalted(ctx.client, da.cpu);

@@ -1,0 +1,312 @@
+/*
+ *  Copyright (c) 2026 Infineon Technologies AG.
+ *
+ *  This file is part of TAS Client, an API for device access for Infineon's
+ *  automotive MCUs.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *  **************************************************************************************************************** */
+
+//********************************************************************************************************************
+//  MCD 执行控制后端实现（动态加载 mcdxdas.dll）
+//********************************************************************************************************************
+
+#include "mcd_ctrl.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+namespace wiggle_mcd {
+
+namespace {
+
+struct Api {
+    mcd_initialize_fn     initialize = nullptr;
+    mcd_exit_fn           exit = nullptr;
+    mcd_open_server_fn    open_server = nullptr;
+    mcd_close_server_fn   close_server = nullptr;
+    mcd_qry_servers_fn    qry_servers = nullptr;
+    mcd_qry_cores_fn      qry_cores = nullptr;
+    mcd_open_core_fn      open_core = nullptr;
+    mcd_close_core_fn     close_core = nullptr;
+    mcd_run_fn            run = nullptr;
+    mcd_stop_fn           stop = nullptr;
+    mcd_step_fn           step = nullptr;
+    mcd_qry_state_fn      qry_state = nullptr;
+    mcd_qry_error_info_fn qry_error_info = nullptr;
+};
+
+Api g_api;
+bool g_loaded = false;
+bool g_initialized = false;
+mcd_server_st* g_server = nullptr;
+
+constexpr uint32_t POLL_MS = 10;
+constexpr uint32_t WAIT_TIMEOUT_MS = 2000;
+
+void sleepMs(uint32_t ms)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+std::string errDetail(const mcd_core_st* core, mcd_return_et rc)
+{
+    char buf[320];
+    if (g_api.qry_error_info) {
+        mcd_error_info_st ei;
+        memset(&ei, 0, sizeof(ei));
+        if (g_api.qry_error_info(core, &ei) == MCD_RET_ACT_NONE && ei.error_str[0]) {
+            snprintf(buf, sizeof(buf), "MCD rc=0x%X: %s", (unsigned)rc, ei.error_str);
+            return buf;
+        }
+    }
+    snprintf(buf, sizeof(buf), "MCD rc=0x%X", (unsigned)rc);
+    return buf;
+}
+
+bool loadDll(std::string& err)
+{
+    if (g_loaded) return true;
+
+    std::vector<std::string> paths;
+    const char* dasHome = getenv("DAS_HOME");
+    if (dasHome) paths.push_back(std::string(dasHome) + "/clients/mcdxdas.dll");
+    paths.push_back("C:/Program Files/DAS64/clients/mcdxdas.dll");
+    paths.push_back("C:/Infineon/DAS64/clients/mcdxdas.dll");
+    paths.push_back("C:/Infineon/AURIX-Studio-1.10.32/plugins/"
+                    "com.rt.hightec.tcf.agent.launcher_1.0.56/res/mcdxdas.dll");
+    paths.push_back("mcdxdas.dll");
+
+#ifdef _WIN32
+    HMODULE h = nullptr;
+    for (const auto& p : paths) {
+        h = LoadLibraryA(p.c_str());
+        if (h) break;
+    }
+    if (!h) { err = "mcdxdas.dll not found (install DAS or set DAS_HOME)"; return false; }
+    auto sym = [&](const char* n) { return (void*)GetProcAddress(h, n); };
+#else
+    void* h = nullptr;
+    for (const auto& p : paths) {
+        h = dlopen(p.c_str(), RTLD_NOW);
+        if (h) break;
+    }
+    if (!h) { err = "mcdxdas.so not found"; return false; }
+    auto sym = [&](const char* n) { return dlsym(h, n); };
+#endif
+
+    g_api.initialize     = (mcd_initialize_fn)sym("mcd_initialize_f");
+    g_api.exit           = (mcd_exit_fn)sym("mcd_exit_f");
+    g_api.open_server    = (mcd_open_server_fn)sym("mcd_open_server_f");
+    g_api.close_server   = (mcd_close_server_fn)sym("mcd_close_server_f");
+    g_api.qry_servers    = (mcd_qry_servers_fn)sym("mcd_qry_servers_f");
+    g_api.qry_cores      = (mcd_qry_cores_fn)sym("mcd_qry_cores_f");
+    g_api.open_core      = (mcd_open_core_fn)sym("mcd_open_core_f");
+    g_api.close_core     = (mcd_close_core_fn)sym("mcd_close_core_f");
+    g_api.run            = (mcd_run_fn)sym("mcd_run_f");
+    g_api.stop           = (mcd_stop_fn)sym("mcd_stop_f");
+    g_api.step           = (mcd_step_fn)sym("mcd_step_f");
+    g_api.qry_state      = (mcd_qry_state_fn)sym("mcd_qry_state_f");
+    g_api.qry_error_info = (mcd_qry_error_info_fn)sym("mcd_qry_error_info_f");
+
+    if (!g_api.initialize || !g_api.open_server || !g_api.qry_cores || !g_api.open_core ||
+        !g_api.close_core || !g_api.run || !g_api.stop || !g_api.step || !g_api.qry_state) {
+        err = "mcdxdas.dll missing required MCD exports";
+        return false;
+    }
+    g_loaded = true;
+    return true;
+}
+
+bool waitState(const Session& s, uint32_t want, std::string& err)
+{
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        mcd_core_state_st st;
+        memset(&st, 0, sizeof(st));
+        mcd_return_et rc = g_api.qry_state(s.core, &st);
+        if (rc == MCD_RET_ACT_NONE && st.state == want) return true;
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (ms >= WAIT_TIMEOUT_MS) {
+            err = "timeout waiting for core state " + std::to_string(want);
+            return false;
+        }
+        sleepMs(POLL_MS);
+    }
+}
+
+}  // namespace
+
+bool available(std::string& err)
+{
+    if (!loadDll(err)) return false;
+    if (g_initialized) return true;
+    mcd_api_version_st req;
+    memset(&req, 0, sizeof(req));
+    req.v_api_major = 1;
+    req.v_api_minor = 1;
+    // DAS 实现校验 author 必须为 SPRINT Release（MCD API 版本标识）
+    snprintf(req.author, sizeof(req.author), "SPRINT Release");
+    mcd_impl_version_info_st impl;
+    memset(&impl, 0, sizeof(impl));
+    mcd_return_et rc = g_api.initialize(&req, &impl);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = errDetail(nullptr, rc);
+        return false;
+    }
+    g_initialized = true;
+    return true;
+}
+
+bool open(int cpu, Session& s, std::string& err)
+{
+    s.core = nullptr;
+    s.cpu = cpu;
+    if (!available(err)) return false;
+
+    if (!g_server) {
+        // 真实硬件需按 access HW 打开：枚举运行中服务器，取 acc_hw 名配置连接
+        mcd_return_et rc = MCD_RET_ACT_HANDLE_ERROR;
+        if (g_api.qry_servers) {
+            uint32_t ns = 0;
+            if (g_api.qry_servers("localhost", 1, 0, &ns, nullptr) == MCD_RET_ACT_NONE && ns > 0) {
+                std::vector<mcd_server_info_st> si(ns);
+                memset(si.data(), 0, sizeof(mcd_server_info_st) * ns);
+                uint32_t got = ns;
+                if (g_api.qry_servers("localhost", 1, 0, &got, si.data()) == MCD_RET_ACT_NONE) {
+                    for (uint32_t i = 0; i < got && !g_server; i++) {
+                        if (!si[i].acc_hw[0]) continue;
+                        char cfg[256];
+                        snprintf(cfg, sizeof(cfg), "McdAccHw=\"%s\"", si[i].acc_hw);
+                        rc = g_api.open_server("", cfg, &g_server);
+                    }
+                }
+            }
+        }
+        if (!g_server) rc = g_api.open_server("", "", &g_server);
+        if (rc != MCD_RET_ACT_NONE && !g_server) {
+            err = "open_server: " + errDetail(nullptr, rc);
+            return false;
+        }
+    }
+
+    mcd_core_con_info_st ci;
+    memset(&ci, 0, sizeof(ci));
+    uint32_t count = 0;
+    mcd_return_et rc = g_api.qry_cores(&ci, 0, &count, nullptr);
+    if (rc != MCD_RET_ACT_NONE || count == 0) {
+        err = "qry_cores: " + errDetail(nullptr, rc);
+        return false;
+    }
+    std::vector<mcd_core_con_info_st> infos(count);
+    memset(infos.data(), 0, sizeof(mcd_core_con_info_st) * count);
+    uint32_t got = count;
+    rc = g_api.qry_cores(&ci, 0, &got, infos.data());
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_cores(list): " + errDetail(nullptr, rc);
+        return false;
+    }
+
+    // 核名形如 "Core 0: CPU0 TriCore 1.6P"，按 CPU<n> 子串匹配，否则按索引
+    int sel = -1;
+    char needle[16];
+    snprintf(needle, sizeof(needle), "CPU%d", cpu);
+    for (uint32_t i = 0; i < got; i++) {
+        if (strstr(infos[i].core, needle)) { sel = (int)i; break; }
+    }
+    if (sel < 0) {
+        if (cpu < 0 || (uint32_t)cpu >= got) {
+            err = "core " + std::to_string(cpu) + " not available";
+            return false;
+        }
+        sel = cpu;
+    }
+
+    rc = g_api.open_core(&infos[sel], &s.core);
+    if (rc != MCD_RET_ACT_NONE || !s.core) {
+        err = "open_core: " + errDetail(nullptr, rc);
+        return false;
+    }
+    return true;
+}
+
+void close(Session& s)
+{
+    if (s.core && g_api.close_core) {
+        g_api.close_core(s.core);
+        s.core = nullptr;
+    }
+    // 释放 access HW 独占权，后续 TAS 连接才能接入
+    if (g_server && g_api.close_server) {
+        g_api.close_server(g_server);
+        g_server = nullptr;
+    }
+}
+
+bool state(const Session& s, uint32_t& st, std::string& info)
+{
+    if (!s.core) return false;
+    mcd_core_state_st cs;
+    memset(&cs, 0, sizeof(cs));
+    mcd_return_et rc = g_api.qry_state(s.core, &cs);
+    if (rc != MCD_RET_ACT_NONE) return false;
+    st = cs.state;
+    info = cs.stop_str[0] ? cs.stop_str : cs.info_str;
+    return true;
+}
+
+bool stop(const Session& s, std::string& err)
+{
+    uint32_t st = 0;
+    std::string info;
+    if (state(s, st, info) && (st == MCD_CORE_STATE_DEBUG || st == MCD_CORE_STATE_HALTED))
+        return true;
+    mcd_return_et rc = g_api.stop(s.core, 0);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "stop: " + errDetail(s.core, rc);
+        return false;
+    }
+    return waitState(s, MCD_CORE_STATE_DEBUG, err);
+}
+
+bool run(const Session& s, std::string& err)
+{
+    mcd_return_et rc = g_api.run(s.core, 0);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "run: " + errDetail(s.core, rc);
+        return false;
+    }
+    return waitState(s, MCD_CORE_STATE_RUNNING, err);
+}
+
+bool step(const Session& s, uint32_t n, std::string& err)
+{
+    mcd_return_et rc = g_api.step(s.core, 0, MCD_CORE_STEP_TYPE_INSTR, n);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "step: " + errDetail(s.core, rc);
+        return false;
+    }
+    return waitState(s, MCD_CORE_STATE_DEBUG, err);
+}
+
+}  // namespace wiggle_mcd

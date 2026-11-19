@@ -383,24 +383,29 @@ wiggle sym name main --elf app.elf
 wiggle sym list IfxCpu --elf app.elf
 ```
 
-**Platform capability notes** (verified on TriBoard TC36x and real ACM TC367 PCB,
-both via TasServer V2.0):
+**Execution-control backends** (probe order, first available wins):
 
-- `halt`: BRKIN and DBGSR-set-halt are unavailable on these probe chains; the tool
-  falls back to `reset-and-halt` and **warns that running context is lost**. On probes
-  with working DBGSR halt or a connected BRKIN line, halt is non-destructive.
-- `go` / `step`: require resume. Platforms where `DBGSR.CLR_HALT` writes are
-  ineffective return exit code 27 with a clear diagnostic — use `wiggle reset`
-  to restart execution. The tool never silently resets to fake a resume.
-- Root cause (measured): the TAS Server/DAS chain selectively discards writes to
-  debug-control registers (DBGSR/EXEVT writes ignored, while TRiEVT in the same
-  region is writable), and keeps `DBGSR.DE=0` (CDC disabled) while running.
-  Per TriCore Vol1, HALT writes and trigger events are gated by DE, so on such
-  chains breakpoints can be programmed but never fire while running. Run-control
-  becomes fully functional on chains that enable CDC / allow DBGSR writes.
-- `cpu_reg` / `bt`: work whenever the CPU is halted (including after
-  `reset --halt` or the halt fallback). Backtrace walks the CSA chain with
-  cycle detection and a 64-frame cap.
+1. **MCD** (`mcdxdas.dll` from the DAS installation, dynamically loaded): full
+   non-destructive `stop`/`run`/`step` via the Infineon MCD API — the same
+   interface layer used by `tricore-gdb-das`. Requires the DAS-bundled TAS
+   server (`C:\Program Files\DAS64\servers\tas_server_console.exe`); an old
+   `System32\tas_server.exe` is not discoverable by MCD. MCD owns the access HW
+   exclusively, so wiggle closes the MCD connection before attaching TAS for
+   register/memory observation. Result `method` field: `mcd`.
+2. **TAS register probe**: BRKIN user pin → DBGSR.HALT write → `reset-and-halt`
+   fallback (warns: running context lost). Resume via DBGSR.CLR_HALT; platforms
+   where the write is ineffective return exit code 27 — use `wiggle reset`.
+   The tool never silently resets to fake a resume.
+
+**Platform capability notes** (measured on TriBoard TC36x and real ACM TC367 PCB):
+
+- With the DAS64 server + MCD: non-destructive halt/resume/hardware single-step
+  all verified working; `bt` shows the live firmware call stack.
+- With the old System32 server: SRI writes to debug-control registers
+  (DBGSR/EXEVT/CBS) are discarded while TRiEVT writes pass, and `DBGSR.DE=0`
+  while running — halt degrades to reset-and-halt, resume/step report code 27.
+- `cpu_reg` / `bt`: work whenever the CPU is halted. Backtrace walks the CSA
+  chain with cycle detection and a 64-frame cap.
 - Breakpoint addresses are execution (linker) addresses: TASKING cached-view
   `0x8x` symbols match the executed PC; symbol annotation auto-translates
   physical `0xAx` ↔ cached `0x8x` PFlash aliases. Note: reset clears TRiEVT,
