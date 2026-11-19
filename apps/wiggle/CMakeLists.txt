@@ -30,13 +30,14 @@ set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/hex_parser.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/svd_loader.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/svd_loader.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/debug_ctrl.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/debug_ctrl.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tricore_defs.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/mcd_abi.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/mcd_ctrl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/mcd_ctrl.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/debug_session.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/debug_session.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wiggle.rc"
 )
 

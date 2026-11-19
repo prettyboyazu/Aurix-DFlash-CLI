@@ -27,6 +27,8 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "mcd_abi.h"
 
@@ -65,6 +67,30 @@ bool createTrig(const Session& s, uint32_t type, uint64_t addr, uint64_t range,
                 uint32_t& id, std::string& err);
 bool removeTrig(const Session& s, uint32_t id, std::string& err);
 bool trigCaptured(const Session& s, uint32_t id, bool& captured, std::string& err);
+
+// MCD 命名寄存器表（CPU Registers 组：PC/PSW/A0-A15/D0-D15/CSFR）
+struct RegInfo {
+    std::string name;
+    uint64_t addr = 0;
+    uint32_t space = 0;
+    uint32_t bits = 32;
+};
+bool regMap(const Session& s, std::vector<RegInfo>& out, std::string& err);
+bool readRegVal(const Session& s, const RegInfo& r, uint64_t& val, std::string& err);
+bool writeRegVal(const Session& s, const RegInfo& r, uint64_t val, std::string& err);
+
+// MCD 复位：classBit 0=Power-On 1=System 2=Application；rst_and_halt 可选
+bool reset(const Session& s, uint32_t classBit, bool andHalt, std::string& err);
+bool rstClasses(const Session& s, std::vector<std::pair<uint32_t, std::string>>& out, std::string& err);
+
+// 地址空间清单（实测 TC3xx 单一 "Code and Data" 空间）
+struct MemSpaceInfo {
+    uint32_t id = 0;
+    std::string name;
+    uint64_t min = 0;
+    uint64_t max = 0;
+};
+bool memSpaces(const Session& s, std::vector<MemSpaceInfo>& out, std::string& err);
 
 }  // namespace wiggle_mcd
 

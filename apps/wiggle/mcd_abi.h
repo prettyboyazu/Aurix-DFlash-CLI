@@ -196,6 +196,52 @@ typedef struct {
     mcd_bool_t count_valid;
 } mcd_trig_state_st;
 
+#define MCD_REG_NAME_LEN        32
+#define MCD_MEM_SPACE_NAME_LEN  32
+
+typedef uint32_t mcd_mem_type_et;
+typedef uint32_t mcd_endian_et;
+typedef uint32_t mcd_reg_type_et;
+
+typedef struct {
+    uint32_t   reg_group_id;
+    mcd_char_t reg_group_name[MCD_REG_NAME_LEN];
+    uint32_t   n_registers;
+} mcd_register_group_st;
+
+typedef struct {
+    mcd_addr_st      addr;
+    uint32_t         reg_group_id;
+    mcd_char_t       regname[MCD_REG_NAME_LEN];
+    uint32_t         regsize;
+    uint32_t         core_mode_mask_read;
+    uint32_t         core_mode_mask_write;
+    mcd_bool_t       has_side_effects_read;
+    mcd_bool_t       has_side_effects_write;
+    mcd_reg_type_et  reg_type;
+    uint32_t         hw_thread_id;
+} mcd_register_info_st;
+
+typedef struct {
+    uint32_t           mem_space_id;
+    mcd_char_t         mem_space_name[MCD_MEM_SPACE_NAME_LEN];
+    mcd_mem_type_et    mem_type;
+    uint32_t           bits_per_mau;
+    uint8_t            invariance;
+    mcd_endian_et      endian;
+    uint64_t           min_addr;
+    uint64_t           max_addr;
+    uint32_t           num_mem_blocks;
+    mcd_tx_access_opt_et supported_access_options;
+    uint32_t           core_mode_mask_read;
+    uint32_t           core_mode_mask_write;
+} mcd_memspace_st;
+
+typedef struct {
+    uint32_t   class_vector;
+    mcd_char_t info_str[MCD_INFO_STR_LEN];
+} mcd_rst_info_st;
+
 // 动态加载函数指针类型（mcdxdas.dll 导出，_f 后缀）
 typedef mcd_return_et (*mcd_initialize_fn)(const mcd_api_version_st*, mcd_impl_version_info_st*);
 typedef void        (*mcd_exit_fn)(void);
@@ -215,5 +261,11 @@ typedef mcd_return_et (*mcd_create_trig_fn)(const mcd_core_st*, void*, uint32_t*
 typedef mcd_return_et (*mcd_remove_trig_fn)(const mcd_core_st*, uint32_t);
 typedef mcd_return_et (*mcd_activate_trig_set_fn)(const mcd_core_st*);
 typedef mcd_return_et (*mcd_qry_trig_state_fn)(const mcd_core_st*, uint32_t, mcd_trig_state_st*);
+typedef mcd_return_et (*mcd_qry_reg_groups_fn)(const mcd_core_st*, uint32_t, uint32_t*, mcd_register_group_st*);
+typedef mcd_return_et (*mcd_qry_reg_map_fn)(const mcd_core_st*, uint32_t, uint32_t, uint32_t*, mcd_register_info_st*);
+typedef mcd_return_et (*mcd_qry_mem_spaces_fn)(const mcd_core_st*, uint32_t, uint32_t*, mcd_memspace_st*);
+typedef mcd_return_et (*mcd_qry_rst_classes_fn)(const mcd_core_st*, uint32_t*);
+typedef mcd_return_et (*mcd_qry_rst_class_info_fn)(const mcd_core_st*, uint8_t, mcd_rst_info_st*);
+typedef mcd_return_et (*mcd_rst_fn)(const mcd_core_st*, uint32_t, mcd_bool_t);
 
 #endif  // WIGGLE_MCD_ABI_H

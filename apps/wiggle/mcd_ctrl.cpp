@@ -58,6 +58,12 @@ struct Api {
     mcd_remove_trig_fn    remove_trig = nullptr;
     mcd_activate_trig_set_fn activate_trig_set = nullptr;
     mcd_qry_trig_state_fn qry_trig_state = nullptr;
+    mcd_qry_reg_groups_fn qry_reg_groups = nullptr;
+    mcd_qry_reg_map_fn    qry_reg_map = nullptr;
+    mcd_qry_mem_spaces_fn qry_mem_spaces = nullptr;
+    mcd_qry_rst_classes_fn qry_rst_classes = nullptr;
+    mcd_qry_rst_class_info_fn qry_rst_class_info = nullptr;
+    mcd_rst_fn            rst = nullptr;
 };
 
 Api g_api;
@@ -137,6 +143,12 @@ bool loadDll(std::string& err)
     g_api.remove_trig    = (mcd_remove_trig_fn)sym("mcd_remove_trig_f");
     g_api.activate_trig_set = (mcd_activate_trig_set_fn)sym("mcd_activate_trig_set_f");
     g_api.qry_trig_state = (mcd_qry_trig_state_fn)sym("mcd_qry_trig_state_f");
+    g_api.qry_reg_groups = (mcd_qry_reg_groups_fn)sym("mcd_qry_reg_groups_f");
+    g_api.qry_reg_map    = (mcd_qry_reg_map_fn)sym("mcd_qry_reg_map_f");
+    g_api.qry_mem_spaces = (mcd_qry_mem_spaces_fn)sym("mcd_qry_mem_spaces_f");
+    g_api.qry_rst_classes = (mcd_qry_rst_classes_fn)sym("mcd_qry_rst_classes_f");
+    g_api.qry_rst_class_info = (mcd_qry_rst_class_info_fn)sym("mcd_qry_rst_class_info_f");
+    g_api.rst            = (mcd_rst_fn)sym("mcd_rst_f");
 
     if (!g_api.initialize || !g_api.open_server || !g_api.qry_cores || !g_api.open_core ||
         !g_api.close_core || !g_api.run || !g_api.stop || !g_api.step || !g_api.qry_state) {
@@ -430,6 +442,161 @@ bool step(const Session& s, uint32_t n, std::string& err)
         return false;
     }
     return waitState(s, MCD_CORE_STATE_DEBUG, err);
+}
+
+bool regMap(const Session& s, std::vector<RegInfo>& out, std::string& err)
+{
+    out.clear();
+    if (!s.core || !g_api.qry_reg_groups || !g_api.qry_reg_map) {
+        err = "MCD reg map unavailable";
+        return false;
+    }
+    uint32_t ng = 0;
+    mcd_return_et rc = g_api.qry_reg_groups(s.core, 0, &ng, nullptr);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_reg_groups: " + errDetail(s.core, rc);
+        return false;
+    }
+    std::vector<mcd_register_group_st> groups(ng);
+    uint32_t got = ng;
+    rc = g_api.qry_reg_groups(s.core, 0, &got, groups.data());
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_reg_groups(list): " + errDetail(s.core, rc);
+        return false;
+    }
+    for (uint32_t i = 0; i < got; i++) {
+        uint32_t nr = 0;
+        rc = g_api.qry_reg_map(s.core, groups[i].reg_group_id, 0, &nr, nullptr);
+        if (rc != MCD_RET_ACT_NONE) continue;
+        std::vector<mcd_register_info_st> regs(nr);
+        uint32_t rg = nr;
+        rc = g_api.qry_reg_map(s.core, groups[i].reg_group_id, 0, &rg, regs.data());
+        if (rc != MCD_RET_ACT_NONE) continue;
+        for (uint32_t k = 0; k < rg; k++) {
+            RegInfo e;
+            e.name = regs[k].regname;
+            e.addr = regs[k].addr.address;
+            e.space = regs[k].addr.mem_space_id;
+            e.bits = regs[k].regsize;
+            out.push_back(std::move(e));
+        }
+    }
+    return true;
+}
+
+bool readRegVal(const Session& s, const RegInfo& r, uint64_t& val, std::string& err)
+{
+    uint32_t bytes = (r.bits + 7) / 8;
+    if (bytes == 0 || bytes > 8) { err = "unsupported register width"; return false; }
+    uint8_t buf[8] = {0};
+    mcd_tx_st tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.addr.address = r.addr;
+    tx.addr.mem_space_id = r.space;
+    tx.access_type = MCD_TX_AT_R;
+    tx.access_width = 1;
+    tx.data = buf;
+    tx.num_bytes = bytes;
+    mcd_txlist_st tl;
+    tl.tx = &tx;
+    tl.num_tx = 1;
+    tl.num_tx_ok = 0;
+    mcd_return_et rc = g_api.execute_txlist(s.core, &tl);
+    if (rc != MCD_RET_ACT_NONE || tx.num_bytes_ok != bytes) {
+        err = "readReg: " + errDetail(s.core, rc);
+        return false;
+    }
+    val = 0;
+    for (uint32_t i = 0; i < bytes; i++) val |= static_cast<uint64_t>(buf[i]) << (8 * i);
+    return true;
+}
+
+bool writeRegVal(const Session& s, const RegInfo& r, uint64_t val, std::string& err)
+{
+    uint32_t bytes = (r.bits + 7) / 8;
+    if (bytes == 0 || bytes > 8) { err = "unsupported register width"; return false; }
+    uint8_t buf[8];
+    for (uint32_t i = 0; i < bytes; i++) buf[i] = static_cast<uint8_t>(val >> (8 * i));
+    mcd_tx_st tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.addr.address = r.addr;
+    tx.addr.mem_space_id = r.space;
+    tx.access_type = MCD_TX_AT_W;
+    tx.access_width = 1;
+    tx.data = buf;
+    tx.num_bytes = bytes;
+    mcd_txlist_st tl;
+    tl.tx = &tx;
+    tl.num_tx = 1;
+    tl.num_tx_ok = 0;
+    mcd_return_et rc = g_api.execute_txlist(s.core, &tl);
+    if (rc != MCD_RET_ACT_NONE || tx.num_bytes_ok != bytes) {
+        err = "writeReg: " + errDetail(s.core, rc);
+        return false;
+    }
+    return true;
+}
+
+bool reset(const Session& s, uint32_t classBit, bool andHalt, std::string& err)
+{
+    if (!s.core || !g_api.rst) { err = "MCD reset unavailable"; return false; }
+    mcd_return_et rc = g_api.rst(s.core, 1u << classBit, andHalt ? 1 : 0);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "rst: " + errDetail(s.core, rc);
+        return false;
+    }
+    return true;
+}
+
+bool rstClasses(const Session& s, std::vector<std::pair<uint32_t, std::string>>& out, std::string& err)
+{
+    out.clear();
+    if (!s.core || !g_api.qry_rst_classes) { err = "MCD rst classes unavailable"; return false; }
+    uint32_t vec = 0;
+    mcd_return_et rc = g_api.qry_rst_classes(s.core, &vec);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_rst_classes: " + errDetail(s.core, rc);
+        return false;
+    }
+    for (uint32_t b = 0; b < 32; b++) {
+        if (!(vec & (1u << b))) continue;
+        mcd_rst_info_st info;
+        memset(&info, 0, sizeof(info));
+        if (g_api.qry_rst_class_info &&
+            g_api.qry_rst_class_info(s.core, static_cast<uint8_t>(b), &info) == MCD_RET_ACT_NONE)
+            out.emplace_back(b, info.info_str);
+        else
+            out.emplace_back(b, "");
+    }
+    return true;
+}
+
+bool memSpaces(const Session& s, std::vector<MemSpaceInfo>& out, std::string& err)
+{
+    out.clear();
+    if (!s.core || !g_api.qry_mem_spaces) { err = "MCD mem spaces unavailable"; return false; }
+    uint32_t ns = 0;
+    mcd_return_et rc = g_api.qry_mem_spaces(s.core, 0, &ns, nullptr);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_mem_spaces: " + errDetail(s.core, rc);
+        return false;
+    }
+    std::vector<mcd_memspace_st> sp(ns);
+    uint32_t got = ns;
+    rc = g_api.qry_mem_spaces(s.core, 0, &got, sp.data());
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_mem_spaces(list): " + errDetail(s.core, rc);
+        return false;
+    }
+    for (uint32_t i = 0; i < got; i++) {
+        MemSpaceInfo e;
+        e.id = sp[i].mem_space_id;
+        e.name = sp[i].mem_space_name;
+        e.min = sp[i].min_addr;
+        e.max = sp[i].max_addr;
+        out.push_back(std::move(e));
+    }
+    return true;
 }
 
 }  // namespace wiggle_mcd

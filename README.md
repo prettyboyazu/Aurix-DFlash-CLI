@@ -146,7 +146,7 @@ wiggle <subcommand> [options]
 | `compare` | | Compare local file with Flash content |
 | `search` | | Search memory for byte pattern |
 | `shell` | | Interactive REPL mode |
-| `halt` | | Halt CPU (BRKIN → DBGSR → reset-and-halt probe) |
+| `halt` | | Halt CPU (MCD, non-destructive) |
 | `go` | `resume` | Resume CPU execution |
 | `cpu_reg` | `cr` | Read/write core registers (PC/PSW/A0-A15/D0-D15) |
 | `break` | `bp` | Hardware breakpoints: add/del/list/clear (8 slots) |
@@ -358,7 +358,7 @@ All debugger commands accept `--cpu <n>` (default 0) and `--elf <file>` for symb
 annotation. They connect with HOT_ATTACH by default (non-intrusive).
 
 ```bash
-# Halt CPU (probe: BRKIN -> DBGSR -> reset-and-halt fallback with warning)
+# Halt CPU (MCD, non-destructive; preserves running context)
 wiggle halt
 
 # Core registers (requires halted CPU)
@@ -403,33 +403,39 @@ the MCP tools `wiggle_watch` / `wiggle_mem_read` / `wiggle_mem_write` /
 {"cmd":"cli","args":["erase","--all","--verify"]}   // TAS backend passthrough
 ```
 
-**Execution-control backends** (probe order, first available wins):
+**Architecture — clear backend split** (debug = MCD only, flash = TAS only):
 
-1. **MCD** (`mcdxdas.dll` from the DAS installation, dynamically loaded): full
-   non-destructive `stop`/`run`/`step` via the Infineon MCD API — the same
-   interface layer used by `tricore-gdb-das`. Requires the DAS-bundled TAS
-   server (`C:\Program Files\DAS64\servers\tas_server_console.exe`); an old
-   `System32\tas_server.exe` is not discoverable by MCD. MCD owns the access HW
-   exclusively, so wiggle closes the MCD connection before attaching TAS for
-   register/memory observation. Result `method` field: `mcd`.
-2. **TAS register probe**: BRKIN user pin → DBGSR.HALT write → `reset-and-halt`
-   fallback (warns: running context lost). Resume via DBGSR.CLR_HALT; platforms
-   where the write is ineffective return exit code 27 — use `wiggle reset`.
-   The tool never silently resets to fake a resume.
+```
+MCP server (Python thin wrapper: tools / risk gates / transport)
+  └─ wiggle serve / CLI  (command layer: arg parsing, output, backend orchestration)
+       ├─ debug_session  (debug backend: halt/go/step/break/watch/regs/mem/bt/reset/symbols)
+       │    └─ mcd_ctrl  (MCD API primitives) ─ mcd_abi (official ABI)
+       ├─ TAS            (flash erase/write/rewrite/restore/ucb + list/status/info/reg-SVD)
+       └─ tricore_defs   (pure register/CSA layout constants, shared)
+            elf_symbols / hex_parser / svd_loader / device_config_loader (pure parsers)
+```
+
+- **Debug backend = MCD** (`mcdxdas.dll`, dynamically loaded; the same interface
+  layer as `tricore-gdb-das`). Non-destructive `stop`/`run`/`step`, named-register
+  map, txlist memory R/W, IP/read/write triggers, reset classes. Requires the
+  DAS-bundled TAS server (`C:\Program Files\DAS64\servers\tas_server_console.exe`);
+  an old `System32\tas_server.exe` is not discoverable by MCD. If MCD is
+  unavailable, debug commands return an error (they never silently reset).
+- **Flash / diagnostics backend = TAS**. MCD owns the access HW exclusively, so
+  before a TAS flash op the session closes MCD, then re-opens it lazily after.
+- The duplicated TAS debug-control code (BRKIN/DBGSR probes, TRiEVT breakpoints,
+  TAS core-reg/backtrace) was **removed**; MCD is the single debug path.
 
 **Platform capability notes** (measured on TriBoard TC36x and real ACM TC367 PCB):
 
-- With the DAS64 server + MCD: non-destructive halt/resume/hardware single-step
-  all verified working; `bt` shows the live firmware call stack.
-- With the old System32 server: SRI writes to debug-control registers
-  (DBGSR/EXEVT/CBS) are discarded while TRiEVT writes pass, and `DBGSR.DE=0`
-  while running — halt degrades to reset-and-halt, resume/step report code 27.
+- DAS64 server + MCD: non-destructive halt/resume/hardware single-step, data
+  watchpoints, named registers, continuous memory reads all verified working;
+  `bt` shows the live firmware call stack.
 - `cpu_reg` / `bt`: work whenever the CPU is halted. Backtrace walks the CSA
   chain with cycle detection and a 64-frame cap.
-- Breakpoint addresses are execution (linker) addresses: TASKING cached-view
+- Breakpoint/watch addresses are execution (linker) addresses: TASKING cached-view
   `0x8x` symbols match the executed PC; symbol annotation auto-translates
-  physical `0xAx` ↔ cached `0x8x` PFlash aliases. Note: reset clears TRiEVT,
-  so set breakpoints after reset.
+  physical `0xAx` ↔ cached `0x8x` PFlash aliases. Reset clears triggers.
 
 ---
 

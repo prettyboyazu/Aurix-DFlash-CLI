@@ -18,20 +18,17 @@
  *  **************************************************************************************************************** */
 
 //********************************************************************************************************************
-//  wiggle 通用调试器原语层：执行控制 / CPU 寄存器 / 硬件断点 / 单步 / 回溯
+//  TriCore 调试寄存器/CSA 布局纯定义（无 IO），MCD 与 TAS 后端共享
 //  寄存器偏移与位域经 TC3xx RegisterDefs JSON 与 TriCore Vol1 §12 三方交叉验证。
 //  平台约束：TriBoard 等DBGSR.CLR_HALT 写入无效的平台，resume 返回 NotSupported，
 //  由调用方明确报错，禁止静默复位掩盖能力缺失。
 //********************************************************************************************************************
 
-#ifndef WIGGLE_DEBUG_CTRL_H
-#define WIGGLE_DEBUG_CTRL_H
+#ifndef WIGGLE_TRICORE_DEFS_H
+#define WIGGLE_TRICORE_DEFS_H
 
 #include <cstdint>
-#include <string>
-#include <vector>
 
-#include "tas_client_rw.h"
 
 namespace wiggle_dbg {
 
@@ -85,57 +82,21 @@ constexpr uint32_t HALT_POLL_MS   = 10u;    // halt 生效等待轮询间隔 ms
 constexpr uint32_t STEP_TIMEOUT_MS = 2000u; // 单步临时断点等待上限 ms
 constexpr uint32_t BT_MAX_FRAMES  = 64u;    // 回溯深度上限（防 CSA 链异常）
 
-enum class HaltResult { AlreadyHalted, HaltedBrkin, HaltedDbgsr, HaltedReset, Failed };
-enum class ResumeResult { Running, AlreadyRunning, NotSupported, Failed };
-
-struct CoreRegs {
-    uint32_t pc = 0;
-    uint32_t psw = 0;
-    uint32_t pcxi = 0;
-    uint32_t a[16] = {0};
-    uint32_t d[16] = {0};
-};
-
-struct BpSlot {
-    uint32_t evt = 0;
-    uint32_t adr = 0;
-};
-
-struct BtFrame {
-    uint32_t pc = 0;
-    uint32_t csa = 0;      // 该帧返回地址来源 CSA（0=当前帧）
-    bool upper = true;
-};
-
 inline uint64_t csfr(int cpu, uint32_t off)
 {
     return static_cast<uint64_t>(CPU_CSFR_BASE[cpu]) + off;
 }
 
 // 链接字 → CSA 有效地址；null 链接返回 0
-uint32_t csaAddrFromLink(uint32_t link);
-
-bool isHalted(CTasClientRw& client, int cpu, uint32_t& dbgsr);
-
-// 三级降级 halt：BRKIN → DBGSR → RESET_AND_HALT；diag 输出降级警告/失败原因
-HaltResult haltCpu(CTasClientRw& client, int cpu, std::string& diag);
-
-// resume：释放 BRKIN + 清 HALT；平台不支持时返回 NotSupported（不静默复位）
-ResumeResult resumeCpu(CTasClientRw& client, int cpu, std::string& diag);
-
-bool readCoreRegs(CTasClientRw& client, int cpu, CoreRegs& out);
-
-bool bpReadAll(CTasClientRw& client, int cpu, BpSlot slots[BP_COUNT]);
-int  bpAdd(CTasClientRw& client, int cpu, uint32_t addr);  // 返回槽号，-1=无空槽/写失败
-bool bpDel(CTasClientRw& client, int cpu, int slot);
-void bpClear(CTasClientRw& client, int cpu);
-
-// 单步：PC+2/PC+4 双临时断点 + resume + 等 halt；失败时 diag 说明原因并清理断点
-bool stepOnce(CTasClientRw& client, int cpu, uint32_t& newPc, std::string& diag);
-
-// CSA 链回溯：当前 PC → live A11 → 逐级 CSA 的 RA；循环检测 + 深度上限
-bool backtrace(CTasClientRw& client, int cpu, std::vector<BtFrame>& frames);
+inline uint32_t csaAddrFromLink(uint32_t link)
+{
+    uint32_t seg = (link >> 16) & 0xFu;
+    uint32_t off = link & 0xFFFFu;
+    if (seg == 0 && off == 0) return 0;
+    return (seg << 28) | (off << 6);
+}
 
 }  // namespace wiggle_dbg
 
-#endif  // WIGGLE_DEBUG_CTRL_H
+#endif  // WIGGLE_TRICORE_DEFS_H
+
