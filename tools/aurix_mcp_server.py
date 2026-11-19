@@ -75,8 +75,8 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
     Lookup order:
       1. env_var         — e.g. "AURIX_FLASHER_EXE" → use directly if set + file exists
       2. env_dir_var     — e.g. "AURIX_FLASHER_DIR"  → join with exe_name (or name)
-      3. Infineon default install locations (C:\\Infineon\\, Program Files)
-      4. script_dir and parent relative paths (MCP deployment layout)
+      3. bundled deployment (script_dir / parent: wiggle/, AURIXFlasher/) — self-contained first
+      4. Infineon default install locations (C:\\Infineon\\, Program Files) — fallback
       5. PATH via shutil.which
     """
     script_dir = Path(__file__).resolve().parent
@@ -103,7 +103,20 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
             if candidate.is_file():
                 return str(candidate)
 
-    # 3) Infineon default install location (Windows) — check BEFORE MCP dirs
+    # 3) 随包部署优先（自包含）：script_dir 及 parent 相对路径
+    candidates = [
+        script_dir / name,
+        script_dir / "wiggle" / name,
+        script_dir / "AURIXFlasher" / name,
+        parent / "wiggle" / name,
+        parent / "data" / name,
+        parent / "AURIXFlasher" / name,
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return str(c)
+
+    # 4) Infineon 默认安装位置（无随包时回退）
     if sys.platform == "win32" and name.lower().startswith("aurixflasher"):
         import glob
         for pattern in (
@@ -114,20 +127,6 @@ def find_exe(name: str, env_var: Optional[str] = None, env_dir_var: Optional[str
             for hit in glob.glob(pattern):
                 if os.path.isfile(hit):
                     return hit
-
-    # 4) MCP deployment layout: script_dir and parent relative paths
-    candidates = [
-        script_dir / name,
-        script_dir / "wiggle" / name,
-        script_dir / "AURIXFlasher" / name,
-        parent / "wiggle" / name,
-        parent / "data" / name,
-        parent / "AURIXFlasher" / name,
-    ]
-
-    for c in candidates:
-        if c.exists() and c.is_file():
-            return str(c)
 
     # 5) Fallback: PATH lookup (scoop / choco / manual install may put it on PATH)
     from shutil import which
