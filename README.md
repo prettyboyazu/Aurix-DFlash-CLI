@@ -381,6 +381,26 @@ wiggle sym load app.elf          # shell mode: persists across commands
 wiggle sym addr 0x80000100 --elf app.elf
 wiggle sym name main --elf app.elf
 wiggle sym list IfxCpu --elf app.elf
+
+# Persistent debug session (JSON-lines over stdio) - the MCP transport:
+# one MCD connection; symbols/breakpoints/watches persist across commands;
+# no per-command reconnect, no implicit resets; flash ops switch backend
+wiggle serve
+```
+
+Data watchpoints (halt on read/write of an address range) and continuous
+memory reads are session features, exposed via `wiggle serve` protocol and
+the MCP tools `wiggle_watch` / `wiggle_mem_read` / `wiggle_mem_write` /
+`wiggle_state`:
+
+```jsonc
+// wiggle serve protocol examples
+{"cmd":"watch","action":"add","addr":1879083104,"range":3,"type":"write"}
+{"cmd":"go"}                      // core halts when the variable is written
+{"cmd":"state"}                   // trig_id attributes the stop
+{"cmd":"bt"}                      // writing call stack, symbolized
+{"cmd":"read","addr":1879083104,"len":4}
+{"cmd":"cli","args":["erase","--all","--verify"]}   // TAS backend passthrough
 ```
 
 **Execution-control backends** (probe order, first available wins):
@@ -494,21 +514,41 @@ python tools/aurix_mcp_server.py --config tools/mcp_config.json --transport sse
 
 ### Available MCP Tools
 
+Tools route through a persistent `wiggle serve` session (MCD backend, state
+persists across calls); per-call CLI spawn is the fallback when serve is
+unavailable.
+
 | Tool | Description |
 |------|-------------|
-| `dflash_list` | List connected TAS targets |
-| `dflash_status` | Flash status register with field decoding |
-| `dflash_info` | Device info, memory layout, SVD summary |
-| `dflash_erase` | Erase DFlash sectors |
-| `dflash_write` | Write data to DFlash |
-| `dflash_read` | Read DFlash content |
-| `dflash_dump` | Hex dump of memory |
-| `dflash_reg` | Read/write registers (SVD-based) |
-| `dflash_poke` | Write value to memory address |
-| `dflash_compare` | Compare file with Flash content |
-| `dflash_search` | Search memory for byte pattern |
-| `dflash_reset` | Reset the MCU |
-| `flash_pflash` | Program PFlash via AURIXFlasher.exe |
+| `wiggle_list` | List connected TAS targets |
+| `wiggle_status` | Flash status register with field decoding |
+| `wiggle_info` | Device info, memory layout, SVD summary |
+| `wiggle_state` | Core state / stop-trigger id / PC (session, no side effects) |
+| `wiggle_halt` | Non-destructive halt (confirm_risk gate for reset fallback) |
+| `wiggle_go` | Resume execution |
+| `wiggle_step` | Hardware single-step |
+| `wiggle_break` | Instruction breakpoints add/del/list/clear |
+| `wiggle_watch` | Data watchpoints (read/write/rw) add/del/list/clear |
+| `wiggle_cpu_reg` | Core register read/write/dump |
+| `wiggle_bt` | Symbolized call-stack backtrace |
+| `wiggle_mem_read` | Continuous memory read (hex, up to 1 MB) |
+| `wiggle_mem_write` | Memory write (hex bytes) |
+| `wiggle_sym` | ELF symbol load/addr/name (persists in session) |
+| `wiggle_erase` | Erase DFlash sectors |
+| `wiggle_write` | Write data to DFlash |
+| `wiggle_read` | Read DFlash content |
+| `wiggle_dump` | Hex dump of memory |
+| `wiggle_reg` | Read/write registers (SVD-based) |
+| `wiggle_poke` | Write value to memory address (--dangerous gate) |
+| `wiggle_compare` | Compare file with Flash content |
+| `wiggle_search` | Search memory for byte pattern |
+| `wiggle_reset` | Reset the MCU |
+| `wiggle_rewrite` | Read-Modify-Write to DFlash |
+| `wiggle_restore` | Restore DFlash from backup |
+| `wiggle_ucb` | UCB read/write/erase (TC3x, confirm_risk gate) |
+| `aurix_pflash` | Program PFlash via AURIXFlasher.exe |
+| `reg_peripherals` / `reg_fields` / `reg_search` | Register metadata / fuzzy search |
+| `build_project` / `parse_symbols` / `parse_elf` / `lookup_symbol` / `lookup_address` / `reload_parsers` | Build artifact analysis |
 
 ### Registering in Qoder / Claude Desktop
 

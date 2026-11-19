@@ -53,6 +53,11 @@ struct Api {
     mcd_step_fn           step = nullptr;
     mcd_qry_state_fn      qry_state = nullptr;
     mcd_qry_error_info_fn qry_error_info = nullptr;
+    mcd_execute_txlist_fn execute_txlist = nullptr;
+    mcd_create_trig_fn    create_trig = nullptr;
+    mcd_remove_trig_fn    remove_trig = nullptr;
+    mcd_activate_trig_set_fn activate_trig_set = nullptr;
+    mcd_qry_trig_state_fn qry_trig_state = nullptr;
 };
 
 Api g_api;
@@ -127,6 +132,11 @@ bool loadDll(std::string& err)
     g_api.step           = (mcd_step_fn)sym("mcd_step_f");
     g_api.qry_state      = (mcd_qry_state_fn)sym("mcd_qry_state_f");
     g_api.qry_error_info = (mcd_qry_error_info_fn)sym("mcd_qry_error_info_f");
+    g_api.execute_txlist = (mcd_execute_txlist_fn)sym("mcd_execute_txlist_f");
+    g_api.create_trig    = (mcd_create_trig_fn)sym("mcd_create_trig_f");
+    g_api.remove_trig    = (mcd_remove_trig_fn)sym("mcd_remove_trig_f");
+    g_api.activate_trig_set = (mcd_activate_trig_set_fn)sym("mcd_activate_trig_set_f");
+    g_api.qry_trig_state = (mcd_qry_trig_state_fn)sym("mcd_qry_trig_state_f");
 
     if (!g_api.initialize || !g_api.open_server || !g_api.qry_cores || !g_api.open_core ||
         !g_api.close_core || !g_api.run || !g_api.stop || !g_api.step || !g_api.qry_state) {
@@ -291,12 +301,125 @@ bool stop(const Session& s, std::string& err)
 
 bool run(const Session& s, std::string& err)
 {
+    // 发出即成功：watch 活跃时核可能立即再命中，等待 RUNNING 会假超时
     mcd_return_et rc = g_api.run(s.core, 0);
     if (rc != MCD_RET_ACT_NONE) {
         err = "run: " + errDetail(s.core, rc);
         return false;
     }
-    return waitState(s, MCD_CORE_STATE_RUNNING, err);
+    return true;
+}
+
+bool stateFull(const Session& s, uint32_t& st, uint32_t& trigId, std::string& info)
+{
+    if (!s.core) return false;
+    mcd_core_state_st cs;
+    memset(&cs, 0, sizeof(cs));
+    mcd_return_et rc = g_api.qry_state(s.core, &cs);
+    if (rc != MCD_RET_ACT_NONE) return false;
+    st = cs.state;
+    trigId = cs.trig_id;
+    info = cs.stop_str[0] ? cs.stop_str : cs.info_str;
+    return true;
+}
+
+bool readMem(const Session& s, uint64_t addr, uint8_t* buf, uint32_t n, std::string& err)
+{
+    if (!s.core || !g_api.execute_txlist) { err = "MCD txlist unavailable"; return false; }
+    mcd_tx_st tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.addr.address = addr;
+    tx.access_type = MCD_TX_AT_R;
+    tx.access_width = 1;
+    tx.data = buf;
+    tx.num_bytes = n;
+    mcd_txlist_st tl;
+    tl.tx = &tx;
+    tl.num_tx = 1;
+    tl.num_tx_ok = 0;
+    mcd_return_et rc = g_api.execute_txlist(s.core, &tl);
+    if (rc != MCD_RET_ACT_NONE || tx.num_bytes_ok != n) {
+        err = "readMem: " + errDetail(s.core, rc);
+        return false;
+    }
+    return true;
+}
+
+bool writeMem(const Session& s, uint64_t addr, const uint8_t* buf, uint32_t n, std::string& err)
+{
+    if (!s.core || !g_api.execute_txlist) { err = "MCD txlist unavailable"; return false; }
+    mcd_tx_st tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.addr.address = addr;
+    tx.access_type = MCD_TX_AT_W;
+    tx.access_width = 1;
+    tx.data = const_cast<uint8_t*>(buf);
+    tx.num_bytes = n;
+    mcd_txlist_st tl;
+    tl.tx = &tx;
+    tl.num_tx = 1;
+    tl.num_tx_ok = 0;
+    mcd_return_et rc = g_api.execute_txlist(s.core, &tl);
+    if (rc != MCD_RET_ACT_NONE || tx.num_bytes_ok != n) {
+        err = "writeMem: " + errDetail(s.core, rc);
+        return false;
+    }
+    return true;
+}
+
+bool createTrig(const Session& s, uint32_t type, uint64_t addr, uint64_t range,
+                uint32_t& id, std::string& err)
+{
+    if (!s.core || !g_api.create_trig) { err = "MCD trig unavailable"; return false; }
+    mcd_trig_simple_core_st tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.struct_size = sizeof(tr);
+    tr.type = type;
+    tr.action = MCD_TRIG_ACTION_DBG_DEBUG;
+    tr.addr_start.address = addr;
+    tr.addr_range = range;
+    mcd_return_et rc = g_api.create_trig(s.core, &tr, &id);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "create_trig: " + errDetail(s.core, rc);
+        return false;
+    }
+    rc = g_api.activate_trig_set(s.core);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "activate_trig_set: " + errDetail(s.core, rc);
+        return false;
+    }
+    return true;
+}
+
+bool removeTrig(const Session& s, uint32_t id, std::string& err)
+{
+    if (!s.core || !g_api.remove_trig) { err = "MCD trig unavailable"; return false; }
+    mcd_return_et rc = g_api.remove_trig(s.core, id);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "remove_trig: " + errDetail(s.core, rc);
+        return false;
+    }
+    // 删除后必须重新上传触发集，否则硬件仍保留旧 watch
+    rc = g_api.activate_trig_set(s.core);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "activate_trig_set: " + errDetail(s.core, rc);
+        return false;
+    }
+    return true;
+}
+
+bool trigCaptured(const Session& s, uint32_t id, bool& captured, std::string& err)
+{
+    if (!s.core || !g_api.qry_trig_state) { err = "MCD trig state unavailable"; return false; }
+    mcd_trig_state_st ts;
+    memset(&ts, 0, sizeof(ts));
+    mcd_return_et rc = g_api.qry_trig_state(s.core, id, &ts);
+    if (rc != MCD_RET_ACT_NONE) {
+        err = "qry_trig_state: " + errDetail(s.core, rc);
+        return false;
+    }
+    captured = ts.captured != 0;
+    return true;
 }
 
 bool step(const Session& s, uint32_t n, std::string& err)

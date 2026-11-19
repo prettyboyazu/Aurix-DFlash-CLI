@@ -128,6 +128,74 @@ typedef struct {
     mcd_char_t         info_str[MCD_INFO_STR_LEN];
 } mcd_core_state_st;
 
+// 地址/事务/触发 ABI（逐字摘录自 mcd_api.h）
+typedef uint32_t mcd_addr_space_type_et;
+typedef uint32_t mcd_tx_access_type_et;
+typedef uint32_t mcd_tx_access_opt_et;
+typedef uint32_t mcd_trig_type_et;
+typedef uint32_t mcd_trig_opt_et;
+typedef uint32_t mcd_trig_action_et;
+
+enum {
+    MCD_TX_AT_R = 0x00000001,
+    MCD_TX_AT_W = 0x00000002
+};
+
+enum {
+    MCD_TRIG_TYPE_IP    = 0x00000001,
+    MCD_TRIG_TYPE_READ  = 0x00000002,
+    MCD_TRIG_TYPE_WRITE = 0x00000004,
+    MCD_TRIG_TYPE_RW    = 0x00000008
+};
+
+enum {
+    MCD_TRIG_ACTION_DBG_DEBUG = 0x00000001
+};
+
+typedef struct {
+    uint64_t               address;
+    uint32_t               mem_space_id;
+    uint32_t               addr_space_id;
+    mcd_addr_space_type_et addr_space_type;
+} mcd_addr_st;
+
+typedef struct {
+    mcd_addr_st           addr;
+    mcd_tx_access_type_et access_type;
+    mcd_tx_access_opt_et  options;
+    uint8_t               access_width;
+    uint8_t               core_mode;
+    uint8_t*              data;
+    uint32_t              num_bytes;
+    uint32_t              num_bytes_ok;
+} mcd_tx_st;
+
+typedef struct {
+    mcd_tx_st* tx;
+    uint32_t   num_tx;
+    uint32_t   num_tx_ok;
+} mcd_txlist_st;
+
+typedef struct {
+    uint32_t           struct_size;
+    mcd_trig_type_et   type;
+    mcd_trig_opt_et    option;
+    mcd_trig_action_et action;
+    uint32_t           action_param;
+    mcd_bool_t         modified;
+    uint32_t           state_mask;
+    mcd_addr_st        addr_start;
+    uint64_t           addr_range;
+} mcd_trig_simple_core_st;
+
+typedef struct {
+    mcd_bool_t active;
+    mcd_bool_t captured;
+    mcd_bool_t captured_valid;
+    uint64_t   count_value;
+    mcd_bool_t count_valid;
+} mcd_trig_state_st;
+
 // 动态加载函数指针类型（mcdxdas.dll 导出，_f 后缀）
 typedef mcd_return_et (*mcd_initialize_fn)(const mcd_api_version_st*, mcd_impl_version_info_st*);
 typedef void        (*mcd_exit_fn)(void);
@@ -142,5 +210,10 @@ typedef mcd_return_et (*mcd_stop_fn)(const mcd_core_st*, mcd_bool_t);
 typedef mcd_return_et (*mcd_step_fn)(const mcd_core_st*, mcd_bool_t, mcd_core_step_type_et, uint32_t);
 typedef mcd_return_et (*mcd_qry_state_fn)(const mcd_core_st*, mcd_core_state_st*);
 typedef mcd_return_et (*mcd_qry_error_info_fn)(const mcd_core_st*, mcd_error_info_st*);
+typedef mcd_return_et (*mcd_execute_txlist_fn)(const mcd_core_st*, mcd_txlist_st*);
+typedef mcd_return_et (*mcd_create_trig_fn)(const mcd_core_st*, void*, uint32_t*);
+typedef mcd_return_et (*mcd_remove_trig_fn)(const mcd_core_st*, uint32_t);
+typedef mcd_return_et (*mcd_activate_trig_set_fn)(const mcd_core_st*);
+typedef mcd_return_et (*mcd_qry_trig_state_fn)(const mcd_core_st*, uint32_t, mcd_trig_state_st*);
 
 #endif  // WIGGLE_MCD_ABI_H

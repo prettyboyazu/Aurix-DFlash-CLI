@@ -5167,14 +5167,470 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
 }
 
 //********************************************************************************************************************
+//  serve 模式：持久调试会话（JSON-lines over stdio）。
+//  调试命令走 MCD 独占后端（连接/符号/断点/观察点跨命令持久，非破坏）；
+//  Flash 等其余命令经 cli 透传：先关 MCD 释放 access HW，TAS 执行后再懒重连。
+//********************************************************************************************************************
+
+#ifdef _WIN32
+#include <io.h>
+#define WIG_DUP _dup
+#define WIG_DUP2 _dup2
+#else
+#include <unistd.h>
+#define WIG_DUP dup
+#define WIG_DUP2 dup2
+#endif
+
+static int dispatchCli(int argc, char** argv);
+
+struct ServeTrigRec {
+    uint32_t id = 0;
+    uint32_t type = 0;
+    uint64_t addr = 0;
+    uint64_t range = 0;
+};
+
+struct ServeSession {
+    wiggle_mcd::Session mcd;
+    bool open = false;
+    int cpu = 0;
+    std::vector<ServeTrigRec> trigs;
+};
+
+static ServeSession g_serve;
+
+static void serveCloseMcd()
+{
+    if (g_serve.open) {
+        wiggle_mcd::close(g_serve.mcd);
+        g_serve.open = false;
+        g_serve.trigs.clear();  // 服务器连接关闭后硬件触发器失效
+    }
+}
+
+static bool serveEnsureMcd(int cpu, std::string& err)
+{
+    if (g_serve.open && g_serve.cpu == cpu) return true;
+    serveCloseMcd();
+    if (!wiggle_mcd::open(cpu, g_serve.mcd, err)) return false;
+    g_serve.open = true;
+    g_serve.cpu = cpu;
+    return true;
+}
+
+static bool serveReadU32(uint64_t addr, uint32_t& val, std::string& err)
+{
+    uint8_t b[4];
+    if (!wiggle_mcd::readMem(g_serve.mcd, addr, b, 4, err)) return false;
+    val = static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
+          (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
+    return true;
+}
+
+// cli 透传：关 MCD → 捕获 stdout 调 dispatchCli → 恢复 → 提取末行 JSON
+static nljson serveCliPassthrough(const std::vector<std::string>& args)
+{
+    serveCloseMcd();
+    g_json = true;
+    fflush(stdout);
+    int saved = WIG_DUP(_fileno(stdout));
+    FILE* cap = tmpfile();
+    if (!cap || saved < 0) {
+        if (saved >= 0) close(saved);
+        nljson j;
+        j["status"] = "error";
+        j["message"] = "stdout capture failed";
+        return j;
+    }
+    WIG_DUP2(_fileno(cap), _fileno(stdout));
+    std::vector<char*> argv;
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    int rc = dispatchCli(static_cast<int>(argv.size()), argv.empty() ? nullptr : argv.data());
+    fflush(stdout);
+    WIG_DUP2(saved, _fileno(stdout));
+    close(saved);
+
+    std::string captured;
+    rewind(cap);
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), cap)) > 0) captured.append(buf, n);
+    fclose(cap);
+
+    nljson j;
+    bool found = false;
+    size_t pos = captured.size();
+    while (pos > 0) {
+        size_t ls = captured.rfind('\n', pos - 1);
+        std::string line = captured.substr(ls + 1, pos - ls - 1);
+        pos = ls;
+        size_t b = line.find_first_not_of(" \t\r");
+        if (b != std::string::npos && line[b] == '{') {
+            try {
+                j = nljson::parse(line.substr(b));
+                found = true;
+                break;
+            } catch (...) {}
+        }
+        if (ls == std::string::npos) break;
+    }
+    if (!found) {
+        j = nljson::object();
+        j["status"] = (rc == EXIT_OK) ? "ok" : "error";
+        j["message"] = captured.empty() ? "no output" : captured;
+    }
+    j["exit_code"] = rc;
+    return j;
+}
+
+static int doServe(int argc, char** argv)
+{
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: wiggle serve\n\n"
+                   "  Persistent debug session, JSON-lines over stdin/stdout.\n"
+                   "  Debug commands use MCD (non-destructive, state persists);\n"
+                   "  {\"cmd\":\"cli\",\"args\":[...]} passes through to TAS backend.\n");
+            return EXIT_OK;
+        }
+    }
+    g_json = true;
+    fprintf(stderr, "wiggle serve: persistent session ready (MCD backend)\n");
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        size_t b = line.find_first_not_of(" \t\r");
+        if (b == std::string::npos) continue;
+        nljson req;
+        try { req = nljson::parse(line.substr(b)); }
+        catch (...) {
+            printf("{\"status\":\"error\",\"message\":\"invalid JSON\"}\n");
+            fflush(stdout);
+            continue;
+        }
+        nljson resp;
+        resp["id"] = req.value("id", 0);
+        std::string cmd = req.value("cmd", "");
+        std::string err;
+        int cpu = req.value("cpu", 0);
+
+        if (cmd == "cli") {
+            std::vector<std::string> args;
+            for (const auto& a : req.value("args", nljson::array()))
+                args.push_back(a.get<std::string>());
+            resp.update(serveCliPassthrough(args));
+        } else if (cmd == "state" || cmd == "halt" || cmd == "go" || cmd == "step") {
+            if (!serveEnsureMcd(cpu, err)) {
+                resp["status"] = "error";
+                resp["message"] = err;
+            } else {
+                bool ok = true;
+                if (cmd == "halt") ok = wiggle_mcd::stop(g_serve.mcd, err);
+                else if (cmd == "go") ok = wiggle_mcd::run(g_serve.mcd, err);
+                else if (cmd == "step") ok = wiggle_mcd::step(g_serve.mcd, req.value("n", 1), err);
+                uint32_t st = 0, tid = 0;
+                std::string info;
+                wiggle_mcd::stateFull(g_serve.mcd, st, tid, info);
+                uint32_t pc = 0;
+                serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PC), pc, err);
+                resp["status"] = ok ? "ok" : "error";
+                if (!ok) resp["message"] = err;
+                resp["state"] = st;
+                resp["trig_id"] = tid;
+                resp["pc"] = pc;
+                std::string sym = symAnnotate(pc);
+                if (!sym.empty()) resp["pc_symbol"] = sym;
+                if (!info.empty()) resp["info"] = info;
+            }
+        } else if (cmd == "break" || cmd == "watch") {
+            if (!serveEnsureMcd(cpu, err)) {
+                resp["status"] = "error";
+                resp["message"] = err;
+            } else {
+                std::string sub = req.value("action", "list");
+                uint32_t type = (cmd == "break") ? MCD_TRIG_TYPE_IP : MCD_TRIG_TYPE_WRITE;
+                if (cmd == "watch") {
+                    std::string wt = req.value("type", "write");
+                    if (wt == "read") type = MCD_TRIG_TYPE_READ;
+                    else if (wt == "rw") type = MCD_TRIG_TYPE_RW;
+                }
+                if (sub == "add") {
+                    uint64_t addr = req.value("addr", 0ULL);
+                    uint64_t range = req.value("range", 0ULL);
+                    uint32_t id = 0;
+                    if (wiggle_mcd::createTrig(g_serve.mcd, type, addr, range, id, err)) {
+                        g_serve.trigs.push_back({id, type, addr, range});
+                        resp["status"] = "ok";
+                        resp["id_trig"] = id;
+                        resp["addr"] = addr;
+                    } else {
+                        resp["status"] = "error";
+                        resp["message"] = err;
+                    }
+                } else if (sub == "del" || sub == "clear") {
+                    bool ok = true;
+                    if (sub == "clear") {
+                        for (const auto& t : g_serve.trigs)
+                            ok = ok && wiggle_mcd::removeTrig(g_serve.mcd, t.id, err);
+                        g_serve.trigs.clear();
+                    } else {
+                        uint32_t id = req.value("id_trig", 0);
+                        uint64_t addr = req.value("addr", 0ULL);
+                        auto it = g_serve.trigs.end();
+                        for (auto i = g_serve.trigs.begin(); i != g_serve.trigs.end(); ++i)
+                            if ((id && i->id == id) || (!id && i->addr == addr)) { it = i; break; }
+                        if (it == g_serve.trigs.end()) {
+                            ok = false;
+                            err = "trigger not found";
+                        } else {
+                            ok = wiggle_mcd::removeTrig(g_serve.mcd, it->id, err);
+                            g_serve.trigs.erase(it);
+                        }
+                    }
+                    resp["status"] = ok ? "ok" : "error";
+                    if (!ok) resp["message"] = err;
+                } else {  // list
+                    resp["status"] = "ok";
+                    resp["trigs"] = nljson::array();
+                    for (const auto& t : g_serve.trigs) {
+                        nljson e;
+                        e["id_trig"] = t.id;
+                        e["kind"] = (t.type == MCD_TRIG_TYPE_IP) ? "break" : "watch";
+                        e["type"] = t.type;
+                        e["addr"] = t.addr;
+                        e["range"] = t.range;
+                        bool cap = false;
+                        wiggle_mcd::trigCaptured(g_serve.mcd, t.id, cap, err);
+                        e["captured"] = cap;
+                        resp["trigs"].push_back(e);
+                    }
+                }
+            }
+        } else if (cmd == "read" || cmd == "write") {
+            if (!serveEnsureMcd(cpu, err)) {
+                resp["status"] = "error";
+                resp["message"] = err;
+            } else {
+                uint64_t addr = req.value("addr", 0ULL);
+                if (cmd == "read") {
+                    uint32_t len = req.value("len", 0);
+                    if (len == 0 || len > 0x100000) {
+                        resp["status"] = "error";
+                        resp["message"] = "len must be 1..100000 (hex)";
+                    } else {
+                        std::vector<uint8_t> buf(len);
+                        bool ok = true;
+                        for (uint32_t off = 0; off < len && ok; off += 4096) {
+                            uint32_t chunk = std::min<uint32_t>(4096, len - off);
+                            ok = wiggle_mcd::readMem(g_serve.mcd, addr + off, buf.data() + off, chunk, err);
+                        }
+                        if (ok) {
+                            std::string hex;
+                            hex.reserve(len * 2);
+                            for (auto v : buf) {
+                                char h[3];
+                                snprintf(h, 3, "%02X", v);
+                                hex += h;
+                            }
+                            resp["status"] = "ok";
+                            resp["addr"] = addr;
+                            resp["data"] = hex;
+                        } else {
+                            resp["status"] = "error";
+                            resp["message"] = err;
+                        }
+                    }
+                } else {
+                    std::string hex = req.value("data", "");
+                    if (hex.size() % 2 != 0) {
+                        resp["status"] = "error";
+                        resp["message"] = "data hex length must be even";
+                    } else {
+                        std::vector<uint8_t> buf(hex.size() / 2);
+                        for (size_t i = 0; i < buf.size(); i++)
+                            buf[i] = static_cast<uint8_t>(strtoul(hex.substr(i * 2, 2).c_str(), nullptr, 16));
+                        if (wiggle_mcd::writeMem(g_serve.mcd, addr, buf.data(),
+                                                 static_cast<uint32_t>(buf.size()), err)) {
+                            resp["status"] = "ok";
+                            resp["bytes"] = buf.size();
+                        } else {
+                            resp["status"] = "error";
+                            resp["message"] = err;
+                        }
+                    }
+                }
+            }
+        } else if (cmd == "reg" || cmd == "cpu_reg") {
+            if (!serveEnsureMcd(cpu, err)) {
+                resp["status"] = "error";
+                resp["message"] = err;
+            } else {
+                std::string name = req.value("name", "");
+                if (name.empty()) {
+                    wiggle_dbg::CoreRegs regs;
+                    bool ok = true;
+                    ok = ok && serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PC), regs.pc, err);
+                    ok = ok && serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PSW), regs.psw, err);
+                    ok = ok && serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PCXI), regs.pcxi, err);
+                    for (int i = 0; i < 16 && ok; i++) {
+                        ok = ok && serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_A0 + i * 4), regs.a[i], err);
+                        ok = ok && serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_D0 + i * 4), regs.d[i], err);
+                    }
+                    if (ok) {
+                        resp["status"] = "ok";
+                        resp["pc"] = regs.pc;
+                        resp["psw"] = regs.psw;
+                        resp["pcxi"] = regs.pcxi;
+                        resp["a"] = nljson::array();
+                        resp["d"] = nljson::array();
+                        for (int i = 0; i < 16; i++) {
+                            resp["a"].push_back(regs.a[i]);
+                            resp["d"].push_back(regs.d[i]);
+                        }
+                        std::string sym = symAnnotate(regs.pc);
+                        if (!sym.empty()) resp["pc_symbol"] = sym;
+                    } else {
+                        resp["status"] = "error";
+                        resp["message"] = err;
+                    }
+                } else {
+                    uint64_t addr = 0;
+                    if (!coreRegAddr(cpu, name, addr)) {
+                        resp["status"] = "error";
+                        resp["message"] = "invalid register name";
+                    } else if (req.contains("value")) {
+                        uint32_t val = req.value("value", 0);
+                        uint8_t b[4] = {static_cast<uint8_t>(val), static_cast<uint8_t>(val >> 8),
+                                        static_cast<uint8_t>(val >> 16), static_cast<uint8_t>(val >> 24)};
+                        if (wiggle_mcd::writeMem(g_serve.mcd, addr, b, 4, err)) {
+                            resp["status"] = "ok";
+                            resp["register"] = name;
+                            resp["value"] = val;
+                        } else {
+                            resp["status"] = "error";
+                            resp["message"] = err;
+                        }
+                    } else {
+                        uint32_t val = 0;
+                        if (serveReadU32(addr, val, err)) {
+                            resp["status"] = "ok";
+                            resp["register"] = name;
+                            resp["value"] = val;
+                        } else {
+                            resp["status"] = "error";
+                            resp["message"] = err;
+                        }
+                    }
+                }
+            }
+        } else if (cmd == "bt") {
+            if (!serveEnsureMcd(cpu, err)) {
+                resp["status"] = "error";
+                resp["message"] = err;
+            } else {
+                uint32_t pc = 0, pcxi = 0, a11 = 0;
+                bool ok = serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PC), pc, err) &&
+                          serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PCXI), pcxi, err) &&
+                          serveReadU32(wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_A0 + 11 * 4), a11, err);
+                if (!ok) {
+                    resp["status"] = "error";
+                    resp["message"] = err;
+                } else {
+                    resp["status"] = "ok";
+                    resp["frames"] = nljson::array();
+                    nljson f0;
+                    f0["pc"] = pc;
+                    uint32_t off0 = 0;
+                    const wiggle_dbg::ElfSymbol* s0 = symFindCode(pc, off0);
+                    if (s0) { f0["symbol"] = s0->name; f0["offset"] = off0; }
+                    resp["frames"].push_back(f0);
+                    uint32_t ra = a11, link = pcxi;
+                    std::vector<uint32_t> visited;
+                    while (resp["frames"].size() < wiggle_dbg::BT_MAX_FRAMES) {
+                        uint32_t ea = wiggle_dbg::csaAddrFromLink(link);
+                        if (ea == 0) break;
+                        if (std::find(visited.begin(), visited.end(), ea) != visited.end()) break;
+                        visited.push_back(ea);
+                        uint32_t nextLink = 0, nextRa = 0;
+                        if (!serveReadU32(ea, nextLink, err)) break;
+                        bool upper = (link & wiggle_dbg::PCXI_UL) != 0;
+                        if (!serveReadU32(ea + (upper ? wiggle_dbg::CSA_UPPER_RA_OFF
+                                                      : wiggle_dbg::CSA_LOWER_RA_OFF), nextRa, err))
+                            break;
+                        nljson f;
+                        f["pc"] = ra;
+                        f["csa"] = ea;
+                        uint32_t off = 0;
+                        const wiggle_dbg::ElfSymbol* s = symFindCode(ra, off);
+                        if (s) { f["symbol"] = s->name; f["offset"] = off; }
+                        resp["frames"].push_back(f);
+                        ra = nextRa;
+                        link = nextLink;
+                    }
+                }
+            }
+        } else if (cmd == "sym") {
+            std::string sub = req.value("action", "");
+            if (sub == "load") {
+                std::string path = req.value("file", "");
+                if (g_elfTable.load(path, err)) {
+                    resp["status"] = "ok";
+                    resp["symbols"] = g_elfTable.count();
+                } else {
+                    resp["status"] = "error";
+                    resp["message"] = err;
+                }
+            } else if (!g_elfTable.isLoaded()) {
+                resp["status"] = "error";
+                resp["message"] = "no ELF loaded";
+            } else if (sub == "addr") {
+                uint32_t off = 0;
+                const wiggle_dbg::ElfSymbol* s = symFindCode(req.value("addr", 0), off);
+                if (s) {
+                    resp["status"] = "ok";
+                    resp["name"] = s->name;
+                    resp["offset"] = off;
+                } else {
+                    resp["status"] = "error";
+                    resp["message"] = "no symbol";
+                }
+            } else if (sub == "name") {
+                const wiggle_dbg::ElfSymbol* s = g_elfTable.findByName(req.value("name", ""));
+                if (s) {
+                    resp["status"] = "ok";
+                    resp["value"] = s->value;
+                    resp["size"] = s->size;
+                } else {
+                    resp["status"] = "error";
+                    resp["message"] = "symbol not found";
+                }
+            } else {
+                resp["status"] = "error";
+                resp["message"] = "unknown sym action";
+            }
+        } else if (cmd == "ping") {
+            resp["status"] = "ok";
+            resp["mcd"] = g_serve.open;
+        } else {
+            resp["status"] = "error";
+            resp["message"] = "unknown cmd: " + cmd;
+        }
+        printf("%s\n", resp.dump().c_str());
+        fflush(stdout);
+    }
+    serveCloseMcd();
+    return EXIT_OK;
+}
+
+//********************************************************************************************************************
 //  Main - subcommand dispatch with legacy backward compatibility
 //********************************************************************************************************************
 
-int main(int argc, char** argv)
+static int dispatchCli(int argc, char** argv)
 {
-    if (argc < 2) { printUsage(argv[0]); return EXIT_USAGE_ERROR; }
-
-    std::string first(argv[1]);
+    if (argc < 1) return EXIT_USAGE_ERROR;
+    std::string first(argv[0]);
 
     // Help
     if (first == "--help" || first == "-h") { printUsage(argv[0]); return EXIT_OK; }
@@ -5183,41 +5639,41 @@ int main(int argc, char** argv)
     if (first == "--version" || first == "-v") { printf("wiggle version %s\n", WIGGLE_VERSION); return EXIT_OK; }
 
     // Subcommands
-    if (first == "erase" || first == "e") return doErase(argc - 2, argv + 2, false);
-    if (first == "write" || first == "w") return doWrite(argc - 2, argv + 2);
-    if (first == "rewrite" || first == "rw") return doRewrite(argc - 2, argv + 2);
-    if (first == "restore") return doRestore(argc - 2, argv + 2);
-    if (first == "read"  || first == "r") return doRead(argc - 2, argv + 2);
-    if (first == "list"  || first == "l") return doList(argc - 2, argv + 2);
-    if (first == "reset") return doReset(argc - 2, argv + 2);
+    if (first == "erase" || first == "e") return doErase(argc - 1, argv + 1, false);
+    if (first == "write" || first == "w") return doWrite(argc - 1, argv + 1);
+    if (first == "rewrite" || first == "rw") return doRewrite(argc - 1, argv + 1);
+    if (first == "restore") return doRestore(argc - 1, argv + 1);
+    if (first == "read"  || first == "r") return doRead(argc - 1, argv + 1);
+    if (first == "list"  || first == "l") return doList(argc - 1, argv + 1);
+    if (first == "reset") return doReset(argc - 1, argv + 1);
 
     // Debug subcommands
-    if (first == "reg") return doReg(argc - 2, argv + 2);
-    if (first == "dump") return doDump(argc - 2, argv + 2);
-    if (first == "poke") return doPoke(argc - 2, argv + 2);
-    if (first == "status") return doStatus(argc - 2, argv + 2);
-    if (first == "info") return doInfo(argc - 2, argv + 2);
-    if (first == "compare") return doCompare(argc - 2, argv + 2);
-    if (first == "search") return doSearch(argc - 2, argv + 2);
-    if (first == "shell") return doShell(argc - 2, argv + 2);
+    if (first == "reg") return doReg(argc - 1, argv + 1);
+    if (first == "dump") return doDump(argc - 1, argv + 1);
+    if (first == "poke") return doPoke(argc - 1, argv + 1);
+    if (first == "status") return doStatus(argc - 1, argv + 1);
+    if (first == "info") return doInfo(argc - 1, argv + 1);
+    if (first == "compare") return doCompare(argc - 1, argv + 1);
+    if (first == "search") return doSearch(argc - 1, argv + 1);
+    if (first == "shell") return doShell(argc - 1, argv + 1);
 
     // Debugger subcommands
-    if (first == "halt") return doHalt(argc - 2, argv + 2);
-    if (first == "go" || first == "resume") return doGo(argc - 2, argv + 2);
-    if (first == "cpu_reg" || first == "cr") return doCpuReg(argc - 2, argv + 2);
-    if (first == "break" || first == "bp") return doBreak(argc - 2, argv + 2);
-    if (first == "step" || first == "s") return doStep(argc - 2, argv + 2);
-    if (first == "bt" || first == "backtrace") return doBt(argc - 2, argv + 2);
-    if (first == "sym") return doSym(argc - 2, argv + 2);
+    if (first == "halt") return doHalt(argc - 1, argv + 1);
+    if (first == "go" || first == "resume") return doGo(argc - 1, argv + 1);
+    if (first == "cpu_reg" || first == "cr") return doCpuReg(argc - 1, argv + 1);
+    if (first == "break" || first == "bp") return doBreak(argc - 1, argv + 1);
+    if (first == "step" || first == "s") return doStep(argc - 1, argv + 1);
+    if (first == "bt" || first == "backtrace") return doBt(argc - 1, argv + 1);
+    if (first == "sym") return doSym(argc - 1, argv + 1);
 
     if (first == "ucb") {
-        if (argc < 3) { printUcbUsage(argv[0]); return EXIT_USAGE_ERROR; }
-        std::string ucbSub(argv[2]);
-        if (ucbSub == "read"  || ucbSub == "r") return doUcbRead(argc - 3, argv + 3);
-        if (ucbSub == "write" || ucbSub == "w") return doUcbWrite(argc - 3, argv + 3);
-        if (ucbSub == "erase" || ucbSub == "e") return doUcbErase(argc - 3, argv + 3);
+        if (argc < 2) { printUcbUsage(argv[0]); return EXIT_USAGE_ERROR; }
+        std::string ucbSub(argv[1]);
+        if (ucbSub == "read"  || ucbSub == "r") return doUcbRead(argc - 2, argv + 2);
+        if (ucbSub == "write" || ucbSub == "w") return doUcbWrite(argc - 2, argv + 2);
+        if (ucbSub == "erase" || ucbSub == "e") return doUcbErase(argc - 2, argv + 2);
         if (ucbSub == "--help" || ucbSub == "-h") { printUcbUsage(argv[0]); return EXIT_OK; }
-        fprintf(stderr, "ERROR: Unknown ucb subcommand '%s'\n", argv[2]);
+        fprintf(stderr, "ERROR: Unknown ucb subcommand '%s'\n", argv[1]);
         printUcbUsage(argv[0]);
         return EXIT_USAGE_ERROR;
     }
@@ -5225,10 +5681,17 @@ int main(int argc, char** argv)
     // Legacy backward compatibility: --all, --info, or hex address as first arg
     if (first == "--all" || first == "--info" ||
         first.rfind("0x", 0) == 0 || first.rfind("0X", 0) == 0) {
-        return doErase(argc - 1, argv + 1, true);
+        return doErase(argc, argv, true);
     }
 
-    fprintf(stderr, "ERROR: Unknown subcommand '%s'\n", argv[1]);
+    fprintf(stderr, "ERROR: Unknown subcommand '%s'\n", argv[0]);
     printUsage(argv[0]);
     return EXIT_USAGE_ERROR;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 2) { printUsage(argv[0]); return EXIT_USAGE_ERROR; }
+    if (std::string(argv[1]) == "serve") return doServe(argc - 2, argv + 2);
+    return dispatchCli(argc - 1, argv + 1);
 }

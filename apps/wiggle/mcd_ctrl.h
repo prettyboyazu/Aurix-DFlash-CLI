@@ -46,13 +46,25 @@ void close(Session& s);
 
 // 查询核状态（MCD_CORE_STATE_*）；info 为状态描述串
 bool state(const Session& s, uint32_t& st, std::string& info);
+// 含触发 ID 的完整状态（watch/break 命中归因）
+bool stateFull(const Session& s, uint32_t& st, uint32_t& trigId, std::string& info);
 
 // 非破坏性 halt：stop + 轮询至 DEBUG/HALT（2s 超时）
 bool stop(const Session& s, std::string& err);
-// resume：run + 轮询至 RUNNING
+// resume：run 发出即成功（watch 活跃时可能立即再命中，属正常调试行为）
 bool run(const Session& s, std::string& err);
 // 硬件单步 n 条指令 + 轮询至 DEBUG
 bool step(const Session& s, uint32_t n, std::string& err);
+
+// 内存/寄存器读写（txlist，默认地址空间=设备内存）
+bool readMem(const Session& s, uint64_t addr, uint8_t* buf, uint32_t n, std::string& err);
+bool writeMem(const Session& s, uint64_t addr, const uint8_t* buf, uint32_t n, std::string& err);
+
+// 触发器：type=MCD_TRIG_TYPE_IP/READ/WRITE/RW；创建/删除后自动 activate 上传硬件
+bool createTrig(const Session& s, uint32_t type, uint64_t addr, uint64_t range,
+                uint32_t& id, std::string& err);
+bool removeTrig(const Session& s, uint32_t id, std::string& err);
+bool trigCaptured(const Session& s, uint32_t id, bool& captured, std::string& err);
 
 }  // namespace wiggle_mcd
 
