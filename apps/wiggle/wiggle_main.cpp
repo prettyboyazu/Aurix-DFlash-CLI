@@ -34,6 +34,8 @@
 #include "device_config_loader.h"
 #include "hex_parser.h"
 #include "svd_loader.h"
+#include "debug_ctrl.h"
+#include "elf_symbols.h"
 
 #include <cstdio>
 #include <cstring>
@@ -137,6 +139,8 @@ static constexpr int EXIT_HEX_PARSE_ERROR    = 21;  // HEX file parse error
 static constexpr int EXIT_MISMATCH_ERROR     = 22;  // Compare found mismatches
 static constexpr int EXIT_NOT_FOUND          = 23;  // Search pattern not found
 static constexpr int EXIT_TRUNCATED          = 25;  // Results truncated (search match limit)
+static constexpr int EXIT_NOT_HALTED         = 26;  // Debug op requires halted CPU
+static constexpr int EXIT_RESUME_FAILED      = 27;  // Platform cannot resume (DBGSR.CLR_HALT ineffective)
 
 static constexpr uint32_t WAIT_UNBUSY_TIMEOUT_MS  = 10000;
 static constexpr uint32_t POLL_INTERVAL_MS         = 10;
@@ -772,6 +776,9 @@ struct ToolContext {
 
 // Shell shared connection: set by doShell, used by RESOLVE_CTX
 static ToolContext* g_shellCtx = nullptr;
+
+// ELF 符号表（sym load / --elf 加载；shell 内跨命令复用）
+static wiggle_dbg::ElfSymbolTable g_elfTable;
 
 // RESOLVE_CTX macro: reuse g_shellCtx if available, otherwise initTool with --hot override
 #define RESOLVE_CTX(CTX_NAME, SESSION, DEFAULT_DCO) \
@@ -4174,6 +4181,728 @@ static int doSearch(int argc, char** argv)
 
 //********************************************************************************************************************
 //********************************************************************************************************************
+//  通用调试器命令: halt / go / cpu_reg / break / step / bt / sym
+//  连接默认 HOT_ATTACH（非侵入）；halt 探测失败降级 RESET_AND_HALT 并明确警告。
+//********************************************************************************************************************
+
+struct DebugArgs {
+    CommonArgs common;
+    int cpu = 0;
+    const char* elfPath = nullptr;
+};
+
+static int parseDebugOption(int argc, char** argv, int idx, DebugArgs& da)
+{
+    if (strcmp(argv[idx], "--cpu") == 0 && idx + 1 < argc) {
+        da.cpu = atoi(argv[idx + 1]);
+        return 2;
+    }
+    if (strcmp(argv[idx], "--elf") == 0 && idx + 1 < argc) {
+        da.elfPath = argv[idx + 1];
+        return 2;
+    }
+    return parseCommonOption(argc, argv, idx, da.common);
+}
+
+static int debugCheckCpu(const DebugArgs& da)
+{
+    if (da.cpu < 0 || da.cpu >= wiggle_dbg::CPU_COUNT) {
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, "--cpu out of range (0-5)");
+        fprintf(stderr, "ERROR: --cpu out of range (0-5)\n");
+        return EXIT_USAGE_ERROR;
+    }
+    return EXIT_OK;
+}
+
+static int debugLoadElf(const DebugArgs& da)
+{
+    if (!da.elfPath) return EXIT_OK;
+    std::string err;
+    if (!g_elfTable.load(da.elfPath, err)) {
+        if (g_json) return jsonError(EXIT_IO_ERROR, "ELF load failed: " + err);
+        fprintf(stderr, "ERROR: ELF load failed: %s\n", err.c_str());
+        return EXIT_IO_ERROR;
+    }
+    return EXIT_OK;
+}
+
+// 符号标注 "<name+0xOFF>"；未加载/未命中返回空串
+static std::string symAnnotate(uint32_t addr)
+{
+    if (!g_elfTable.isLoaded()) return "";
+    uint32_t off = 0;
+    const wiggle_dbg::ElfSymbol* s = g_elfTable.findByAddr(addr, off);
+    if (!s) return "";
+    char buf[160];
+    snprintf(buf, sizeof(buf), " <%s+0x%X>", s->name.c_str(), off);
+    return std::string(buf);
+}
+
+static void debugPrintHelp(const char* cmd, const char* usage, const char* desc)
+{
+    printf("Usage: wiggle %s %s\n\n%s\n", cmd, usage, desc);
+    printf("Options:\n"
+           "  --cpu <n>           Core number (default 0)\n"
+           "  --elf <file>        Load ELF symbols for annotation\n"
+           "  --json              JSON output\n"
+           "  --server <ip>       TAS server IP (default: localhost)\n"
+           "  --target <id>       Target identifier\n"
+           "  --device <name>     Override device type\n"
+           "  --config-dir <path> DeviceConfigs JSON directory\n");
+}
+
+// halt 前置检查：CPU 必须 halted 才能读核心寄存器/回溯
+static int debugRequireHalted(CTasClientRw& client, int cpu)
+{
+    uint32_t dbgsr = 0;
+    if (!wiggle_dbg::isHalted(client, cpu, dbgsr)) {
+        const char* msg = "CPU must be halted first - run 'wiggle halt'";
+        if (g_json) return jsonError(EXIT_NOT_HALTED, msg);
+        fprintf(stderr, "ERROR: %s\n", msg);
+        return EXIT_NOT_HALTED;
+    }
+    return EXIT_OK;
+}
+
+static int doHalt(int argc, char** argv)
+{
+    DebugArgs da;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            debugPrintHelp("halt", "[options]",
+                "  Halt CPU. Probe order: BRKIN -> DBGSR -> reset-and-halt.\n"
+                "  Fallback to reset-and-halt loses running context (warned).");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    CommonArgs& args = da.common;
+    g_json = args.jsonOutput;
+    int rc = debugCheckCpu(da);
+    if (rc != EXIT_OK) return rc;
+    rc = debugLoadElf(da);
+    if (rc != EXIT_OK) return rc;
+
+    RESOLVE_CTX(ctx, "WiggleHalt", TAS_CLNT_DCO_HOT_ATTACH);
+
+    std::string diag;
+    wiggle_dbg::HaltResult r = wiggle_dbg::haltCpu(ctx.client, da.cpu, diag);
+    uint32_t dbgsr = 0, pc = 0;
+    wiggle_dbg::isHalted(ctx.client, da.cpu, dbgsr);
+    ctx.client.read32(wiggle_dbg::csfr(da.cpu, wiggle_dbg::OFF_PC), &pc);
+
+    if (r == wiggle_dbg::HaltResult::Failed) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, diag);
+        fprintf(stderr, "ERROR: %s\n", diag.c_str());
+        return EXIT_DEVICE_ERROR;
+    }
+    const char* method = "dbgsr";
+    switch (r) {
+        case wiggle_dbg::HaltResult::AlreadyHalted: method = "already_halted"; break;
+        case wiggle_dbg::HaltResult::HaltedBrkin:   method = "brkin"; break;
+        case wiggle_dbg::HaltResult::HaltedReset:   method = "reset"; break;
+        default: break;
+    }
+    if (r == wiggle_dbg::HaltResult::HaltedReset)
+        fprintf(stderr, "WARNING: %s\n", diag.c_str());
+
+    if (g_json) {
+        nljson j;
+        j["action"] = "halt";
+        j["cpu"] = da.cpu;
+        j["method"] = method;
+        j["dbgsr"] = dbgsr;
+        j["pc"] = pc;
+        if (r == wiggle_dbg::HaltResult::HaltedReset) j["warning"] = diag;
+        std::string sym = symAnnotate(pc);
+        if (!sym.empty()) j["pc_symbol"] = sym;
+        return jsonOk(j);
+    }
+    printf("CPU%d halted (method: %s). DBGSR=0x%08X PC=0x%08X%s\n",
+           da.cpu, method, dbgsr, pc, symAnnotate(pc).c_str());
+    return EXIT_OK;
+}
+
+static int doGo(int argc, char** argv)
+{
+    DebugArgs da;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            debugPrintHelp("go", "[options]",
+                "  Resume CPU execution (release BRKIN + clear DBGSR.HALT).\n"
+                "  Platforms with ineffective CLR_HALT report an error; use 'reset' instead.");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    CommonArgs& args = da.common;
+    g_json = args.jsonOutput;
+    int rc = debugCheckCpu(da);
+    if (rc != EXIT_OK) return rc;
+
+    RESOLVE_CTX(ctx, "WiggleGo", TAS_CLNT_DCO_HOT_ATTACH);
+
+    std::string diag;
+    wiggle_dbg::ResumeResult r = wiggle_dbg::resumeCpu(ctx.client, da.cpu, diag);
+    if (r == wiggle_dbg::ResumeResult::NotSupported) {
+        if (g_json) return jsonError(EXIT_RESUME_FAILED, diag);
+        fprintf(stderr, "ERROR: %s\n", diag.c_str());
+        return EXIT_RESUME_FAILED;
+    }
+    if (r == wiggle_dbg::ResumeResult::Failed) {
+        if (g_json) return jsonError(EXIT_DEVICE_ERROR, diag);
+        fprintf(stderr, "ERROR: %s\n", diag.c_str());
+        return EXIT_DEVICE_ERROR;
+    }
+    if (g_json) {
+        nljson j;
+        j["action"] = "go";
+        j["cpu"] = da.cpu;
+        j["state"] = (r == wiggle_dbg::ResumeResult::AlreadyRunning) ? "already_running" : "running";
+        return jsonOk(j);
+    }
+    printf("CPU%d %s.\n", da.cpu,
+           (r == wiggle_dbg::ResumeResult::AlreadyRunning) ? "already running" : "resumed");
+    return EXIT_OK;
+}
+
+// 核心寄存器名 → CSFR 地址（A0-A15/D0-D15/PC/PSW/PCXI，大小写不敏感）
+static bool coreRegAddr(int cpu, const std::string& name, uint64_t& addr)
+{
+    std::string up = name;
+    for (auto& ch : up) ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
+    if (up == "PC")   { addr = wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PC);   return true; }
+    if (up == "PSW")  { addr = wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PSW);  return true; }
+    if (up == "PCXI") { addr = wiggle_dbg::csfr(cpu, wiggle_dbg::OFF_PCXI); return true; }
+    if (up.size() >= 2 && (up[0] == 'A' || up[0] == 'D')) {
+        for (size_t k = 1; k < up.size(); k++)
+            if (!isdigit(static_cast<unsigned char>(up[k]))) return false;
+        int idx = atoi(up.c_str() + 1);
+        if (idx < 0 || idx > 15) return false;
+        uint32_t base = (up[0] == 'A') ? wiggle_dbg::OFF_A0 : wiggle_dbg::OFF_D0;
+        addr = wiggle_dbg::csfr(cpu, base + static_cast<uint32_t>(idx) * 4);
+        return true;
+    }
+    return false;
+}
+
+static int doCpuReg(int argc, char** argv)
+{
+    DebugArgs da;
+    const char* regName = nullptr;
+    const char* regValue = nullptr;
+    bool all = false;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--all") == 0) { all = true; i++; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            debugPrintHelp("cpu_reg", "[name] [value] | --all [options]",
+                "  Read/write core registers (requires halted CPU).\n"
+                "  Names: PC PSW PCXI A0-A15 D0-D15. No name = dump all.");
+            return EXIT_OK;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+            return EXIT_USAGE_ERROR;
+        }
+        if (!regName) regName = argv[i];
+        else if (!regValue) regValue = argv[i];
+        else {
+            fprintf(stderr, "ERROR: Too many arguments\n");
+            return EXIT_USAGE_ERROR;
+        }
+        i++;
+    }
+    CommonArgs& args = da.common;
+    g_json = args.jsonOutput;
+    int rc = debugCheckCpu(da);
+    if (rc != EXIT_OK) return rc;
+    rc = debugLoadElf(da);
+    if (rc != EXIT_OK) return rc;
+
+    RESOLVE_CTX(ctx, "WiggleCpuReg", TAS_CLNT_DCO_HOT_ATTACH);
+    rc = debugRequireHalted(ctx.client, da.cpu);
+    if (rc != EXIT_OK) return rc;
+
+    // 写寄存器：name + value
+    if (regName && regValue) {
+        uint64_t addr = 0;
+        uint32_t val = 0;
+        if (!coreRegAddr(da.cpu, regName, addr) || !parseHexAddr(regValue, val)) {
+            const char* msg = "invalid register name or value (names: PC PSW PCXI A0-A15 D0-D15)";
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_USAGE_ERROR;
+        }
+        if (ctx.client.write32(addr, val) != TAS_ERR_NONE) {
+            const char* msg = "core register write failed";
+            if (g_json) return jsonError(EXIT_IO_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_IO_ERROR;
+        }
+        uint32_t rb = 0;
+        ctx.client.read32(addr, &rb);
+        if (g_json) {
+            nljson j;
+            j["action"] = "cpu_reg_write";
+            j["register"] = regName;
+            j["value"] = val;
+            j["readback"] = rb;
+            return jsonOk(j);
+        }
+        printf("%s = 0x%08X (readback 0x%08X)\n", regName, val, rb);
+        return EXIT_OK;
+    }
+
+    // 单寄存器读
+    if (regName && !all) {
+        uint64_t addr = 0;
+        if (!coreRegAddr(da.cpu, regName, addr)) {
+            const char* msg = "invalid register name (PC PSW PCXI A0-A15 D0-D15)";
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_USAGE_ERROR;
+        }
+        uint32_t val = 0;
+        if (ctx.client.read32(addr, &val) != TAS_ERR_NONE) {
+            const char* msg = "core register read failed";
+            if (g_json) return jsonError(EXIT_IO_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_IO_ERROR;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "cpu_reg_read";
+            j["register"] = regName;
+            j["value"] = val;
+            return jsonOk(j);
+        }
+        printf("%s = 0x%08X%s\n", regName, val,
+               (strcmp(regName, "PC") == 0) ? symAnnotate(val).c_str() : "");
+        return EXIT_OK;
+    }
+
+    // 全量转储
+    wiggle_dbg::CoreRegs regs;
+    if (!wiggle_dbg::readCoreRegs(ctx.client, da.cpu, regs)) {
+        const char* msg = "core register dump failed";
+        if (g_json) return jsonError(EXIT_IO_ERROR, msg);
+        fprintf(stderr, "ERROR: %s\n", msg);
+        return EXIT_IO_ERROR;
+    }
+    if (g_json) {
+        nljson j;
+        j["action"] = "cpu_reg";
+        j["cpu"] = da.cpu;
+        j["pc"] = regs.pc;
+        j["psw"] = regs.psw;
+        j["pcxi"] = regs.pcxi;
+        j["a"] = nljson::array();
+        j["d"] = nljson::array();
+        for (int i = 0; i < 16; i++) { j["a"].push_back(regs.a[i]); j["d"].push_back(regs.d[i]); }
+        std::string sym = symAnnotate(regs.pc);
+        if (!sym.empty()) j["pc_symbol"] = sym;
+        return jsonOk(j);
+    }
+    printf("CPU%d core registers:\n", da.cpu);
+    printf("  PC   = 0x%08X%s\n", regs.pc, symAnnotate(regs.pc).c_str());
+    printf("  PSW  = 0x%08X  PCXI = 0x%08X\n", regs.psw, regs.pcxi);
+    for (int i = 0; i < 16; i++)
+        printf("  A%-2d = 0x%08X   D%-2d = 0x%08X\n", i, regs.a[i], i, regs.d[i]);
+    return EXIT_OK;
+}
+
+static int doBreak(int argc, char** argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "Usage: wiggle break <add|del|list|clear> [args]\n");
+        return EXIT_USAGE_ERROR;
+    }
+    std::string sub = argv[0];
+    DebugArgs da;
+    const char* posArg = nullptr;
+    for (int i = 1; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            debugPrintHelp("break", "<add|del|list|clear> [addr|slot] [options]",
+                "  Hardware breakpoints (8 slots, TRiEVT/TRiADR, instruction halt).\n"
+                "  add <hex addr> | del <slot 0-7 or hex addr> | list | clear");
+            return EXIT_OK;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+            return EXIT_USAGE_ERROR;
+        }
+        posArg = argv[i];
+        i++;
+    }
+    CommonArgs& args = da.common;
+    g_json = args.jsonOutput;
+    int rc = debugCheckCpu(da);
+    if (rc != EXIT_OK) return rc;
+
+    RESOLVE_CTX(ctx, "WiggleBreak", TAS_CLNT_DCO_HOT_ATTACH);
+
+    if (sub == "add") {
+        uint32_t addr = 0;
+        if (!posArg || !parseHexAddr(posArg, addr)) {
+            const char* msg = "break add requires a hex address";
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_USAGE_ERROR;
+        }
+        int slot = wiggle_dbg::bpAdd(ctx.client, da.cpu, addr);
+        if (slot < 0) {
+            const char* msg = "breakpoint add failed (no free slot or register write error)";
+            if (g_json) return jsonError(EXIT_DEVICE_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_DEVICE_ERROR;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "break_add";
+            j["slot"] = slot;
+            j["address"] = addr;
+            return jsonOk(j);
+        }
+        printf("Breakpoint set: slot %d @ 0x%08X%s\n", slot, addr, symAnnotate(addr).c_str());
+        return EXIT_OK;
+    }
+    if (sub == "del") {
+        if (!posArg) {
+            const char* msg = "break del requires slot (0-7) or hex address";
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_USAGE_ERROR;
+        }
+        int slot = -1;
+        bool decimal = true;
+        for (const char* p = posArg; *p; p++)
+            if (!isdigit(static_cast<unsigned char>(*p))) { decimal = false; break; }
+        if (decimal && atoi(posArg) < static_cast<int>(wiggle_dbg::BP_COUNT)) {
+            slot = atoi(posArg);
+        } else {
+            uint32_t addr = 0;
+            if (!parseHexAddr(posArg, addr)) {
+                const char* msg = "invalid slot or address";
+                if (g_json) return jsonError(EXIT_USAGE_ERROR, msg);
+                fprintf(stderr, "ERROR: %s\n", msg);
+                return EXIT_USAGE_ERROR;
+            }
+            wiggle_dbg::BpSlot slots[wiggle_dbg::BP_COUNT];
+            if (wiggle_dbg::bpReadAll(ctx.client, da.cpu, slots)) {
+                for (uint32_t i = 0; i < wiggle_dbg::BP_COUNT; i++)
+                    if (slots[i].adr == addr && (slots[i].evt & wiggle_dbg::TRIEVT_EVTA_MASK))
+                        slot = static_cast<int>(i);
+            }
+        }
+        if (slot < 0 || !wiggle_dbg::bpDel(ctx.client, da.cpu, slot)) {
+            const char* msg = "breakpoint not found or delete failed";
+            if (g_json) return jsonError(EXIT_NOT_FOUND, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_NOT_FOUND;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "break_del";
+            j["slot"] = slot;
+            return jsonOk(j);
+        }
+        printf("Breakpoint slot %d deleted.\n", slot);
+        return EXIT_OK;
+    }
+    if (sub == "list") {
+        wiggle_dbg::BpSlot slots[wiggle_dbg::BP_COUNT];
+        if (!wiggle_dbg::bpReadAll(ctx.client, da.cpu, slots)) {
+            const char* msg = "breakpoint register read failed";
+            if (g_json) return jsonError(EXIT_IO_ERROR, msg);
+            fprintf(stderr, "ERROR: %s\n", msg);
+            return EXIT_IO_ERROR;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "break_list";
+            j["breakpoints"] = nljson::array();
+            for (uint32_t i = 0; i < wiggle_dbg::BP_COUNT; i++) {
+                nljson b;
+                b["slot"] = i;
+                b["address"] = slots[i].adr;
+                b["evt"] = slots[i].evt;
+                b["active"] = (slots[i].evt & wiggle_dbg::TRIEVT_EVTA_MASK) != 0;
+                j["breakpoints"].push_back(b);
+            }
+            return jsonOk(j);
+        }
+        printf("Hardware breakpoints (CPU%d):\n", da.cpu);
+        for (uint32_t i = 0; i < wiggle_dbg::BP_COUNT; i++) {
+            bool active = (slots[i].evt & wiggle_dbg::TRIEVT_EVTA_MASK) != 0;
+            printf("  slot %u: %s  addr=0x%08X evt=0x%08X\n", i,
+                   active ? "SET " : "free", slots[i].adr, slots[i].evt);
+        }
+        return EXIT_OK;
+    }
+    if (sub == "clear") {
+        wiggle_dbg::bpClear(ctx.client, da.cpu);
+        if (g_json) {
+            nljson j;
+            j["action"] = "break_clear";
+            return jsonOk(j);
+        }
+        printf("All breakpoints cleared.\n");
+        return EXIT_OK;
+    }
+    fprintf(stderr, "ERROR: Unknown break subcommand '%s' (add|del|list|clear)\n", sub.c_str());
+    return EXIT_USAGE_ERROR;
+}
+
+static int doStep(int argc, char** argv)
+{
+    DebugArgs da;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            debugPrintHelp("step", "[options]",
+                "  Single-step via temporary breakpoints at PC+2/PC+4.\n"
+                "  Requires resume capability; unsupported platforms report an error.");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    CommonArgs& args = da.common;
+    g_json = args.jsonOutput;
+    int rc = debugCheckCpu(da);
+    if (rc != EXIT_OK) return rc;
+    rc = debugLoadElf(da);
+    if (rc != EXIT_OK) return rc;
+
+    RESOLVE_CTX(ctx, "WiggleStep", TAS_CLNT_DCO_HOT_ATTACH);
+    rc = debugRequireHalted(ctx.client, da.cpu);
+    if (rc != EXIT_OK) return rc;
+
+    uint32_t newPc = 0;
+    std::string diag;
+    bool ok = wiggle_dbg::stepOnce(ctx.client, da.cpu, newPc, diag);
+    if (!ok) {
+        int code = (diag.find("resume") != std::string::npos) ? EXIT_RESUME_FAILED : EXIT_DEVICE_ERROR;
+        if (g_json) return jsonError(code, diag);
+        fprintf(stderr, "ERROR: %s\n", diag.c_str());
+        return code;
+    }
+    if (g_json) {
+        nljson j;
+        j["action"] = "step";
+        j["cpu"] = da.cpu;
+        j["pc"] = newPc;
+        std::string sym = symAnnotate(newPc);
+        if (!sym.empty()) j["pc_symbol"] = sym;
+        return jsonOk(j);
+    }
+    printf("Stepped to PC=0x%08X%s\n", newPc, symAnnotate(newPc).c_str());
+    return EXIT_OK;
+}
+
+static int doBt(int argc, char** argv)
+{
+    DebugArgs da;
+    for (int i = 0; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            debugPrintHelp("bt", "[options]",
+                "  Call-stack backtrace via CSA chain (requires halted CPU).\n"
+                "  Use --elf <file> for symbol annotation.");
+            return EXIT_OK;
+        }
+        fprintf(stderr, "ERROR: Unknown option '%s'\n", argv[i]);
+        return EXIT_USAGE_ERROR;
+    }
+    CommonArgs& args = da.common;
+    g_json = args.jsonOutput;
+    int rc = debugCheckCpu(da);
+    if (rc != EXIT_OK) return rc;
+    rc = debugLoadElf(da);
+    if (rc != EXIT_OK) return rc;
+
+    RESOLVE_CTX(ctx, "WiggleBt", TAS_CLNT_DCO_HOT_ATTACH);
+    rc = debugRequireHalted(ctx.client, da.cpu);
+    if (rc != EXIT_OK) return rc;
+
+    std::vector<wiggle_dbg::BtFrame> frames;
+    if (!wiggle_dbg::backtrace(ctx.client, da.cpu, frames)) {
+        const char* msg = "backtrace failed (core register read error)";
+        if (g_json) return jsonError(EXIT_IO_ERROR, msg);
+        fprintf(stderr, "ERROR: %s\n", msg);
+        return EXIT_IO_ERROR;
+    }
+    if (g_json) {
+        nljson j;
+        j["action"] = "bt";
+        j["cpu"] = da.cpu;
+        j["frames"] = nljson::array();
+        for (size_t i = 0; i < frames.size(); i++) {
+            nljson f;
+            f["index"] = i;
+            f["pc"] = frames[i].pc;
+            f["csa"] = frames[i].csa;
+            uint32_t off = 0;
+            const wiggle_dbg::ElfSymbol* s =
+                g_elfTable.isLoaded() ? g_elfTable.findByAddr(frames[i].pc, off) : nullptr;
+            if (s) { f["symbol"] = s->name; f["offset"] = off; }
+            j["frames"].push_back(f);
+        }
+        return jsonOk(j);
+    }
+    printf("Call stack (CPU%d, %zu frames):\n", da.cpu, frames.size());
+    for (size_t i = 0; i < frames.size(); i++)
+        printf("  #%zu  PC=0x%08X%s\n", i, frames[i].pc, symAnnotate(frames[i].pc).c_str());
+    return EXIT_OK;
+}
+
+static int doSym(int argc, char** argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "Usage: wiggle sym <load|list|addr|name> [args]\n");
+        return EXIT_USAGE_ERROR;
+    }
+    std::string sub = argv[0];
+    DebugArgs da;
+    const char* posArg = nullptr;
+    for (int i = 1; i < argc; ) {
+        int consumed = parseDebugOption(argc, argv, i, da);
+        if (consumed > 0) { i += consumed; continue; }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: wiggle sym <load|list|addr|name> [args] [--elf <file>]\n\n"
+                   "  load <file.elf>   Load TriCore ELF32 symbol table\n"
+                   "  list [filter]     List symbols (max 100)\n"
+                   "  addr <hex>        Address -> symbol\n"
+                   "  name <symbol>     Symbol -> address\n"
+                   "  --elf <file>      Load symbols for this invocation (CLI one-shot)\n");
+            return EXIT_OK;
+        }
+        posArg = argv[i];
+        i++;
+    }
+    g_json = da.common.jsonOutput;
+    if (da.elfPath && sub != "load") {
+        int rc = debugLoadElf(da);
+        if (rc != EXIT_OK) return rc;
+    }
+
+    if (sub == "load") {
+        if (!posArg) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "sym load requires a file path");
+            fprintf(stderr, "ERROR: sym load requires a file path\n");
+            return EXIT_USAGE_ERROR;
+        }
+        std::string err;
+        if (!g_elfTable.load(posArg, err)) {
+            if (g_json) return jsonError(EXIT_IO_ERROR, "ELF load failed: " + err);
+            fprintf(stderr, "ERROR: ELF load failed: %s\n", err.c_str());
+            return EXIT_IO_ERROR;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "sym_load";
+            j["file"] = posArg;
+            j["symbols"] = g_elfTable.count();
+            return jsonOk(j);
+        }
+        printf("Loaded %zu symbols from %s\n", g_elfTable.count(), posArg);
+        return EXIT_OK;
+    }
+
+    if (!g_elfTable.isLoaded()) {
+        const char* msg = "no ELF loaded - use 'sym load <file>' first";
+        if (g_json) return jsonError(EXIT_USAGE_ERROR, msg);
+        fprintf(stderr, "ERROR: %s\n", msg);
+        return EXIT_USAGE_ERROR;
+    }
+    if (sub == "list") {
+        auto syms = g_elfTable.list(posArg ? posArg : "", 100);
+        if (g_json) {
+            nljson j;
+            j["action"] = "sym_list";
+            j["symbols"] = nljson::array();
+            for (const auto* s : syms) {
+                nljson e;
+                e["name"] = s->name;
+                e["value"] = s->value;
+                e["size"] = s->size;
+                e["type"] = (s->type == 2) ? "FUNC" : "OBJECT";
+                j["symbols"].push_back(e);
+            }
+            return jsonOk(j);
+        }
+        for (const auto* s : syms)
+            printf("  0x%08X  %6u  %s  %s\n", s->value, s->size,
+                   (s->type == 2) ? "FUNC" : "OBJ ", s->name.c_str());
+        printf("(%zu shown)\n", syms.size());
+        return EXIT_OK;
+    }
+    if (sub == "addr") {
+        uint32_t addr = 0;
+        if (!posArg || !parseHexAddr(posArg, addr)) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "sym addr requires a hex address");
+            fprintf(stderr, "ERROR: sym addr requires a hex address\n");
+            return EXIT_USAGE_ERROR;
+        }
+        uint32_t off = 0;
+        const wiggle_dbg::ElfSymbol* s = g_elfTable.findByAddr(addr, off);
+        if (!s) {
+            if (g_json) return jsonError(EXIT_NOT_FOUND, "no symbol at or before address");
+            fprintf(stderr, "ERROR: no symbol at or before 0x%08X\n", addr);
+            return EXIT_NOT_FOUND;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "sym_addr";
+            j["address"] = addr;
+            j["name"] = s->name;
+            j["value"] = s->value;
+            j["offset"] = off;
+            return jsonOk(j);
+        }
+        printf("0x%08X = %s+0x%X\n", addr, s->name.c_str(), off);
+        return EXIT_OK;
+    }
+    if (sub == "name") {
+        if (!posArg) {
+            if (g_json) return jsonError(EXIT_USAGE_ERROR, "sym name requires a symbol name");
+            fprintf(stderr, "ERROR: sym name requires a symbol name\n");
+            return EXIT_USAGE_ERROR;
+        }
+        const wiggle_dbg::ElfSymbol* s = g_elfTable.findByName(posArg);
+        if (!s) {
+            if (g_json) return jsonError(EXIT_NOT_FOUND, "symbol not found");
+            fprintf(stderr, "ERROR: symbol '%s' not found\n", posArg);
+            return EXIT_NOT_FOUND;
+        }
+        if (g_json) {
+            nljson j;
+            j["action"] = "sym_name";
+            j["name"] = s->name;
+            j["value"] = s->value;
+            j["size"] = s->size;
+            return jsonOk(j);
+        }
+        printf("%s = 0x%08X (size %u)\n", s->name.c_str(), s->value, s->size);
+        return EXIT_OK;
+    }
+    fprintf(stderr, "ERROR: Unknown sym subcommand '%s' (load|list|addr|name)\n", sub.c_str());
+    return EXIT_USAGE_ERROR;
+}
+
+//********************************************************************************************************************
 //  doShell - interactive REPL
 //********************************************************************************************************************
 
@@ -4232,6 +4961,7 @@ static int doShell(int argc, char** argv)
         if (cmd == "quit" || cmd == "exit" || cmd == "q") break;
         if (cmd == "help" || cmd == "?") {
             printf("Commands: erase write rewrite restore read dump poke reg status info compare search reset list shell help quit\n");
+            printf("Debugger: halt go cpu_reg(cr) break(bp) step(s) bt sym\n");
             continue;
         }
 
@@ -4257,6 +4987,13 @@ static int doShell(int argc, char** argv)
         else if (cmd == "read") doRead(subArgc, subArgvPtr);
         else if (cmd == "reset") doReset(subArgc, subArgvPtr);
         else if (cmd == "list") doList(subArgc, subArgvPtr);
+        else if (cmd == "halt") doHalt(subArgc, subArgvPtr);
+        else if (cmd == "go" || cmd == "resume") doGo(subArgc, subArgvPtr);
+        else if (cmd == "cpu_reg" || cmd == "cr") doCpuReg(subArgc, subArgvPtr);
+        else if (cmd == "break" || cmd == "bp") doBreak(subArgc, subArgvPtr);
+        else if (cmd == "step" || cmd == "s") doStep(subArgc, subArgvPtr);
+        else if (cmd == "bt" || cmd == "backtrace") doBt(subArgc, subArgvPtr);
+        else if (cmd == "sym") doSym(subArgc, subArgvPtr);
         else printf("Unknown command '%s'. Type 'help' for list.\n", cmd.c_str());
         fflush(stdout);  // Ensure output is flushed to pipe for MCP integration
     }
@@ -4297,6 +5034,14 @@ static void printUsage(const char* progName, const DeviceConfigLoader* loader = 
     printf("  compare  Compare local file with Flash content\n");
     printf("  search   Search memory for byte pattern\n");
     printf("  shell    Interactive REPL mode\n\n");
+    printf("Debugger:\n");
+    printf("  halt     Halt CPU (BRKIN -> DBGSR -> reset-and-halt probe)\n");
+    printf("  go       Resume CPU execution (alias: resume)\n");
+    printf("  cpu_reg  Read/write core registers PC/PSW/A0-A15/D0-D15 (alias: cr)\n");
+    printf("  break    Hardware breakpoints add/del/list/clear (alias: bp)\n");
+    printf("  step     Single-step (alias: s)\n");
+    printf("  bt       Call-stack backtrace via CSA chain\n");
+    printf("  sym      ELF symbol load/list/addr/name\n\n");
     printf("Legacy (backward compatible):\n");
     printf("  %s <addr> <num_sectors> [options]\n", base);
     printf("  %s --all [options]\n", base);
@@ -4367,6 +5112,15 @@ int main(int argc, char** argv)
     if (first == "compare") return doCompare(argc - 2, argv + 2);
     if (first == "search") return doSearch(argc - 2, argv + 2);
     if (first == "shell") return doShell(argc - 2, argv + 2);
+
+    // Debugger subcommands
+    if (first == "halt") return doHalt(argc - 2, argv + 2);
+    if (first == "go" || first == "resume") return doGo(argc - 2, argv + 2);
+    if (first == "cpu_reg" || first == "cr") return doCpuReg(argc - 2, argv + 2);
+    if (first == "break" || first == "bp") return doBreak(argc - 2, argv + 2);
+    if (first == "step" || first == "s") return doStep(argc - 2, argv + 2);
+    if (first == "bt" || first == "backtrace") return doBt(argc - 2, argv + 2);
+    if (first == "sym") return doSym(argc - 2, argv + 2);
 
     if (first == "ucb") {
         if (argc < 3) { printUcbUsage(argv[0]); return EXIT_USAGE_ERROR; }

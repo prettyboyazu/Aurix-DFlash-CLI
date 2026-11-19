@@ -146,6 +146,13 @@ wiggle <subcommand> [options]
 | `compare` | | Compare local file with Flash content |
 | `search` | | Search memory for byte pattern |
 | `shell` | | Interactive REPL mode |
+| `halt` | | Halt CPU (BRKIN → DBGSR → reset-and-halt probe) |
+| `go` | `resume` | Resume CPU execution |
+| `cpu_reg` | `cr` | Read/write core registers (PC/PSW/A0-A15/D0-D15) |
+| `break` | `bp` | Hardware breakpoints: add/del/list/clear (8 slots) |
+| `step` | `s` | Single-step one instruction |
+| `bt` | `backtrace` | Call-stack backtrace via CSA chain |
+| `sym` | | ELF symbol load/list/addr/name (native C++ parser) |
 
 ### Global Options
 
@@ -342,6 +349,51 @@ wiggle ucb erase --addr AF400000 --sectors 4 --verify
 ```
 
 Locked regions (`AF400800`–`AF400FFF`, `AF401800`–`AF401FFF`) cannot be erased — the tool will abort with an error.
+
+---
+
+## Debugger (execution control, registers, breakpoints, symbols)
+
+All debugger commands accept `--cpu <n>` (default 0) and `--elf <file>` for symbol
+annotation. They connect with HOT_ATTACH by default (non-intrusive).
+
+```bash
+# Halt CPU (probe: BRKIN -> DBGSR -> reset-and-halt fallback with warning)
+wiggle halt
+
+# Core registers (requires halted CPU)
+wiggle cpu_reg            # dump PC/PSW/PCXI/A0-A15/D0-D15
+wiggle cpu_reg PC         # single register
+wiggle cpu_reg A0 0x70000000   # write register
+
+# Hardware breakpoints (8 TRiEVT/TRiADR slots, instruction halt)
+wiggle break add 0x80000100
+wiggle break list
+wiggle break del 0        # by slot, or by hex address
+wiggle break clear
+
+# Single-step / backtrace
+wiggle step
+wiggle bt --elf app.elf
+
+# ELF symbols (native C++ ELF32 parser, no Python deps)
+wiggle sym load app.elf          # shell mode: persists across commands
+wiggle sym addr 0x80000100 --elf app.elf
+wiggle sym name main --elf app.elf
+wiggle sym list IfxCpu --elf app.elf
+```
+
+**Platform capability notes** (verified on TriBoard TC36x + TasServer V2.0):
+
+- `halt`: BRKIN and DBGSR-set-halt are unavailable on TriBoard; the tool falls
+  back to `reset-and-halt` and **warns that running context is lost**. On probes
+  with working DBGSR halt or a connected BRKIN line, halt is non-destructive.
+- `go` / `step`: require resume. Platforms where `DBGSR.CLR_HALT` writes are
+  ineffective return exit code 27 with a clear diagnostic — use `wiggle reset`
+  to restart execution. The tool never silently resets to fake a resume.
+- `cpu_reg` / `bt`: work whenever the CPU is halted (including after
+  `reset --halt` or the halt fallback). Backtrace walks the CSA chain with
+  cycle detection and a 64-frame cap.
 
 ---
 
@@ -565,6 +617,10 @@ Device parameters (DFlash base address, sector size, total size) are loaded from
 | 18–20 | Read / write / file failed |
 | 21 | Restore failed |
 | 22–23 | UCB locked / unsupported device |
+| 24 | Write page timeout |
+| 25 | Search results truncated |
+| 26 | Debug operation requires halted CPU |
+| 27 | Resume not supported on this platform (DBGSR.CLR_HALT ineffective) |
 
 ---
 

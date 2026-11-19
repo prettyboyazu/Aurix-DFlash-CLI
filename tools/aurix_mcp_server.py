@@ -1497,6 +1497,31 @@ def parse_elf(functions: bool = False, variables: bool = False,
     return format_result(result)
 
 
+# ---------------- 地址区域识别(2026-11-15 新增) ----------------
+def _addr_region_info(addr):
+    """TC2xx 地址区域识别与 wiggle 可用物理地址换算。
+
+    mcp:vtc:linear 等链接器虚拟地址不能直接喂 wiggle_dump/read/write
+    (S3Server 排查实踩: 旧版只回 linear 数字)。PFlash cached 0x8x -> 物理区
+    0xAx(+0x2000_0000); DSPR 0xDx 别名 -> 0x7x 视图(-0x6000_0000); SFR 原样。"""
+    if 0x80000000 <= addr < 0x81000000:
+        return {"region": "PFlash(cached/linear)", "wiggle_addr": hex(addr + 0x20000000),
+                "addr_note": "wiggle 工具请用 wiggle_addr(0xA0000000 物理区)"}
+    if 0xA0000000 <= addr < 0xA1000000:
+        return {"region": "PFlash(physical)", "wiggle_addr": hex(addr),
+                "addr_note": "已是物理地址(部分 TAS 版本 PFlash 直接读受限)"}
+    if 0x70000000 <= addr < 0x70200000:
+        return {"region": "DSPR(0x7000 uncached view)", "wiggle_addr": hex(addr),
+                "addr_note": "SRAM 变量 wiggle 直接可读"}
+    if 0xD0000000 <= addr < 0xD0200000:
+        return {"region": "DSPR(0xD000 alias)", "wiggle_addr": hex(addr - 0x60000000),
+                "addr_note": "wiggle 用 0x7000 视图(wiggle_addr)"}
+    if 0xF0000000 <= addr <= 0xFFFFFFFF:
+        return {"region": "SFR", "wiggle_addr": hex(addr),
+                "addr_note": "外设寄存器直接可读"}
+    return {"region": "unknown", "wiggle_addr": hex(addr),
+            "addr_note": "未识别区域, 原样返回"}
+
 @mcp.tool()
 def lookup_symbol(name: str, source: str = "all") -> str:
     """Look up a symbol by name across MAP/LST/ELF files.
@@ -1528,6 +1553,16 @@ def lookup_symbol(name: str, source: str = "all") -> str:
         return format_result({"status": "not_found",
                               "message": f"Symbol '{name}' not found in any source.",
                               "searched": source})
+    for sym in results:
+        try:
+            info = _addr_region_info(int(sym.get("address", 0)))
+            sym.update(info)
+            if sym.get("source") == "tasking_map":
+                sym["map_warning"] = ("MAP 为链接器逻辑地址: Flash 符号通常等于运行地址,"
+                                      "但 RAM 变量(.bss/.data)与运行时 DSPR 地址不同——"
+                                      "以 ELF 源结果或反汇编 lea 偏移为准")
+        except (TypeError, ValueError):
+            pass
     return format_result({"status": "ok", "results": results})
 
 
@@ -1546,6 +1581,8 @@ def lookup_address(address: str, source: str = "all") -> str:
     except ValueError:
         return json.dumps({"status": "error",
                            "message": f"Invalid hex address: {address}"})
+
+    query_info = _addr_region_info(addr)
 
     results = []
 
@@ -1572,12 +1609,173 @@ def lookup_address(address: str, source: str = "all") -> str:
     if not results and not addr_translation:
         return format_result({"status": "not_found",
                               "message": f"No symbol found near address {address}",
-                              "searched": source})
+                              "searched": source,
+                              "query_addr_info": query_info})
 
-    resp = {"status": "ok", "address": address, "results": results}
+    resp = {"status": "ok", "address": address, "results": results,
+            "query_addr_info": query_info}
     if addr_translation:
         resp["address_translation"] = addr_translation
     return format_result(resp)
+
+
+
+# ---------------------------------------------------------------------------
+# Debugger tools (halt / go / cpu_reg / break / step / bt / sym)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def wiggle_halt(
+    cpu: int = 0,
+    elf_file: str = "",
+    confirm_risk: bool = False,
+    server: str = "",
+    target: str = "",
+) -> str:
+    """Halt CPU for debugging. Probe order: BRKIN -> DBGSR -> reset-and-halt.
+    WARNING: on platforms without working DBGSR halt (e.g. TriBoard) this falls
+    back to reset-and-halt and LOSES running context; confirm_risk=True is
+    required to acknowledge. Result 'method' field tells which path was used
+    (already_halted / brkin / dbgsr / reset). elf_file annotates PC with symbols.
+    """
+    if not confirm_risk:
+        return json.dumps({"status": "error",
+                           "message": "wiggle_halt may fall back to reset-and-halt "
+                                      "(loses running context). Set confirm_risk=True "
+                                      "to acknowledge and proceed."})
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    args = ["halt", "--cpu", str(cpu)]
+    if elf_file:
+        args += ["--elf", elf_file]
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_go(cpu: int = 0, server: str = "", target: str = "") -> str:
+    """Resume CPU execution (release BRKIN + clear DBGSR.HALT).
+    Platforms with ineffective CLR_HALT (e.g. TriBoard) return error code 27;
+    use wiggle_reset to restart execution there.
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    return format_result(run_wiggle(["go", "--cpu", str(cpu)], cfg))
+
+
+@mcp.tool()
+def wiggle_cpu_reg(
+    name: str = "",
+    value: str = "",
+    cpu: int = 0,
+    elf_file: str = "",
+    server: str = "",
+    target: str = "",
+) -> str:
+    """Read/write core registers (requires halted CPU; run wiggle_halt first).
+    No name: dump PC/PSW/PCXI/A0-A15/D0-D15. name only: read one register.
+    name+value: write register (value in hex). Names: PC PSW PCXI A0-A15 D0-D15.
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    args = ["cpu_reg", "--cpu", str(cpu)]
+    if name:
+        args.append(name)
+        if value:
+            args.append(value)
+    if elf_file:
+        args += ["--elf", elf_file]
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_break(
+    action: str = "list",
+    address: str = "",
+    slot: int = -1,
+    cpu: int = 0,
+    server: str = "",
+    target: str = "",
+) -> str:
+    """Hardware breakpoints (8 slots, instruction-address halt triggers).
+    action='add' needs address (hex); 'del' needs slot (0-7) or address;
+    'list' shows all slots; 'clear' removes all. Settings live in CPU trigger
+    registers and persist until reset.
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    args = ["break", action, "--cpu", str(cpu)]
+    if action == "add":
+        if not address:
+            return json.dumps({"status": "error", "message": "address required for add"})
+        args.append(address)
+    elif action == "del":
+        if slot >= 0:
+            args.append(str(slot))
+        elif address:
+            args.append(address)
+        else:
+            return json.dumps({"status": "error", "message": "slot or address required for del"})
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_step(cpu: int = 0, elf_file: str = "", server: str = "", target: str = "") -> str:
+    """Single-step one instruction (temporary breakpoints at PC+2/PC+4).
+    Requires halted CPU and resume capability; unsupported platforms return
+    error code 27. Returns new PC, symbol-annotated when elf_file given.
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    args = ["step", "--cpu", str(cpu)]
+    if elf_file:
+        args += ["--elf", elf_file]
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_bt(cpu: int = 0, elf_file: str = "", server: str = "", target: str = "") -> str:
+    """Call-stack backtrace via CSA chain (requires halted CPU).
+    Returns frames with PC and, when elf_file given, symbol name + offset.
+    """
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    args = ["bt", "--cpu", str(cpu)]
+    if elf_file:
+        args += ["--elf", elf_file]
+    return format_result(run_wiggle(args, cfg))
+
+
+@mcp.tool()
+def wiggle_sym(
+    action: str = "addr",
+    arg: str = "",
+    elf_file: str = "",
+    server: str = "",
+    target: str = "",
+) -> str:
+    """ELF symbol queries (TriCore ELF32, parsed natively by wiggle).
+    action='addr': arg=hex address -> symbol+offset; 'name': arg=symbol ->
+    address+size; 'list': arg=optional substring filter (max 100).
+    elf_file is required (CLI invocations are one-shot).
+    """
+    if not elf_file:
+        return json.dumps({"status": "error", "message": "elf_file required"})
+    if action not in ("addr", "name", "list"):
+        return json.dumps({"status": "error", "message": "action must be addr|name|list"})
+    cfg = dict(_config)
+    if server: cfg["server"] = server
+    if target: cfg["target"] = target
+    args = ["sym", action]
+    if arg:
+        args.append(arg)
+    args += ["--elf", elf_file]
+    return format_result(run_wiggle(args, cfg))
 
 
 # ---------------------------------------------------------------------------

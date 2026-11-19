@@ -30,6 +30,10 @@ set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/hex_parser.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/svd_loader.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/svd_loader.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/debug_ctrl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/debug_ctrl.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wiggle.rc"
 )
 
@@ -64,6 +68,7 @@ if (MSVC)
     target_compile_options(${EXE_NAME} PRIVATE
         /W3
         /MP
+        /utf-8  # 中文注释 UTF-8 源码必须显式指定，否则 GBK 码页尾字节 0x5C 引发行接续吞代码
         "$<$<CONFIG:Release>:"
             "/O2"
         ">"
