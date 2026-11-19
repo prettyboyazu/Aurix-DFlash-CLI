@@ -38,6 +38,8 @@ set(NO_GROUP_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/debug_session.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/tricore_disasm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tricore_disasm.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gdb_stub.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gdb_stub.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/elf_symbols.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wiggle.rc"
@@ -50,6 +52,10 @@ add_executable(${EXE_NAME}
 )
 
 target_link_libraries(${EXE_NAME} tas_client)
+
+if (WIN32)
+    target_link_libraries(${EXE_NAME} ws2_32)
+endif()
 
 # Include path for third-party headers (nlohmann/json)
 target_include_directories(${EXE_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/src/third_party")

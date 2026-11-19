@@ -159,6 +159,7 @@ wiggle <subcommand> [options]
 | `sample` | | Live double-sampling (torn-read protection / counter rate) |
 | `bt` | `backtrace` | Call-stack backtrace via CSA chain |
 | `sym` | | ELF symbol load/list/addr/name (native C++ parser) |
+| `gdbserver` | | GDB RSP server (`target remote :3333`), exposes MCD to GDB/IDE |
 
 ### Global Options
 
@@ -462,6 +463,22 @@ MCP server (Python thin wrapper: tools / risk gates / transport)
 - Address-view normalization for data R/W: DSPR `0xD0…`→`0x70…`, PFlash
   `0x80…`→`0xA0…` (IP breakpoint addresses stay in execution view).
 - `halt --global` / MCP `global_halt`: multi-core synchronous stop (MCD).
+
+**GDB / IDE integration** (`gdbserver`):
+
+```bash
+wiggle gdbserver --port 3333        # GDB RSP server over TCP (MCD backend)
+# in GDB (TriCore-capable):
+#   (gdb) target remote :3333
+#   (gdb) file app.elf              # GDB reads DWARF: source/line/disasm/expressions
+#   (gdb) break main / continue / step / info registers / x/16xw 0x70000000
+```
+
+The stub implements the GDB Remote Serial Protocol (registers via `target.xml`,
+memory R/W, hw/sw breakpoints `Z0/Z1`, watchpoints `Z2/3/4`, continue/step/vCont,
+Ctrl-C interrupt). GDB itself supplies source-level stepping, disassembly and
+expression evaluation from the ELF's DWARF — the stub only provides target
+access. Verified with an RSP client (regs/mem/break/continue/step/detach).
 
 ---
 

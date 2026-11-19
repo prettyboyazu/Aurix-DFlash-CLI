@@ -38,6 +38,7 @@
 #include "elf_symbols.h"
 #include "mcd_ctrl.h"
 #include "debug_session.h"
+#include "gdb_stub.h"
 
 #include <cstdio>
 #include <cstring>
@@ -4707,5 +4708,16 @@ int main(int argc, char** argv)
 {
     if (argc < 2) { printUsage(argv[0]); return EXIT_USAGE_ERROR; }
     if (std::string(argv[1]) == "serve") return doServe(argc - 2, argv + 2);
+    if (std::string(argv[1]) == "gdbserver") {
+        int port = 3333;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
+            if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+                printf("Usage: wiggle gdbserver [--port N]\n  GDB RSP server; in GDB: target remote :N\n");
+                return EXIT_OK;
+            }
+        }
+        return wiggle_dbg::gdbServe(port);
+    }
     return dispatchCli(argc - 1, argv + 1);
 }
