@@ -78,6 +78,7 @@ private:
     void cmdWrite(const nljson& req, nljson& resp);
     void cmdPoke(const nljson& req, nljson& resp);
     void cmdReg(const nljson& req, nljson& resp);
+    void cmdVar(const nljson& req, nljson& resp);
     void cmdBt(const nljson& req, nljson& resp);
     void cmdSym(const nljson& req, nljson& resp);
     void cmdReset(const nljson& req, nljson& resp);

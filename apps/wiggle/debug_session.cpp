@@ -189,6 +189,12 @@ void DebugSession::cmdTrig(const nljson& req, nljson& resp)
     if (sub == "add") {
         uint64_t addr = req.value("addr", 0ULL);
         uint64_t range = req.value("range", 0ULL);
+        if (req.contains("sym")) {
+            const ElfSymbol* s = elf_.findByName(req.value("sym", ""));
+            if (!s) { resp["status"] = "error"; resp["message"] = "symbol not found: " + req.value("sym", ""); return; }
+            addr = s->value;
+            range = s->size > 0 ? s->size - 1 : 0;
+        }
         uint32_t id = 0;
         if (wiggle_mcd::createTrig(mcd_, type, addr, range, id, err)) {
             trigs_.push_back({id, type, addr, range});
@@ -332,6 +338,45 @@ void DebugSession::cmdReg(const nljson& req, nljson& resp)
         if (wiggle_mcd::readRegVal(mcd_, r, val, err)) {
             resp["status"] = "ok"; resp["register"] = name; resp["value"] = val;
         } else { resp["status"] = "error"; resp["message"] = err; }
+    }
+}
+
+void DebugSession::cmdVar(const nljson& req, nljson& resp)
+{
+    std::string err;
+    int cpu = req.value("cpu", 0);
+    if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    std::string name = req.value("name", "");
+    const ElfSymbol* s = elf_.findByName(name);
+    if (!s) { resp["status"] = "error"; resp["message"] = "symbol not found: " + name; return; }
+    uint64_t addr = s->value;
+    uint32_t size = s->size ? s->size : 4;
+    resp["name"] = name;
+    resp["addr"] = addr;
+    resp["size"] = size;
+    std::string action = req.value("action", "read");
+    if (action == "write") {
+        uint64_t val = req.value("value", 0ULL);
+        uint32_t n = std::min<uint32_t>(size, 8);
+        uint8_t b[8];
+        for (uint32_t i = 0; i < n; i++) b[i] = static_cast<uint8_t>(val >> (8 * i));
+        if (wiggle_mcd::writeMem(mcd_, addr, b, n, err)) {
+            resp["status"] = "ok"; resp["value"] = val;
+        } else { resp["status"] = "error"; resp["message"] = err; }
+    } else {
+        std::vector<uint8_t> buf(size);
+        if (!wiggle_mcd::readMem(mcd_, addr, buf.data(), size, err)) {
+            resp["status"] = "error"; resp["message"] = err; return;
+        }
+        resp["status"] = "ok";
+        if (size <= 8) {
+            uint64_t v = 0;
+            for (uint32_t i = 0; i < size; i++) v |= static_cast<uint64_t>(buf[i]) << (8 * i);
+            resp["value"] = v;
+        }
+        std::string hex;
+        for (auto v : buf) { char h[3]; snprintf(h, 3, "%02X", v); hex += h; }
+        resp["data"] = hex;
     }
 }
 
@@ -557,6 +602,7 @@ bool DebugSession::dispatch(const nljson& req, nljson& resp)
     else if (cmd == "write") cmdWrite(req, resp);
     else if (cmd == "poke") cmdPoke(req, resp);
     else if (cmd == "reg" || cmd == "cpu_reg") cmdReg(req, resp);
+    else if (cmd == "var") cmdVar(req, resp);
     else if (cmd == "bt") cmdBt(req, resp);
     else if (cmd == "sym") cmdSym(req, resp);
     else if (cmd == "reset") cmdReset(req, resp);

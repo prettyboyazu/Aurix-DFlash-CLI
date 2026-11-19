@@ -149,7 +149,9 @@ wiggle <subcommand> [options]
 | `halt` | | Halt CPU (MCD, non-destructive) |
 | `go` | `resume` | Resume CPU execution |
 | `cpu_reg` | `cr` | Read/write core registers (PC/PSW/A0-A15/D0-D15) |
-| `break` | `bp` | Hardware breakpoints: add/del/list/clear (8 slots) |
+| `break` | `bp` | Instruction breakpoints (MCD triggers): add/del/list/clear |
+| `watch` | | Data watchpoints (read/write/rw), by address or symbol |
+| `var` | | Variable read/write by symbol name (ELF closed-loop) |
 | `step` | `s` | Single-step one instruction |
 | `bt` | `backtrace` | Call-stack backtrace via CSA chain |
 | `sym` | | ELF symbol load/list/addr/name (native C++ parser) |
@@ -382,6 +384,13 @@ wiggle sym addr 0x80000100 --elf app.elf
 wiggle sym name main --elf app.elf
 wiggle sym list IfxCpu --elf app.elf
 
+# Variable closed-loop by symbol name (ELF): symbol -> address -> read/write
+wiggle var read Core0_Task_cnt --elf app.elf
+wiggle var write Core0_Task_cnt 0x1234 --elf app.elf
+wiggle watch add --sym Core0_Task_cnt --elf app.elf   # watch by symbol
+wiggle go                                            # halts when variable written
+wiggle bt --elf app.elf                              # writing call stack
+
 # Persistent debug session (JSON-lines over stdio) - the MCP transport:
 # one MCD connection; symbols/breakpoints/watches persist across commands;
 # no per-command reconnect, no implicit resets; flash ops switch backend
@@ -534,7 +543,8 @@ unavailable.
 | `wiggle_go` | Resume execution |
 | `wiggle_step` | Hardware single-step |
 | `wiggle_break` | Instruction breakpoints add/del/list/clear |
-| `wiggle_watch` | Data watchpoints (read/write/rw) add/del/list/clear |
+| `wiggle_watch` | Data watchpoints (read/write/rw) add/del/list/clear, by addr or symbol |
+| `wiggle_var` | Variable read/write by symbol name (ELF closed-loop) |
 | `wiggle_cpu_reg` | Core register read/write/dump |
 | `wiggle_bt` | Symbolized call-stack backtrace |
 | `wiggle_mem_read` | Continuous memory read (hex, up to 1 MB) |

@@ -4233,17 +4233,20 @@ static int doBreakWatch(int argc, char** argv, const char* cmd)
 {
     if(argc<1){fprintf(stderr,"Usage: wiggle %s <add|del|list|clear> [addr] [--cpu n]\n",cmd);return EXIT_USAGE_ERROR;}
     std::string sub=argv[0];
-    DebugArgs da;const char*addr=nullptr;const char*type=nullptr;int len=4;
+    DebugArgs da;const char*addr=nullptr;const char*type=nullptr;const char*req_sym=nullptr;int len=4;
     for(int i=1;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
         if(!strcmp(argv[i],"--type")&&i+1<argc){type=argv[i+1];i+=2;continue;}
         if(!strcmp(argv[i],"--length")&&i+1<argc){len=atoi(argv[i+1]);i+=2;continue;}
+        if(!strcmp(argv[i],"--sym")&&i+1<argc){req_sym=argv[i+1];i+=2;continue;}
         if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle %s <add|del|list|clear> [addr]\n",cmd);return EXIT_OK;}
         if(argv[i][0]=='-'){fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
         addr=argv[i];i++;}
     g_json=da.common.jsonOutput;
     int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
     nljson req;req["cmd"]=cmd;req["action"]=sub;req["cpu"]=da.cpu;
     if(addr)req["addr"]=strtoull(addr,nullptr,16);
+    if(req_sym)req["sym"]=req_sym;
     if(type)req["type"]=type;
     if(!strcmp(cmd,"watch"))req["range"]=len>0?len-1:0;
     return runDebugReq(req);
@@ -4251,6 +4254,23 @@ static int doBreakWatch(int argc, char** argv, const char* cmd)
 
 static int doBreak(int argc, char** argv){return doBreakWatch(argc,argv,"break");}
 static int doWatch(int argc, char** argv){return doBreakWatch(argc,argv,"watch");}
+
+static int doVar(int argc, char** argv)
+{
+    if(argc<2){fprintf(stderr,"Usage: wiggle var <read|write> <symbol> [value] [--elf f]\n");return EXIT_USAGE_ERROR;}
+    std::string action=argv[0];
+    DebugArgs da;const char*name=argv[1];const char*val=nullptr;
+    for(int i=2;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle var <read|write> <symbol> [value]\n");return EXIT_OK;}
+        if(argv[i][0]=='-'){fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+        val=argv[i];i++;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
+    nljson req;req["cmd"]="var";req["action"]=action;req["name"]=name;req["cpu"]=da.cpu;
+    if(val)req["value"]=strtoull(val,nullptr,16);
+    return runDebugReq(req);
+}
 
 static int doSym(int argc, char** argv)
 {
@@ -4350,6 +4370,7 @@ static int doShell(int argc, char** argv)
         else if (cmd == "bt" || cmd == "backtrace") doBt(subArgc, subArgvPtr);
         else if (cmd == "sym") doSym(subArgc, subArgvPtr);
         else if (cmd == "watch") doWatch(subArgc, subArgvPtr);
+        else if (cmd == "var") doVar(subArgc, subArgvPtr);
         else printf("Unknown command '%s'. Type 'help' for list.\n", cmd.c_str());
         fflush(stdout);  // Ensure output is flushed to pipe for MCP integration
     }
@@ -4583,6 +4604,7 @@ static int dispatchCli(int argc, char** argv)
     if (first == "cpu_reg" || first == "cr") return doCpuReg(argc - 1, argv + 1);
     if (first == "break" || first == "bp") return doBreak(argc - 1, argv + 1);
     if (first == "watch") return doWatch(argc - 1, argv + 1);
+    if (first == "var") return doVar(argc - 1, argv + 1);
     if (first == "step" || first == "s") return doStep(argc - 1, argv + 1);
     if (first == "bt" || first == "backtrace") return doBt(argc - 1, argv + 1);
     if (first == "sym") return doSym(argc - 1, argv + 1);
