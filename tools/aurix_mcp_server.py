@@ -153,13 +153,12 @@ def load_config(config_path: Optional[str] = None) -> dict:
             else:
                 cfg[key] = val
 
-    # Auto-detect executables (env var > auto-search)
-    if not cfg["wiggle_exe"]:
-        exe_name = "wiggle.exe" if sys.platform == "win32" else "wiggle"
-        cfg["wiggle_exe"] = find_exe(exe_name,
-                                     env_var="WIGGLE_EXE",
-                                     env_dir_var="WIGGLE_DIR",
-                                     exe_name=exe_name)
+    # Auto-detect executables (env var > auto-search); 配置路径失效时回退随包目录
+    exe_name = "wiggle.exe" if sys.platform == "win32" else "wiggle"
+    if not cfg["wiggle_exe"] or not os.path.isfile(cfg["wiggle_exe"]):
+        bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wiggle", exe_name)
+        cfg["wiggle_exe"] = bundled if os.path.isfile(bundled) else find_exe(
+            exe_name, env_var="WIGGLE_EXE", env_dir_var="WIGGLE_DIR", exe_name=exe_name)
     if not cfg["aurix_flasher_exe"]:
         exe_name = "AURIXFlasher.exe"
         cfg["aurix_flasher_exe"] = find_exe(exe_name,
