@@ -73,6 +73,28 @@ mcd_server_st* g_server = nullptr;
 
 constexpr uint32_t POLL_MS = 10;
 constexpr uint32_t WAIT_TIMEOUT_MS = 2000;
+constexpr uint32_t QUERY_MAX_ATTEMPTS = 5;
+constexpr uint32_t QUERY_RETRY_TIMEOUT_MS = 200;
+
+// 只用于状态查询；事务读可能读清寄存器，不能套用自动重试。
+template<typename Query>
+mcd_return_et queryWithRetry(Query query)
+{
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(QUERY_RETRY_TIMEOUT_MS);
+    mcd_return_et rc = MCD_RET_ACT_AGAIN;
+    for (uint32_t attempt = 0; attempt < QUERY_MAX_ATTEMPTS; ++attempt) {
+        if (attempt > 0 && std::chrono::steady_clock::now() >= deadline) break;
+        rc = query();
+        if (rc != MCD_RET_ACT_AGAIN || attempt + 1 == QUERY_MAX_ATTEMPTS) break;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        const auto delay = remaining < POLL_MS ? remaining : POLL_MS;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+    return rc;
+}
 
 void sleepMs(uint32_t ms)
 {
@@ -85,10 +107,10 @@ std::string errDetail(const mcd_core_st* core, mcd_return_et rc)
     if (g_api.qry_error_info) {
         mcd_error_info_st ei;
         memset(&ei, 0, sizeof(ei));
-        if (g_api.qry_error_info(core, &ei) == MCD_RET_ACT_NONE && ei.error_str[0]) {
-            snprintf(buf, sizeof(buf), "MCD rc=0x%X: %s", (unsigned)rc, ei.error_str);
-            return buf;
-        }
+        g_api.qry_error_info(core, &ei);
+        snprintf(buf, sizeof(buf), "MCD rc=0x%X error=0x%X: %s",
+                 (unsigned)rc, (unsigned)ei.error_code, ei.error_str);
+        return buf;
     }
     snprintf(buf, sizeof(buf), "MCD rc=0x%X", (unsigned)rc);
     return buf;
@@ -172,8 +194,20 @@ bool waitState(const Session& s, uint32_t want, std::string& err)
     while (true) {
         mcd_core_state_st st;
         memset(&st, 0, sizeof(st));
-        mcd_return_et rc = g_api.qry_state(s.core, &st);
-        if (rc == MCD_RET_ACT_NONE && st.state == want) return true;
+        const mcd_return_et rc = queryWithRetry([&]() {
+            memset(&st, 0, sizeof(st));
+            return g_api.qry_state(s.core, &st);
+        });
+        if (rc != MCD_RET_ACT_NONE) {
+            err = rc == MCD_RET_ACT_AGAIN ? "qry_state: AGAIN retry budget exhausted" :
+                  "qry_state: " + errDetail(s.core, rc);
+            return false;
+        }
+        if (st.state == MCD_CORE_STATE_UNKNOWN) {
+            err = "qry_state: core state unknown";
+            return false;
+        }
+        if (st.state == want) return true;
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         if (ms >= WAIT_TIMEOUT_MS) {
@@ -294,27 +328,24 @@ void close(Session& s)
 
 bool state(const Session& s, uint32_t& st, std::string& info)
 {
-    if (!s.core) return false;
-    mcd_core_state_st cs;
-    memset(&cs, 0, sizeof(cs));
-    mcd_return_et rc = g_api.qry_state(s.core, &cs);
-    if (rc != MCD_RET_ACT_NONE) return false;
-    st = cs.state;
-    info = cs.stop_str[0] ? cs.stop_str : cs.info_str;
-    return true;
+    uint32_t trigId = 0;
+    return stateFull(s, st, trigId, info);
 }
 
-bool stop(const Session& s, std::string& err)
+bool stop(const Session& s, bool& applied, std::string& err)
 {
+    applied = false;
     uint32_t st = 0;
     std::string info;
     if (state(s, st, info) && (st == MCD_CORE_STATE_DEBUG || st == MCD_CORE_STATE_HALTED))
         return true;
+    // 预查询失败不能阻止收回控制权，但 stop 本身只下发一次。
     mcd_return_et rc = g_api.stop(s.core, 0);
     if (rc != MCD_RET_ACT_NONE) {
         err = "stop: " + errDetail(s.core, rc);
         return false;
     }
+    applied = true;
     return waitState(s, MCD_CORE_STATE_DEBUG, err);
 }
 
@@ -329,10 +360,12 @@ bool run(const Session& s, std::string& err)
     return true;
 }
 
-bool stopGlobal(const Session& s, std::string& err)
+bool stopGlobal(const Session& s, bool& applied, std::string& err)
 {
+    applied = false;
     mcd_return_et rc = g_api.stop(s.core, 1);
     if (rc != MCD_RET_ACT_NONE) { err = "stop(global): " + errDetail(s.core, rc); return false; }
+    applied = true;
     return waitState(s, MCD_CORE_STATE_DEBUG, err);
 }
 
@@ -345,11 +378,23 @@ bool runGlobal(const Session& s, std::string& err)
 
 bool stateFull(const Session& s, uint32_t& st, uint32_t& trigId, std::string& info)
 {
-    if (!s.core) return false;
+    st = MCD_CORE_STATE_UNKNOWN;
+    trigId = 0;
+    if (!s.core) { info = "MCD core unavailable"; return false; }
     mcd_core_state_st cs;
-    memset(&cs, 0, sizeof(cs));
-    mcd_return_et rc = g_api.qry_state(s.core, &cs);
-    if (rc != MCD_RET_ACT_NONE) return false;
+    const mcd_return_et rc = queryWithRetry([&]() {
+        memset(&cs, 0, sizeof(cs));
+        return g_api.qry_state(s.core, &cs);
+    });
+    if (rc != MCD_RET_ACT_NONE) {
+        info = rc == MCD_RET_ACT_AGAIN ? "qry_state: AGAIN retry budget exhausted" :
+               "qry_state: " + errDetail(s.core, rc);
+        return false;
+    }
+    if (cs.state == MCD_CORE_STATE_UNKNOWN) {
+        info = "qry_state: core state unknown";
+        return false;
+    }
     st = cs.state;
     trigId = cs.trig_id;
     info = cs.stop_str[0] ? cs.stop_str : cs.info_str;
@@ -441,27 +486,34 @@ bool removeTrig(const Session& s, uint32_t id, std::string& err)
     return true;
 }
 
-bool trigCaptured(const Session& s, uint32_t id, bool& captured, std::string& err)
+bool trigCaptured(const Session& s, uint32_t id, bool& captured, bool& valid, std::string& err)
 {
+    valid = false;
     if (!s.core || !g_api.qry_trig_state) { err = "MCD trig state unavailable"; return false; }
     mcd_trig_state_st ts;
-    memset(&ts, 0, sizeof(ts));
-    mcd_return_et rc = g_api.qry_trig_state(s.core, id, &ts);
+    const mcd_return_et rc = queryWithRetry([&]() {
+        memset(&ts, 0, sizeof(ts));
+        return g_api.qry_trig_state(s.core, id, &ts);
+    });
     if (rc != MCD_RET_ACT_NONE) {
-        err = "qry_trig_state: " + errDetail(s.core, rc);
+        err = rc == MCD_RET_ACT_AGAIN ? "qry_trig_state: AGAIN retry budget exhausted" :
+              "qry_trig_state: " + errDetail(s.core, rc);
         return false;
     }
-    captured = ts.captured != 0;
+    valid = ts.captured_valid != 0;
+    if (valid) captured = ts.captured != 0;
     return true;
 }
 
-bool step(const Session& s, uint32_t n, std::string& err)
+bool step(const Session& s, uint32_t n, bool& applied, std::string& err)
 {
+    applied = false;
     mcd_return_et rc = g_api.step(s.core, 0, MCD_CORE_STEP_TYPE_INSTR, n);
     if (rc != MCD_RET_ACT_NONE) {
         err = "step: " + errDetail(s.core, rc);
         return false;
     }
+    applied = true;
     return waitState(s, MCD_CORE_STATE_DEBUG, err);
 }
 

@@ -102,3 +102,17 @@ if (MINGW)
 endif()
 
 install(TARGETS ${EXE_NAME} DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT applications)
+
+if (MSVC AND BUILD_TESTING)
+    add_executable(wiggle_mcd_status_tests
+        tests/mcd_status_tests.cpp
+        elf_symbols.cpp
+        hex_parser.cpp
+        tricore_disasm.cpp
+    )
+    target_include_directories(wiggle_mcd_status_tests PRIVATE "${CMAKE_SOURCE_DIR}/src/third_party")
+    target_compile_features(wiggle_mcd_status_tests PRIVATE cxx_std_17)
+    target_compile_options(wiggle_mcd_status_tests PRIVATE /utf-8 /W3)
+    target_compile_definitions(wiggle_mcd_status_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    add_test(NAME wiggle_mcd_status_tests COMMAND wiggle_mcd_status_tests)
+endif()

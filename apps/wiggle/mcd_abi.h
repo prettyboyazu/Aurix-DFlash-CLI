@@ -255,7 +255,7 @@ typedef mcd_return_et (*mcd_run_fn)(const mcd_core_st*, mcd_bool_t);
 typedef mcd_return_et (*mcd_stop_fn)(const mcd_core_st*, mcd_bool_t);
 typedef mcd_return_et (*mcd_step_fn)(const mcd_core_st*, mcd_bool_t, mcd_core_step_type_et, uint32_t);
 typedef mcd_return_et (*mcd_qry_state_fn)(const mcd_core_st*, mcd_core_state_st*);
-typedef mcd_return_et (*mcd_qry_error_info_fn)(const mcd_core_st*, mcd_error_info_st*);
+typedef void (*mcd_qry_error_info_fn)(const mcd_core_st*, mcd_error_info_st*);
 typedef mcd_return_et (*mcd_execute_txlist_fn)(const mcd_core_st*, mcd_txlist_st*);
 typedef mcd_return_et (*mcd_create_trig_fn)(const mcd_core_st*, void*, uint32_t*);
 typedef mcd_return_et (*mcd_remove_trig_fn)(const mcd_core_st*, uint32_t);

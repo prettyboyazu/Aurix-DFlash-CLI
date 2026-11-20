@@ -46,20 +46,20 @@ bool available(std::string& err);
 bool open(int cpu, Session& s, std::string& err);
 void close(Session& s);
 
-// 查询核状态（MCD_CORE_STATE_*）；info 为状态描述串
+// 查询核状态；失败时 info 为原因，状态查询只对 AGAIN 有界重试。
 bool state(const Session& s, uint32_t& st, std::string& info);
 // 含触发 ID 的完整状态（watch/break 命中归因）
 bool stateFull(const Session& s, uint32_t& st, uint32_t& trigId, std::string& info);
 
-// 非破坏性 halt：stop + 轮询至 DEBUG/HALT（2s 超时）
-bool stop(const Session& s, std::string& err);
+// applied 表示动作已获 MCD 成功应答，后续查询失败时也不能盲目重放。
+bool stop(const Session& s, bool& applied, std::string& err);
 // 全局 halt/run（所有核，多核同步）
-bool stopGlobal(const Session& s, std::string& err);
+bool stopGlobal(const Session& s, bool& applied, std::string& err);
 bool runGlobal(const Session& s, std::string& err);
 // resume：run 发出即成功（watch 活跃时可能立即再命中，属正常调试行为）
 bool run(const Session& s, std::string& err);
 // 硬件单步 n 条指令 + 轮询至 DEBUG
-bool step(const Session& s, uint32_t n, std::string& err);
+bool step(const Session& s, uint32_t n, bool& applied, std::string& err);
 
 // 内存/寄存器读写（txlist，默认地址空间=设备内存）
 bool readMem(const Session& s, uint64_t addr, uint8_t* buf, uint32_t n, std::string& err);
@@ -69,7 +69,7 @@ bool writeMem(const Session& s, uint64_t addr, const uint8_t* buf, uint32_t n, s
 bool createTrig(const Session& s, uint32_t type, uint64_t addr, uint64_t range,
                 uint32_t& id, std::string& err);
 bool removeTrig(const Session& s, uint32_t id, std::string& err);
-bool trigCaptured(const Session& s, uint32_t id, bool& captured, std::string& err);
+bool trigCaptured(const Session& s, uint32_t id, bool& captured, bool& valid, std::string& err);
 
 // MCD 命名寄存器表（CPU Registers 组：PC/PSW/A0-A15/D0-D15/CSFR）
 struct RegInfo {

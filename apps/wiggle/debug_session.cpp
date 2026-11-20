@@ -157,9 +157,13 @@ void DebugSession::cmdState(const nljson& req, nljson& resp)
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
     uint32_t st = 0, tid = 0;
     std::string info;
-    wiggle_mcd::stateFull(mcd_, st, tid, info);
+    if (!wiggle_mcd::stateFull(mcd_, st, tid, info)) {
+        resp["status"] = "error"; resp["message"] = info; return;
+    }
     uint32_t pc = 0;
-    readU32(csfr(cpu, OFF_PC), pc, err);
+    if (!readU32(csfr(cpu, OFF_PC), pc, err)) {
+        resp["status"] = "error"; resp["message"] = err; return;
+    }
     resp["status"] = "ok";
     resp["state"] = st;
     resp["trig_id"] = tid;
@@ -176,23 +180,20 @@ void DebugSession::cmdHaltGoStep(const nljson& req, nljson& resp)
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
     std::string cmd = req.value("cmd", "");
     bool global = req.value("global", false);
-    bool ok = true;
-    if (cmd == "halt") ok = global ? wiggle_mcd::stopGlobal(mcd_, err) : wiggle_mcd::stop(mcd_, err);
-    else if (cmd == "go") ok = global ? wiggle_mcd::runGlobal(mcd_, err) : wiggle_mcd::run(mcd_, err);
-    else if (cmd == "step") ok = wiggle_mcd::step(mcd_, req.value("n", 1), err);
-    uint32_t st = 0, tid = 0;
-    std::string info;
-    wiggle_mcd::stateFull(mcd_, st, tid, info);
-    uint32_t pc = 0;
-    readU32(csfr(cpu, OFF_PC), pc, err);
-    resp["status"] = ok ? "ok" : "error";
-    if (!ok) resp["message"] = err;
+    bool ok = true, applied = false;
+    if (cmd == "halt") ok = global ? wiggle_mcd::stopGlobal(mcd_, applied, err) : wiggle_mcd::stop(mcd_, applied, err);
+    else if (cmd == "go") {
+        ok = global ? wiggle_mcd::runGlobal(mcd_, err) : wiggle_mcd::run(mcd_, err);
+        applied = ok;
+    } else if (cmd == "step") ok = wiggle_mcd::step(mcd_, req.value("n", 1), applied, err);
     resp["method"] = "mcd";
-    resp["state"] = st;
-    resp["trig_id"] = tid;
-    resp["pc"] = pc;
-    std::string sym = symAnnotate(pc);
-    if (!sym.empty()) resp["pc_symbol"] = sym;
+    if (!ok) {
+        resp["status"] = "error"; resp["message"] = err;
+        if (applied) resp["action_applied"] = true;
+        return;
+    }
+    cmdState(req, resp);
+    if (applied && resp.value("status", "") == "error") resp["action_applied"] = true;
 }
 
 void DebugSession::cmdTrig(const nljson& req, nljson& resp)
@@ -251,9 +252,15 @@ void DebugSession::cmdTrig(const nljson& req, nljson& resp)
             e["type"] = t.type;
             e["addr"] = t.addr;
             e["range"] = t.range;
-            bool cap = false;
-            wiggle_mcd::trigCaptured(mcd_, t.id, cap, err);
-            e["captured"] = cap;
+            bool cap = false, valid = false;
+            const bool ok = wiggle_mcd::trigCaptured(mcd_, t.id, cap, valid, err);
+            e["captured_valid"] = valid;
+            e["captured"] = valid ? nljson(cap) : nljson(nullptr);
+            if (!ok) {
+                e["capture_error"] = err;
+                resp["status"] = "error";
+                resp["message"] = "trigger state query failed: " + err;
+            }
             resp["trigs"].push_back(e);
         }
     }
@@ -489,7 +496,10 @@ void DebugSession::cmdReset(const nljson& req, nljson& resp)
     sleepMs(50);
     uint32_t st = 0, tid = 0;
     std::string info;
-    wiggle_mcd::stateFull(mcd_, st, tid, info);
+    if (!wiggle_mcd::stateFull(mcd_, st, tid, info)) {
+        resp["status"] = "error"; resp["message"] = info;
+        resp["action_applied"] = true; return;
+    }
     resp["status"] = "ok";
     resp["method"] = "mcd";
     resp["class"] = cls;
@@ -737,17 +747,17 @@ void DebugSession::cmdDisasm(const nljson& req, nljson& resp)
 }
 
 // 等待核进入 DEBUG（step-over/out 用），超时返回 false
-static bool waitDebug(wiggle_mcd::Session& s, uint32_t timeoutMs)
+static bool waitDebug(wiggle_mcd::Session& s, uint32_t timeoutMs, std::string& err)
 {
     auto t0 = std::chrono::steady_clock::now();
     while (true) {
         uint32_t st = 0, tid = 0;
-        std::string info;
-        if (wiggle_mcd::stateFull(s, st, tid, info) && st == MCD_CORE_STATE_DEBUG) return true;
+        if (!wiggle_mcd::stateFull(s, st, tid, err)) return false;
+        if (st == MCD_CORE_STATE_DEBUG) return true;
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        if (ms >= timeoutMs) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (ms >= timeoutMs) { err = "timeout waiting for debug state"; return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(wiggle_dbg::HALT_POLL_MS));
     }
 }
 
@@ -758,10 +768,14 @@ void DebugSession::cmdStepOver(const nljson& req, nljson& resp)
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
     uint32_t st = 0, tid = 0;
     std::string info;
-    wiggle_mcd::stateFull(mcd_, st, tid, info);
+    if (!wiggle_mcd::stateFull(mcd_, st, tid, info)) {
+        resp["status"] = "error"; resp["message"] = info; return;
+    }
     if (st != MCD_CORE_STATE_DEBUG) { resp["status"] = "error"; resp["message"] = "halt first"; return; }
     uint32_t pc = 0;
-    readU32(csfr(cpu, OFF_PC), pc, err);
+    if (!readU32(csfr(cpu, OFF_PC), pc, err)) {
+        resp["status"] = "error"; resp["message"] = err; return;
+    }
     uint8_t code[4];
     if (!wiggle_mcd::readMem(mcd_, normData(pc), code, 4, err)) {
         resp["status"] = "error"; resp["message"] = err; return;
@@ -772,16 +786,30 @@ void DebugSession::cmdStepOver(const nljson& req, nljson& resp)
     if (!wiggle_mcd::createTrig(mcd_, MCD_TRIG_TYPE_IP, target, 0, id, err)) {
         resp["status"] = "error"; resp["message"] = err; return;
     }
-    wiggle_mcd::run(mcd_, err);
-    bool hit = waitDebug(mcd_, 2000);
-    wiggle_mcd::removeTrig(mcd_, id, err);
-    if (!hit) wiggle_mcd::stop(mcd_, err);  // 分支跳走未命中，收回控制权
+    bool ok = wiggle_mcd::run(mcd_, err);
+    const bool applied = ok;
+    if (ok) ok = waitDebug(mcd_, STEP_TIMEOUT_MS, err);
+    std::string cleanupError;
+    bool stopApplied = false;
+    if (!ok && !wiggle_mcd::stop(mcd_, stopApplied, cleanupError)) err += "; " + cleanupError;
+    if (!wiggle_mcd::removeTrig(mcd_, id, cleanupError)) {
+        err = ok ? cleanupError : err + "; " + cleanupError;
+        ok = false;
+    }
+    if (!ok) {
+        resp["status"] = "error"; resp["message"] = err;
+        if (applied) resp["action_applied"] = true;
+        return;
+    }
     uint32_t npc = 0;
-    readU32(csfr(cpu, OFF_PC), npc, err);
+    if (!readU32(csfr(cpu, OFF_PC), npc, err)) {
+        resp["status"] = "error"; resp["message"] = err;
+        resp["action_applied"] = true; return;
+    }
     resp["status"] = "ok";
     resp["pc"] = npc;
     resp["target"] = target;
-    resp["hit"] = hit;
+    resp["hit"] = npc == target;
     std::string sym = symAnnotate(npc);
     if (!sym.empty()) resp["pc_symbol"] = sym;
 }
@@ -793,24 +821,42 @@ void DebugSession::cmdStepOut(const nljson& req, nljson& resp)
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
     uint32_t st = 0, tid = 0;
     std::string info;
-    wiggle_mcd::stateFull(mcd_, st, tid, info);
+    if (!wiggle_mcd::stateFull(mcd_, st, tid, info)) {
+        resp["status"] = "error"; resp["message"] = info; return;
+    }
     if (st != MCD_CORE_STATE_DEBUG) { resp["status"] = "error"; resp["message"] = "halt first"; return; }
     uint32_t ra = 0;
-    readU32(csfr(cpu, OFF_A0 + 11 * 4), ra, err);  // A11=返回地址
+    if (!readU32(csfr(cpu, OFF_A0 + 11 * 4), ra, err)) {
+        resp["status"] = "error"; resp["message"] = err; return;
+    }
     uint32_t id = 0;
     if (!wiggle_mcd::createTrig(mcd_, MCD_TRIG_TYPE_IP, ra, 0, id, err)) {
         resp["status"] = "error"; resp["message"] = err; return;
     }
-    wiggle_mcd::run(mcd_, err);
-    bool hit = waitDebug(mcd_, 2000);
-    wiggle_mcd::removeTrig(mcd_, id, err);
-    if (!hit) wiggle_mcd::stop(mcd_, err);
+    bool ok = wiggle_mcd::run(mcd_, err);
+    const bool applied = ok;
+    if (ok) ok = waitDebug(mcd_, STEP_TIMEOUT_MS, err);
+    std::string cleanupError;
+    bool stopApplied = false;
+    if (!ok && !wiggle_mcd::stop(mcd_, stopApplied, cleanupError)) err += "; " + cleanupError;
+    if (!wiggle_mcd::removeTrig(mcd_, id, cleanupError)) {
+        err = ok ? cleanupError : err + "; " + cleanupError;
+        ok = false;
+    }
+    if (!ok) {
+        resp["status"] = "error"; resp["message"] = err;
+        if (applied) resp["action_applied"] = true;
+        return;
+    }
     uint32_t npc = 0;
-    readU32(csfr(cpu, OFF_PC), npc, err);
+    if (!readU32(csfr(cpu, OFF_PC), npc, err)) {
+        resp["status"] = "error"; resp["message"] = err;
+        resp["action_applied"] = true; return;
+    }
     resp["status"] = "ok";
     resp["pc"] = npc;
     resp["return_addr"] = ra;
-    resp["hit"] = hit;
+    resp["hit"] = npc == ra;
     std::string sym = symAnnotate(npc);
     if (!sym.empty()) resp["pc_symbol"] = sym;
 }
