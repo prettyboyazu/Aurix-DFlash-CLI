@@ -89,59 +89,115 @@ Python 需 ≥3.10（`pip install -r requirements.txt`：mcp[cli]、pyelftools�
 
 ---
 
-## 3. CLI 指令（wiggle\wiggle.exe，具体示例）
+## 3. CLI 独立命令行（wiggle\wiggle.exe）
 
-通用选项：`--json --server <ip> --target <id> --device <name> --config-dir <p> --cpu <n> --elf <f> --hot`
+wiggle 可脱离 MCP 单独作命令行工具。把 `wiggle.exe` 与 `DeviceConfigs/`、`RegisterDefs/`
+放同一目录即可运行（或 `--config-dir` 指定）。所有子命令支持 `--help`。
 
-### 3.1 执行控制 / 调试（MCD，非破坏）
+### 3.0 约定与通用选项
+- **地址/长度默认十六进制**（`0x` 前缀可选）：`AF000000`、`0x1000`；`--sectors`/`step n`/`--cpu` 为十进制。
+- `--json` 输出机器可读 JSON（脚本/AI 用）；默认人类可读。
+- 通用：`--server <ip>`(默认localhost) `--port <n>`(2000) `--target <id>` `--device <name>`
+  `--config-dir <p>` `--json` `--hot`(HOT_ATTACH不复位) `--cpu <n>`(调试核号) `--elf <f>`(符号)。
+- 调试类默认 HOT_ATTACH（非破坏）；Flash 类自动 RESET_AND_HALT。
+
+### 3.1 设备 / 连接 / 复位
 ```bat
-wiggle halt --elf app.elf                 :: 暂停（保留上下文）
-wiggle halt --global                      :: 多核同停
-wiggle go [--global]                      :: 恢复
-wiggle step 5                             :: 单步5条
-wiggle stepover / wiggle stepout          :: 跨过 / 跳出
-wiggle state --cpu 0                      :: 核状态/停止触发/PC
-wiggle cpu_reg                            :: 全核寄存器
-wiggle cpu_reg PC                         :: 读单寄存器
-wiggle cpu_reg D0 0x12345678              :: 写寄存器
-wiggle break add 0x80001000               :: 指令断点
-wiggle break list / del 0 / clear
-wiggle watch add 0x70008860 --length 4 --type write   :: 数据观察点(写)
-wiggle watch add --sym Core0_Task_cnt --elf app.elf   :: 按符号
-wiggle var read Core0_Task_cnt --elf app.elf          :: 变量读
-wiggle var write Core0_Task_cnt 0x1234 --elf app.elf  :: 变量写
-wiggle bt --elf app.elf                   :: 符号化调用栈
-wiggle disasm 0x80018250 16 --elf app.elf :: 反汇编(hldumptc优先)
-wiggle sample --sym Core0_Task_cnt --interval 100     :: 活体双采样
-wiggle rtos tasks --type autosar --elf app.elf        :: AUTOSAR任务清单
-wiggle rtos tasks --type freertos --elf app.elf       :: FreeRTOS任务
-wiggle rtos bt --task TaskName --elf app.elf          :: 任务回溯
-wiggle reset [--halt] [--class 2]         :: 复位(0=POR 1=System 2=App)
+wiggle list                          :: 列出TAS目标+设备
+wiggle info                          :: 设备/内存布局/SVD摘要
+wiggle status                        :: Flash状态寄存器(SVD字段解码)
+wiggle reset                         :: 复位并运行
+wiggle reset --halt                  :: 复位并暂停
+wiggle reset --hot                   :: 热附着不复位
+wiggle reset --class 1               :: 复位类 0=POR 1=System 2=Application(默认)
 ```
 
-### 3.2 内存 / Flash / 诊断（TAS）
+### 3.2 Flash（DFlash/UCB，TAS 后端）
 ```bat
-wiggle list / info / status
-wiggle dump 0x70000000 0x40               :: hex dump
-wiggle read -a AF000000 -l 1000 -o dump.bin
-wiggle poke 0x70000000 0x1234 --dangerous :: 写内存(需--dangerous)
-wiggle reg DMU.HF.STATUS                  :: SVD外设寄存器
-wiggle reg 0xF8040010 0x1                 :: 按地址写
-wiggle erase --addr AF000000 --sectors 1 --verify
-wiggle erase --all --backup dump.bin --verify
-wiggle write -f app.hex --verify
-wiggle rewrite --addr AF004000 --data 1122334455667788 --verify
-wiggle restore --file dump.bin
-wiggle ucb read / write --file bmhd.hex --verify / erase --addr AF400000 --sectors 4
-wiggle compare -f app.hex -a AF000000
-wiggle search 0xAF000000 0x20000 0x11223344
+wiggle erase --info                              :: 只看设备/扇区信息不擦
+wiggle erase --addr AF000000 --sectors 2 --verify
+wiggle erase --all --backup dump.bin --verify    :: 全擦+备份+校验
+wiggle read  -a AF000000 -l 20000 -o dump.bin    :: .bin原始 / .hex IntelHEX
+wiggle read  -a AF004000 -l 100                  :: 终端hex dump
+wiggle write -f app.hex --verify                 :: HEX按文件地址
+wiggle write -f data.bin -a AF000000 --verify    :: BIN需-a(8字节对齐)
+wiggle rewrite --addr AF004004 --data 1122334455667788 --verify  :: 任意地址R-M-W
+wiggle rewrite -f patch.hex --backup --verify
+wiggle restore --file dump.bin                   :: 擦+写+校验
+wiggle ucb read  -a AF400000 -l 800 -o ucb.hex
+wiggle ucb write -f bmhd.hex --verify            :: 需确认,32B对齐+CONFIRMED校验
+wiggle ucb erase --addr AF400000 --sectors 4 --verify
+```
+对齐：read 无；write 8字节页对齐；erase 扇区对齐(自动)；rewrite 无(内部R-M-W)。
+UCB 锁定区(安全/OTP)禁止擦写；`--all`/UCB 需交互确认。
+
+### 3.3 内存 / 外设寄存器 / 比对（TAS）
+```bat
+wiggle dump 0x70000000 0x80                 :: hex dump(PFlash/DFlash/SRAM)
+wiggle dump 0xA0000000 0x100 -o pflash.hex
+wiggle poke 0x70000000 0x12345678 --dangerous   :: 写内存+读回(需--dangerous)
+wiggle poke 0xF0018300 0x1 --width 32 --dangerous
+wiggle reg DMU.HF.STATUS                   :: SVD名读+字段解码
+wiggle reg 0xF8040010                      :: 按地址读
+wiggle reg DMU.HF.CONTROL 0x1              :: 写
+wiggle reg --list DMU                      :: 列外设寄存器
+wiggle compare -f app.hex -a AF000000      :: 文件vs Flash
+wiggle search 0xAF000000 0x20000 0x11223344  :: 模式搜索
 ```
 
-### 3.3 服务形态
+### 3.4 调试器（MCD，非破坏）
 ```bat
-wiggle shell                    :: 交互REPL(持久MCD会话)
-wiggle serve                    :: JSON-lines持久会话(MCP传输)
-wiggle gdbserver --port 3333    :: GDB RSP；GDB: target remote :3333
+wiggle halt [--cpu n] [--global] [--elf f]   :: 暂停;--global多核同停
+wiggle go   [--global]                       :: 恢复
+wiggle step [n]                              :: 单步n条(默认1)
+wiggle stepover / stepout                    :: 跨过call / 跳到返回地址
+wiggle state [--cpu n]                       :: 状态/停止触发id/PC
+wiggle cpu_reg                               :: 全核寄存器(PC/PSW/PCXI/A0-15/D0-15)
+wiggle cpu_reg PC                            :: 读单寄存器
+wiggle cpu_reg D0 0x12345678                 :: 写寄存器
+wiggle break add 0x80001000                  :: 指令断点(执行地址)
+wiggle break list / del 0 / del 0x80001000 / clear
+wiggle watch add 0x70008860 --length 4 --type write  :: 写观察点
+wiggle watch add 0x70008860 --type read|rw   :: 读/读写观察点
+wiggle watch add --sym Core0_Task_cnt --elf f:: 按符号(自动长度)
+wiggle watch list / del <addr> / clear
+wiggle var read  Core0_Task_cnt --elf f      :: 变量读(值+hex)
+wiggle var write Core0_Task_cnt 0x1234 --elf f
+wiggle bt [--elf f]                          :: 符号化调用栈(CSA链)
+wiggle disasm 0x80018250 [count] [--elf f]   :: 反汇编(hldumptc优先,原生回退)
+wiggle sample --sym X --interval 100 [--size 4]  :: 活体双采样(防撕裂)
+wiggle sample 0x70008860 --interval 200
+wiggle rtos tasks [--type auto|freertos|autosar] [--elf f]
+wiggle rtos bt --task TaskName [--elf f]
+```
+注意：halt 后计数器停走，测时序先 `reset`；watch 命中后 `go` 会因变量再写立即再停（正常）。
+
+### 3.5 服务形态
+```bat
+wiggle shell                  :: 交互REPL,持久MCD会话,help/quit
+wiggle serve                  :: JSON-lines持久会话(MCP传输),stdin/stdout
+wiggle gdbserver --port 3333  :: GDB RSP server
+:: GDB 侧: (gdb) target remote :3333 ; file app.elf ; break main ; continue
+```
+
+### 3.6 退出码（脚本判断）
+| 码 | 含义 | 码 | 含义 |
+|----|------|----|------|
+| 0 | 成功 | 14 | 擦除超时 |
+| 1 | 参数/地址错 | 15 | 错误标志 |
+| 2 | server连接失败 | 17 | 校验失败 |
+| 3/4 | 目标查询/无目标 | 18 | IO错误 |
+| 5/6 | session/device连接 | 22 | 比对不一致 |
+| 7 | 设备不支持 | 23 | 搜索无结果 |
+| 8 | 备份失败 | 25 | 结果截断 |
+| 11-13 | Flash状态/命令 | 26 | 需先halt |
+| | | 27 | 平台不支持resume |
+
+### 3.7 旧版兼容（位置参数）
+```bat
+wiggle 0xAF000000 4            :: 等价 erase --addr AF000000 --sectors 4
+wiggle --all --verify          :: 等价 erase --all --verify
+wiggle --info                  :: 等价 erase --info
 ```
 
 ---
