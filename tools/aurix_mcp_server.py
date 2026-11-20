@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "device": None,
     "timeout": 120,
     "das_home": None,   # DAS 安装路径（MCD/server 回退查找）；null=自动/随包
+    "hldumptc": None,   # TASKING hldumptc 路径（完整反汇编，依赖环境不随包）；null=自动探测
     "build": {
         "command": None,
         "work_dir": None,
@@ -201,14 +202,32 @@ def load_config(config_path: Optional[str] = None) -> dict:
                     cfg["das_home"] = cand
                     break
 
+    # hldumptc（完整反汇编，依赖环境不随包）：配置 > env > 常见 TASKING 路径；无则原生回退
+    hl = cfg.get("hldumptc")
+    if hl and not os.path.isfile(hl):
+        cfg["hldumptc"] = None
+    if not cfg.get("hldumptc"):
+        env_hl = os.environ.get("WIGGLE_HLDUMPTC")
+        if env_hl and os.path.isfile(env_hl):
+            cfg["hldumptc"] = env_hl
+        else:
+            for cand in (r"D:\Program Files\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe",
+                         r"C:\Program Files\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe",
+                         r"C:\Program Files (x86)\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe"):
+                if os.path.isfile(cand):
+                    cfg["hldumptc"] = cand
+                    break
+
     return cfg
 
 
 def _spawn_env(cfg: dict) -> dict:
-    """子进程环境：把 das_home 注入 DAS_HOME，供 wiggle 定位 mcdxdas.dll。"""
+    """子进程环境：das_home→DAS_HOME（定位 mcdxdas.dll）；hldumptc→WIGGLE_HLDUMPTC。"""
     env = os.environ.copy()
     if cfg.get("das_home"):
         env["DAS_HOME"] = cfg["das_home"]
+    if cfg.get("hldumptc"):
+        env["WIGGLE_HLDUMPTC"] = cfg["hldumptc"]
     return env
 
 
