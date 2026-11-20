@@ -302,6 +302,13 @@ void TestNoTransactionReplay()
     s_mock.partialTx = true;
     Check(!wiggle_mcd::readMem(session, 0x70000000U, data, 4U, err) && s_mock.txCalls == 3U,
           "partial transaction is not replayed");
+    Check(err.find("addr=0x70000000 length=4 bytes_ok=0") != std::string::npos,
+          "read failure includes exact transaction and valid byte count");
+    s_mock.txResult = MCD_RET_ACT_HANDLE_ERROR;
+    Check(!wiggle_mcd::readMem(session, 0xA0003000U, data, 4U, err) &&
+          err.find("addr=0xA0003000") != std::string::npos &&
+          err.find("error=0x102") != std::string::npos && s_mock.txCalls == 4U,
+          "flash read error is not silently filled with zero or retried");
 }
 
 void TestAppliedWaitFailure()

@@ -417,7 +417,12 @@ bool readMem(const Session& s, uint64_t addr, uint8_t* buf, uint32_t n, std::str
     tl.num_tx_ok = 0;
     mcd_return_et rc = g_api.execute_txlist(s.core, &tl);
     if (rc != MCD_RET_ACT_NONE || tx.num_bytes_ok != n) {
-        err = "readMem: " + errDetail(s.core, rc);
+        const std::string detail = errDetail(s.core, rc);
+        char position[160];
+        snprintf(position, sizeof(position),
+                 "readMem addr=0x%llX length=%u bytes_ok=%u: ",
+                 static_cast<unsigned long long>(addr), n, tx.num_bytes_ok);
+        err = position + detail;
         return false;
     }
     return true;

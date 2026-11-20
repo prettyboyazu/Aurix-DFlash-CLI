@@ -33,6 +33,7 @@ import queue
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -481,45 +482,36 @@ def run_wiggle(args: list[str], cfg: dict, timeout: Optional[int] = None) -> dic
 
 
 def run_flasher(args: list[str], cfg: dict, timeout: Optional[int] = None) -> dict:
-    """Run AURIXFlasher.exe and return result."""
+    """Run AURIXFlasher once and retain diagnostics even on failure."""
     exe = cfg["aurix_flasher_exe"]
     if not exe:
         return {"status": "error", "code": -1, "message": "AURIXFlasher.exe not found"}
 
     cmd = [exe] + args
-    tout = timeout or cfg.get("timeout") or 300  # null config must not mean "wait forever"
-
+    tout = timeout or cfg.get("timeout") or 300
+    log_file = args[args.index("-log") + 1] if "-log" in args else ""
+    diagnostics = {"command": cmd, "log_file": log_file, "process_timeout_seconds": tout}
+    _kill_session()
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=tout,
+            cmd, capture_output=True, text=True, errors="replace", timeout=tout,
             cwd=os.path.dirname(exe) if os.path.dirname(exe) else None,
         )
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "code": -2, "message": f"Timeout after {tout}s"}
-    except FileNotFoundError:
-        return {"status": "error", "code": -1, "message": f"Executable not found: {exe}"}
-    except Exception as e:
-        return {"status": "error", "code": -3, "message": str(e)}
+    except subprocess.TimeoutExpired as exc:
+        def text(value):
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+        return dict(diagnostics, status="error", code=-2, completion_unknown=True,
+                    message=f"Process timeout after {tout}s; do not retry before inspecting target state",
+                    stdout=text(exc.stdout), stderr=text(exc.stderr))
+    except (OSError, ValueError) as exc:
+        return dict(diagnostics, status="error", code=-1, message=str(exc))
 
-    # AURIXFlasher doesn't support --json, so we construct result
-    stdout = result.stdout.strip()
-    stderr = result.stderr.strip()
-
+    diagnostics.update(stdout=result.stdout.strip(), stderr=result.stderr.strip(),
+                       returncode=result.returncode)
     if result.returncode == 0:
-        return {
-            "status": "ok",
-            "returncode": 0,
-            "stdout": stdout,
-        }
-    else:
-        return {
-            "status": "error",
-            "code": result.returncode,
-            "message": stderr or stdout or "AURIXFlasher failed",
-        }
+        return dict(diagnostics, status="ok")
+    return dict(diagnostics, status="error", code=result.returncode,
+                message=result.stderr.strip() or result.stdout.strip() or "AURIXFlasher failed")
 
 
 def format_result(result: dict) -> str:
@@ -1477,21 +1469,23 @@ def aurix_pflash(
     start: str = "",
     device_id: str = "",
     confirm_risk: bool = False,
+    flax_timeout_seconds: int = 10,
+    log_file: str = "",
 ) -> str:
     """Program PFlash using AURIXFlasher.exe.
     This is for PFlash programming only. For DFlash, use wiggle_write.
 
     Args:
-        hex_file: Intel HEX or ELF file path (required)
+        hex_file: Intel HEX file path (required)
         verify: Verify after programming (default: True)
-        erase: Erase mode before programming: 'all' (full chip erase),
-               'used' (erase only used sectors), '' (default AURIXFlasher behavior)
+        erase: 'all' (all PFlash sectors), 'on' (used sectors), 'off', or '' (vendor default).
         ucb: Enable UCB programming (default: False, HIGH RISK)
-        connect: Connection mode: '0' (hot attach, no reset),
-                 '1' (reset and halt), '' (default)
+        connect: '0' (hot attach; target must be halted), '6' (reset and halt), or '' (default)
         start: After programming: 'on' (reset and run), 'off' (stay halted), '' (default)
         device_id: Device/DAP ID for multi-target setups (e.g. '0', '1')
         confirm_risk: MUST be True when ucb=True. Acknowledges risk of locking device.
+        flax_timeout_seconds: Vendor FLAX polling timeout (1..120 seconds), independent of process timeout.
+        log_file: New XML log path; empty creates a unique local temporary log returned with the result.
     """
     # Double confirmation for UCB programming
     if ucb and not confirm_risk:
@@ -1501,7 +1495,28 @@ def aurix_pflash(
                        "Writing UCB/BMHD may permanently lock the device. "
                        "Set confirm_risk=True to acknowledge and proceed."
         })
-    args = ["-hex", hex_file]
+    if erase not in ("", "all", "on", "off") or connect not in ("", "0", "6") or start not in ("", "on", "off"):
+        return json.dumps({"status": "error", "message": "Invalid flasher option: erase=all/on/off, connect=0/6, start=on/off"})
+    if not 1 <= flax_timeout_seconds <= 120:
+        return json.dumps({"status": "error", "message": "flax_timeout_seconds must be 1..120"})
+    hex_path = Path(hex_file).resolve()
+    if not hex_path.is_file():
+        return json.dumps({"status": "error", "message": f"HEX file not found: {hex_file}"})
+    hex_file = str(hex_path)
+    if not _config.get("aurix_flasher_exe"):
+        return json.dumps({"status": "error", "message": "AURIXFlasher.exe not found"})
+    try:
+        if log_file:
+            log_path = Path(log_file).resolve()
+            with log_path.open("x", encoding="utf-8"):
+                pass
+            log_file = str(log_path)
+        else:
+            fd, log_file = tempfile.mkstemp(prefix="wiggle_flasher_", suffix=".xml")
+            os.close(fd)
+    except OSError as exc:
+        return json.dumps({"status": "error", "message": f"Cannot create flasher log: {exc}"})
+    args = ["-hex", hex_file, "-timeout", str(flax_timeout_seconds), "-log", log_file]
     if verify:
         args += ["-v", "on"]
     else:

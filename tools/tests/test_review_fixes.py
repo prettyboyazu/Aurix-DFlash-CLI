@@ -423,6 +423,67 @@ err = json.loads(srv._device_required_error(srv._config, "reg_search"))
 check("error lists available devices", "TC39xB" in err.get("available_devices", []) and "TC23x" in err.get("available_devices", []), str(err.get("available_devices"))[:80])
 srv._config = {}
 
+print("[PFlash] diagnostics and non-replayed execution (host mocks)")
+orig_run4, orig_kill4 = srv.subprocess.run, srv._kill_session
+order = []
+calls = []
+srv._kill_session = lambda: order.append("release")
+
+def flasher_fail(cmd, **kwargs):
+    order.append("launch")
+    calls.append((cmd, kwargs))
+    return type("Result", (), {"returncode": 2, "stdout": "Programming Flash memory Flax : Not Responding", "stderr": "vendor detail"})()
+
+try:
+    srv.subprocess.run = flasher_fail
+    result = srv.run_flasher(["-e", "all", "-log", "diagnostic.xml"], {"aurix_flasher_exe": "fake.exe"})
+    check("release owned MCD session before launch", order == ["release", "launch"])
+    check("retain both vendor streams and log path", result["stdout"].endswith("Not Responding") and result["stderr"] == "vendor detail" and result["log_file"] == "diagnostic.xml")
+    check("all failure is not retried as on", len(calls) == 1 and calls[0][0][2] == "all")
+    def expire(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        raise srv.subprocess.TimeoutExpired(cmd, 3, output=b"erase started", stderr=b"timeout detail")
+    srv.subprocess.run = expire
+    result = srv.run_flasher(["-e", "all"], {"aurix_flasher_exe": "fake.exe"}, timeout=3)
+    check("process timeout retains output and unknown completion", result.get("completion_unknown") and result["stdout"] == "erase started" and result["stderr"] == "timeout detail")
+    srv.subprocess.run = flasher_fail
+    with tempfile.TemporaryDirectory() as directory:
+        hex_path = os.path.join(directory, "input.hex")
+        with open(hex_path, "w", encoding="ascii") as stream:
+            stream.write(":00000001FF\n")
+        srv._config = {"aurix_flasher_exe": "fake.exe"}
+        log_path = os.path.join(directory, "capture.xml")
+        try:
+            srv.aurix_pflash(hex_file=hex_path, erase="all", connect="6", flax_timeout_seconds=60, log_file=log_path)
+        except ToolError:
+            pass
+        argv = calls[-1][0]
+        check("inner timeout forwarded separately from outer process", argv[argv.index("-timeout")+1] == "60" and calls[-1][1]["timeout"] == 300)
+        check("requested all erase retained", argv[argv.index("-e")+1] == "all")
+        check("vendor decoding cannot abort result capture", calls[-1][1].get("errors") == "replace")
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(directory)
+            try:
+                srv.aurix_pflash(hex_file="input.hex", log_file="relative.xml")
+            except ToolError:
+                pass
+        finally:
+            os.chdir(old_cwd)
+        relative_argv = calls[-1][0]
+        check("relative HEX becomes verified absolute path before cwd change",
+              relative_argv[relative_argv.index("-hex")+1] == hex_path)
+        count = len(calls)
+        for kwargs in ({"erase": "used"}, {"connect": "1"}, {"flax_timeout_seconds": 0}, {"log_file": log_path}, {"ucb": True}):
+            try:
+                srv.aurix_pflash(hex_file=hex_path, **kwargs)
+                check("invalid/unsafe request rejected before launch", False)
+            except ToolError:
+                check("invalid/unsafe request rejected before launch", len(calls) == count)
+finally:
+    srv.subprocess.run, srv._kill_session = orig_run4, orig_kill4
+    srv._config = {}
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

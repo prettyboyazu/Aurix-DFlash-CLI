@@ -210,7 +210,12 @@ wiggle --info                  :: 等价 erase --info
 `wiggle_var(action,name,value)`、`wiggle_bt`、`wiggle_disasm(address,count)`、
 `wiggle_sample(sym,interval_ms)`、`wiggle_rtos(action,type,task)`
 Flash/诊断：`wiggle_erase/write/read/rewrite/restore/ucb/dump/poke/reg/status/info/list/compare/search/reset`
-PFlash：`aurix_pflash(hex_file, verify=True, erase="all", ucb=False, confirm_risk=…)`
+PFlash：`aurix_pflash(hex_file, verify=True, erase="all", ucb=False, confirm_risk=…, flax_timeout_seconds=10, log_file="")`
+
+- `erase`：`on`=所用扇区、`all`=全部 PFlash 扇区、`off`=不擦；`connect`：`6`=复位暂停、`0`=热附着（须已暂停）。不使用旧文档中的 `used`/`1`。
+- `flax_timeout_seconds` 为厂商内部轮询预算（1–120 秒，默认 10），与外层进程 300 秒超时独立；超时不会自动重试擦写。
+- `log_file` 为新的 XML 文件路径；不填则生成唯一临时日志。成功和失败均返回命令、stdout/stderr、日志路径；失败后先检查目标状态。
+- `wiggle_read` 已分块读取；跨空白 PFlash 页仍可能报 ECC 错误。失败返回事务地址/长度/bytes_ok、整块前缀和 `output_written=false`，不会把读取失败填成 0x00 或覆盖原输出文件。
 寄存器元数据：`reg_peripherals / reg_fields / reg_search`
 构建：`build_project / parse_symbols / parse_elf / lookup_symbol / lookup_address / reload_parsers`
 

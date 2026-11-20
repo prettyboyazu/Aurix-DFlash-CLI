@@ -1067,7 +1067,13 @@ static int doRead(int argc, char** argv)
     for (uint32_t offset = 0; offset < readLength; offset += 4096) {
         uint32_t thisChunk = std::min<uint32_t>(4096, readLength - offset);
         if (!wiggle_dbg::g_debug.readMem(readAddr + offset, allData.data() + offset, thisChunk, merr)) {
-            if (g_json) return jsonError(EXIT_IO_ERROR, merr);
+            if (g_json) {
+                return jsonErrorData(EXIT_IO_ERROR, {
+                    {"message", merr}, {"address", readAddr}, {"length", readLength},
+                    {"completed_prefix_bytes", offset}, {"failed_chunk_address", readAddr + offset},
+                    {"failed_chunk_length", thisChunk}, {"output_written", false}
+                });
+            }
             fprintf(stderr, "ERROR: Read failed at 0x%08X: %s\n", readAddr + offset, merr.c_str());
             return EXIT_IO_ERROR;
         }
