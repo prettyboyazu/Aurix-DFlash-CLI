@@ -18,5 +18,7 @@
         "hex_file": null,
         "toolchain": null
     },
-    "das_home": null
+    "das_home": null,
+    "hldumptc": null,
+    "tasking_home": null
 }
