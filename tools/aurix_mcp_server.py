@@ -2221,13 +2221,34 @@ def wiggle_mem_write(address: str, data: str, cpu: int = 0) -> str:
 
 @tool
 def wiggle_disasm(address: str, count: int = 10, cpu: int = 0, elf_file: str = "") -> str:
-    """Disassemble TriCore instructions at address (hex). Native C++ decoder;
-    instruction length validated against hardware single-step. Returns
-    addr/length/mnemonic/raw per insn. Uncovered opcodes shown as .hword/.word.
+    """Disassemble TriCore instructions at address (hex). Uses TASKING hldumptc
+    (full symbolic disassembly, cached per ELF) when available; falls back to the
+    native C++ decoder (length HW-validated, subset mnemonics) otherwise.
+    Returns addr/length/mnemonic/label per insn and the backend used.
     """
     if elf_file:
         session_request("sym", action="load", file=elf_file)
     r = session_request("disasm", cpu=cpu, addr=int(address, 16), count=count)
+    if r is not None:
+        return format_result(r)
+    return json.dumps({"status": "error", "message": "serve session unavailable"})
+
+
+@tool
+def wiggle_rtos(action: str = "tasks", type: str = "auto", task: str = "",
+                cpu: int = 0, elf_file: str = "") -> str:
+    """RTOS awareness. action='tasks' lists tasks (name/state/priority/stack);
+    'bt' unwinds a task's call stack (default current). type='freertos' parses
+    generic TCB/list structures; 'autosar' needs exported OS kernel symbols or
+    config (project-specific); 'auto' detects. Requires ELF loaded (elf_file).
+    FreeRTOS layout assumes 32-bit, configMAX_TASK_NAME_LEN=16.
+    """
+    if elf_file:
+        session_request("sym", action="load", file=elf_file)
+    kw = dict(cpu=cpu, action=action, type=type)
+    if task:
+        kw["task"] = task
+    r = session_request("rtos", **kw)
     if r is not None:
         return format_result(r)
     return json.dumps({"status": "error", "message": "serve session unavailable"})

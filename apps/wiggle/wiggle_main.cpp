@@ -4287,6 +4287,24 @@ static int doState(int argc, char** argv)
     return runDebugReq(req);
 }
 
+static int doRtos(int argc, char** argv)
+{
+    DebugArgs da;const char*action=nullptr;const char*type=nullptr;const char*task=nullptr;
+    for(int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--type")&&i+1<argc){type=argv[i+1];i+=2;continue;}
+        if(!strcmp(argv[i],"--task")&&i+1<argc){task=argv[i+1];i+=2;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle rtos <tasks|bt> [--type freertos|autosar] [--task name] [--elf f]\n");return EXIT_OK;}
+        if(argv[i][0]=='-'){fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+        action=argv[i];i++;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    rc=debugLoadElf(da);if(rc)return rc;
+    nljson req;req["cmd"]="rtos";req["action"]=action?action:"tasks";req["cpu"]=da.cpu;
+    if(type)req["type"]=type;
+    if(task)req["task"]=task;
+    return runDebugReq(req);
+}
+
 static int doDisasm(int argc, char** argv)
 {
     DebugArgs da;uint64_t addr=0;bool hasAddr=false;int count=10;
@@ -4693,6 +4711,7 @@ static int dispatchCli(int argc, char** argv)
     if (first == "watch") return doWatch(argc - 1, argv + 1);
     if (first == "var") return doVar(argc - 1, argv + 1);
     if (first == "state") return doState(argc - 1, argv + 1);
+    if (first == "rtos") return doRtos(argc - 1, argv + 1);
     if (first == "disasm") return doDisasm(argc - 1, argv + 1);
     if (first == "stepover" || first == "so") return doStepOver(argc - 1, argv + 1);
     if (first == "stepout" || first == "su") return doStepOut(argc - 1, argv + 1);

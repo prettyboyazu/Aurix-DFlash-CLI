@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "nlohmann/json.hpp"
@@ -89,6 +90,17 @@ private:
     void cmdSearch(const nljson& req, nljson& resp);
     void cmdCompare(const nljson& req, nljson& resp);
     void cmdInfo(const nljson& req, nljson& resp);
+    void cmdRtos(const nljson& req, nljson& resp);
+
+    // hldumptc 完整反汇编后端（离线 ELF，缓存）
+    struct DisasmLine { uint32_t addr = 0, len = 0; std::string text, label; };
+    bool buildDisasmCache(std::string& err);
+    std::string findHldumptc();
+
+    // RTOS 感知（FreeRTOS 通用 / AUTOSAR OS 配置驱动）
+    bool freertosTasks(nljson& out, std::string& err);
+    bool autosarTasks(nljson& out, std::string& err);
+    bool rtosBacktrace(const nljson& req, nljson& out, std::string& err);
 
     wiggle_mcd::Session mcd_;
     bool open_ = false;
@@ -97,6 +109,9 @@ private:
     std::vector<RegInfo> regmap_;
     bool regmapLoaded_ = false;
     ElfSymbolTable elf_;
+    std::unordered_map<uint32_t, DisasmLine> disasmCache_;
+    std::string disasmCacheElf_;
+    std::string hldumptc_;
 };
 
 // 全局单例：CLI 一次性进程或 serve 持久进程共用

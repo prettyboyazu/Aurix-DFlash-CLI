@@ -23,12 +23,18 @@
 
 #include "debug_session.h"
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <thread>
 
 #include "tricore_defs.h"
@@ -609,35 +615,115 @@ void DebugSession::cmdInfo(const nljson& req, nljson& resp)
     } else { resp["status"] = "error"; resp["message"] = "unknown what"; }
 }
 
+std::string DebugSession::findHldumptc()
+{
+    if (!hldumptc_.empty()) return hldumptc_;
+    auto exists = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) { fclose(f); return true; } return false; };
+    const char* env = getenv("WIGGLE_HLDUMPTC");
+    if (env && exists(env)) return hldumptc_ = env;
+    const char* cand[] = {
+        "D:/Program Files/TASKING/TriCore v6.3r1/ctc/bin/hldumptc.exe",
+        "C:/Program Files/TASKING/TriCore v6.3r1/ctc/bin/hldumptc.exe",
+        "C:/Program Files (x86)/TASKING/TriCore v6.3r1/ctc/bin/hldumptc.exe",
+    };
+    for (auto c : cand) if (exists(c)) return hldumptc_ = c;
+    return "";
+}
+
+bool DebugSession::buildDisasmCache(std::string& err)
+{
+    std::string exe = findHldumptc();
+    if (exe.empty()) { err = "hldumptc not found (set WIGGLE_HLDUMPTC)"; return false; }
+    std::string exeW = exe, elfW = elf_.sourcePath();
+    for (auto& c : exeW) if (c == '/') c = '\\';
+    for (auto& c : elfW) if (c == '/') c = '\\';
+    // 经临时 bat 包装，避免 _popen 嵌套引号被 cmd 剥离
+    char batPath[MAX_PATH] = {0};
+    GetTempPathA(MAX_PATH, batPath);
+    std::string bat = std::string(batPath) + "wiggle_hld.bat";
+    { FILE* bf = fopen(bat.c_str(), "w"); if (!bf) { err = "temp bat failed"; return false; }
+      fprintf(bf, "@\"%s\" \"%s\"\n", exeW.c_str(), elfW.c_str()); fclose(bf); }
+    FILE* p = _popen(bat.c_str(), "r");
+    if (!p) { remove(bat.c_str()); err = "hldumptc popen failed"; return false; }
+    disasmCache_.clear();
+    char line[2048];
+    while (fgets(line, sizeof(line), p)) {
+        std::istringstream iss(line);
+        std::string tok;
+        if (!(iss >> tok)) continue;
+        if (tok.size() != 8) continue;
+        uint32_t a = 0; bool hexok = true;
+        for (char ch : tok) { if (!isxdigit((unsigned char)ch)) { hexok = false; break; } }
+        if (!hexok) continue;
+        a = (uint32_t)strtoul(tok.c_str(), nullptr, 16);
+        uint32_t nbytes = 0;
+        while (iss >> tok) {
+            if (tok.size() == 2 && isxdigit((unsigned char)tok[0]) && isxdigit((unsigned char)tok[1])) nbytes++;
+            else break;
+        }
+        if (nbytes != 2 && nbytes != 4) continue;
+        std::string label, text;
+        if (!tok.empty() && tok.back() == ':') { label = tok.substr(0, tok.size() - 1); }
+        else if (!tok.empty()) { text = tok; }
+        std::string rest;
+        while (iss >> tok) text += (text.empty() ? "" : " ") + tok;
+        if (text.empty()) continue;
+        DisasmLine d; d.addr = a; d.len = nbytes; d.text = text; d.label = label;
+        disasmCache_[a] = d;
+    }
+    _pclose(p);
+    remove(bat.c_str());
+    disasmCacheElf_ = elf_.sourcePath();
+    if (disasmCache_.empty()) { err = "hldumptc produced no disassembly"; return false; }
+    return true;
+}
+
 void DebugSession::cmdDisasm(const nljson& req, nljson& resp)
 {
     std::string err;
     int cpu = req.value("cpu", 0);
     if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
     uint64_t in = req.value("addr", 0ULL);
-    uint64_t addr = normData(in);
     uint32_t count = req.value("count", 10);
     if (count == 0 || count > 256) count = 10;
-    std::vector<uint8_t> buf(count * 4 + 4);
-    if (!wiggle_mcd::readMem(mcd_, addr, buf.data(), count * 4, err)) {
-        if (!wiggle_mcd::readMem(mcd_, in, buf.data(), count * 4, err)) {
-            resp["status"] = "error"; resp["message"] = err; return;
-        }
-        addr = in;
+
+    bool usedHld = false;
+    if (elf_.isLoaded()) {
+        if (disasmCacheElf_ != elf_.sourcePath() || disasmCache_.empty()) buildDisasmCache(err);
+        usedHld = !disasmCache_.empty();
     }
+
+    uint64_t addr = normData(in);
+    std::vector<uint8_t> buf(count * 4 + 4);
+    bool haveLive = wiggle_mcd::readMem(mcd_, addr, buf.data(), count * 4, err);
+    if (!haveLive) { addr = in; haveLive = wiggle_mcd::readMem(mcd_, in, buf.data(), count * 4, err); }
+
     resp["status"] = "ok";
+    resp["backend"] = usedHld ? "hldumptc" : "native";
     resp["insns"] = nljson::array();
-    uint32_t off = 0;
-    for (uint32_t i = 0; i < count && off + 2 <= count * 4; i++) {
-        DisasmInsn d = tricoreDecode(static_cast<uint32_t>(addr + off), buf.data() + off, count * 4 - off);
+    uint32_t cur = (uint32_t)in;
+    for (uint32_t i = 0; i < count; i++) {
         nljson e;
-        e["addr"] = addr + off;
-        e["length"] = d.length;
-        e["mnemonic"] = d.mnemonic;
-        e["raw"] = d.raw;
-        e["is32"] = d.is32;
-        resp["insns"].push_back(e);
-        off += d.length;
+        if (usedHld) {
+            auto it = disasmCache_.find(cur);
+            if (it != disasmCache_.end()) {
+                e["addr"] = cur; e["length"] = it->second.len;
+                e["mnemonic"] = it->second.text;
+                if (!it->second.label.empty()) e["label"] = it->second.label;
+                e["source"] = "hldumptc";
+                resp["insns"].push_back(e);
+                cur += it->second.len;
+                continue;
+            }
+        }
+        uint32_t off = cur - (uint32_t)in;
+        if (haveLive && off + 2 <= count * 4) {
+            DisasmInsn d = tricoreDecode(cur, buf.data() + off, count * 4 - off);
+            e["addr"] = cur; e["length"] = d.length; e["mnemonic"] = d.mnemonic;
+            e["raw"] = d.raw; e["is32"] = d.is32; e["source"] = "native";
+            resp["insns"].push_back(e);
+            cur += d.length;
+        } else break;
     }
 }
 
@@ -749,6 +835,121 @@ void DebugSession::cmdSample(const nljson& req, nljson& resp)
     resp["consistent"] = (v0 == v1);  // 撕裂读防护：双次采样一致才采信
 }
 
+// ---------------------------------------------------------------------------
+// RTOS 感知。FreeRTOS 用通用 TCB/List 布局（32-bit, configMAX_TASK_NAME_LEN=16）；
+// AUTOSAR OS 内核结构项目特定，需符号导出或经 req 配置表参数，缺失时优雅报错。
+// TCB: pxTopOfStack+0, xStateListItem+4, uxPriority+44, pxStack+48, pcTaskName+52
+// ListItem_t: xItemValue0 pxNext4 pxPrevious8 pvOwner12 pxContainer16 (20B)
+// List_t: uxNumberOfItems0 pxIndex4 xListEnd8 (28B); xListEnd.pxNext=+12, 结束标记=+8
+// ---------------------------------------------------------------------------
+bool DebugSession::freertosTasks(nljson& out, std::string& err)
+{
+    auto sym = [&](const char* n) { return elf_.findByName(n); };
+    const ElfSymbol* cur = sym("pxCurrentTCB");
+    const ElfSymbol* ready = sym("pxReadyTasksLists");
+    if (!cur || !ready) { err = "FreeRTOS symbols (pxCurrentTCB/pxReadyTasksLists) not found"; return false; }
+    uint32_t curTcb = 0; readU32(cur->value, curTcb, err);
+    const ElfSymbol* top = sym("uxTopUsedPriority");
+    uint32_t topPri = 7; if (top) readU32(top->value, topPri, err);
+    const ElfSymbol* nt = sym("uxCurrentNumberOfTasks");
+    uint32_t n = 0; if (nt) readU32(nt->value, n, err);
+    out["type"] = "freertos"; out["current_tcb"] = curTcb; out["num_tasks"] = n;
+    out["tasks"] = nljson::array();
+    auto walk = [&](uint32_t list, const char* state) {
+        uint32_t item = 0; readU32(list + 12, item, err);
+        uint32_t end = list + 8; int guard = 0;
+        while (item && item != end && guard++ < 256) {
+            uint32_t tcb = item - 4;
+            uint8_t nb[16] = {0}; char name[17] = {0};
+            if (readMem(tcb + 52, nb, 16, err)) memcpy(name, nb, 16);
+            uint32_t pri = 0, tos = 0;
+            readU32(tcb + 44, pri, err); readU32(tcb + 0, tos, err);
+            nljson t;
+            t["name"] = name; t["tcb"] = tcb; t["priority"] = pri;
+            t["state"] = (tcb == curTcb) ? "running" : state;
+            t["top_of_stack"] = tos;
+            out["tasks"].push_back(t);
+            uint32_t next = 0; readU32(item + 4, next, err); item = next;
+        }
+    };
+    for (uint32_t p = 0; p <= topPri && p < 16; p++) walk(ready->value + p * 28, "ready");
+    if (auto* s = sym("xDelayedTaskList1")) walk(s->value, "delayed");
+    if (auto* s = sym("xDelayedTaskList2")) walk(s->value, "delayed");
+    if (auto* s = sym("xSuspendedTaskList")) walk(s->value, "suspended");
+    if (auto* s = sym("xPendingReadyList")) walk(s->value, "pending");
+    return true;
+}
+
+bool DebugSession::autosarTasks(nljson& out, std::string& err)
+{
+    // 配置驱动：req 提供 task_table/stride/name_off/state_off/count 符号或地址；否则探测常见符号
+    auto sym = [&](const char* n) { return elf_.findByName(n); };
+    const ElfSymbol* tbl = sym("OsTaskTable");
+    if (!tbl) tbl = sym("OsTaskInitBlock");
+    if (!tbl) { err = "AUTOSAR OS kernel symbols not exported; supply rtos table params"; return false; }
+    out["type"] = "autosar"; out["table"] = tbl->name; out["table_addr"] = tbl->value;
+    out["tasks"] = nljson::array();
+    out["note"] = "AUTOSAR OS layout is project-specific; refine via config";
+    return true;
+}
+
+bool DebugSession::rtosBacktrace(const nljson& req, nljson& out, std::string& err)
+{
+    nljson tasks;
+    if (!freertosTasks(tasks, err)) return false;
+    uint32_t tos = 0;
+    std::string want = req.value("task", "");
+    bool found = false;
+    for (const auto& t : tasks["tasks"]) {
+        if (want.empty() ? t.value("current", false) : t.value("name", "") == want) {
+            tos = t.value("top_of_stack", 0); found = true; break;
+        }
+    }
+    if (!found) { err = "task not found"; return false; }
+    // TriCore FreeRTOS port: pxTopOfStack 指向保存的上下文，word0=PCXI 链接
+    uint32_t link = 0, ra = 0;
+    if (!readU32(tos, link, err)) return false;
+    readU32(tos + CSA_UPPER_RA_OFF, ra, err);
+    out["frames"] = nljson::array();
+    nljson f0; f0["pc"] = ra;
+    uint32_t o0 = 0; auto* s0 = symFindCode(ra, o0);
+    if (s0) { f0["symbol"] = s0->name; f0["offset"] = o0; }
+    out["frames"].push_back(f0);
+    std::vector<uint32_t> visited;
+    while (out["frames"].size() < BT_MAX_FRAMES) {
+        uint32_t ea = csaAddrFromLink(link);
+        if (!ea || std::find(visited.begin(), visited.end(), ea) != visited.end()) break;
+        visited.push_back(ea);
+        uint32_t nl = 0, nr = 0;
+        if (!readU32(ea, nl, err)) break;
+        bool up = (link & PCXI_UL) != 0;
+        if (!readU32(ea + (up ? CSA_UPPER_RA_OFF : CSA_LOWER_RA_OFF), nr, err)) break;
+        nljson f; f["pc"] = nr; f["csa"] = ea;
+        uint32_t o = 0; auto* s = symFindCode(nr, o);
+        if (s) { f["symbol"] = s->name; f["offset"] = o; }
+        out["frames"].push_back(f);
+        ra = nr; link = nl;
+    }
+    return true;
+}
+
+void DebugSession::cmdRtos(const nljson& req, nljson& resp)
+{
+    std::string err;
+    int cpu = req.value("cpu", 0);
+    if (!ensure(cpu, err)) { resp["status"] = "error"; resp["message"] = err; return; }
+    if (!elf_.isLoaded()) { resp["status"] = "error"; resp["message"] = "load ELF first (sym load)"; return; }
+    std::string action = req.value("action", "tasks");
+    std::string type = req.value("type", "auto");
+    if (type == "auto") type = elf_.findByName("pxCurrentTCB") ? "freertos" : "autosar";
+    bool ok = false;
+    if (action == "tasks") ok = (type == "freertos") ? freertosTasks(resp, err) : autosarTasks(resp, err);
+    else if (action == "bt") ok = rtosBacktrace(req, resp, err);
+    else { err = "unknown rtos action"; }
+    resp["status"] = ok ? "ok" : "error";
+    if (!ok) resp["message"] = err;
+}
+
 bool DebugSession::dispatch(const nljson& req, nljson& resp)
 {
     std::string cmd = req.value("cmd", "");
@@ -769,6 +970,7 @@ bool DebugSession::dispatch(const nljson& req, nljson& resp)
     else if (cmd == "reset") cmdReset(req, resp);
     else if (cmd == "search") cmdSearch(req, resp);
     else if (cmd == "compare") cmdCompare(req, resp);
+    else if (cmd == "rtos") cmdRtos(req, resp);
     else if (cmd == "spaces" || cmd == "regs" || cmd == "rst") {
         nljson r2 = req;
         r2["what"] = cmd;
