@@ -2234,17 +2234,65 @@ def wiggle_disasm(address: str, count: int = 10, cpu: int = 0, elf_file: str = "
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
+def _autosar_tasks_from_map(elf_file: str, cpu: int = 0):
+    """Best-effort AUTOSAR OS task overview from TASKING MAP (kernel TCB symbols
+    are usually not exported). Extracts Os_Task_* entry addresses and
+    OS_STACK_*_TASK_PRIO<n> stacks; marks running task by current PC."""
+    import re
+    map_path = None
+    if elf_file:
+        cand = re.sub(r"\.elf$", ".map", elf_file, flags=re.I)
+        if os.path.isfile(cand):
+            map_path = cand
+    if not map_path:
+        map_path = (_config.get("project") or {}).get("map_file")
+    if not map_path or not os.path.isfile(map_path):
+        return None
+    text = open(map_path, encoding="utf-8", errors="replace").read()
+    entries = {}
+    for m in re.finditer(r"^\|\s*(0x8[0-9a-fA-F]{7})\s*\|\s*(Os_Task_[A-Za-z0-9_]+)", text, re.M):
+        entries.setdefault(m.group(2), int(m.group(1), 16))
+    if not entries:
+        return None
+    stacks = {}
+    for m in re.finditer(r"OS_STACK_\w*?TASK_PRIO(\d+)_VAR_NOINIT[^\n]*?\|\s*(0x7[0-9a-fA-F]{7})", text):
+        stacks.setdefault(int(m.group(1)), int(m.group(2), 16))
+    pc = None
+    st = session_request("state", cpu=cpu)
+    if st and st.get("status") == "ok":
+        pc = st.get("pc")
+    order = sorted(entries.items(), key=lambda kv: kv[1])
+    running = None
+    if pc is not None:
+        for name, addr in order:
+            if addr <= pc:
+                running = name
+    tasks = []
+    for name, addr in order:
+        t = {"name": name, "entry": hex(addr), "state": "running" if name == running else "unknown"}
+        tasks.append(t)
+    return {"type": "autosar", "source": "map", "current_pc": hex(pc) if pc is not None else None,
+            "running_task": running, "tasks": tasks,
+            "note": "entry/stack from MAP; task state needs OS kernel symbols (not exported)"}
+
+
 @tool
 def wiggle_rtos(action: str = "tasks", type: str = "auto", task: str = "",
                 cpu: int = 0, elf_file: str = "") -> str:
-    """RTOS awareness. action='tasks' lists tasks (name/state/priority/stack);
-    'bt' unwinds a task's call stack (default current). type='freertos' parses
-    generic TCB/list structures; 'autosar' needs exported OS kernel symbols or
-    config (project-specific); 'auto' detects. Requires ELF loaded (elf_file).
-    FreeRTOS layout assumes 32-bit, configMAX_TASK_NAME_LEN=16.
+    """RTOS awareness. action='tasks' lists tasks; 'bt' unwinds a task stack.
+    type='freertos' parses generic TCB/list structures (needs FreeRTOS symbols);
+    'autosar' builds a task overview from the TASKING MAP (Os_Task_* entries +
+    OS_STACK_* stacks, running task by PC) since AUTOSAR kernel TCBs are usually
+    not exported; 'auto' picks. Requires ELF/MAP for the project.
     """
     if elf_file:
         session_request("sym", action="load", file=elf_file)
+    if action == "tasks" and type in ("autosar", "auto"):
+        ar = _autosar_tasks_from_map(elf_file, cpu)
+        if ar is not None:
+            return format_result(dict(status="ok", **ar))
+        if type == "autosar":
+            return json.dumps({"status": "error", "message": "no Os_Task_* symbols in MAP"})
     kw = dict(cpu=cpu, action=action, type=type)
     if task:
         kw["task"] = task
