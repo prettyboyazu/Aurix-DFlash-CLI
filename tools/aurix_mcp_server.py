@@ -26,14 +26,18 @@ Configuration (mcp_config.json):
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
+import queue
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Build analysis parsers (imported lazily to avoid hard dependency on pyelftools)
 from build_analysis import (
@@ -153,6 +157,21 @@ def load_config(config_path: Optional[str] = None) -> dict:
             else:
                 cfg[key] = val
 
+    # Resolve configured paths relative to the config file so the config is
+    # portable across machines/CWDs; absolute paths pass through unchanged.
+    if config_path:
+        base = os.path.dirname(os.path.abspath(config_path))
+        for section, keys in [
+            ("project", ("elf_file", "map_file", "lst_file", "mdf_file", "hex_file")),
+            ("build", ("work_dir",)),
+            (None, ("wiggle_exe", "aurix_flasher_exe", "das_home")),
+        ]:
+            holder = cfg[section] if section else cfg
+            for k in keys:
+                v = holder.get(k)
+                if isinstance(v, str) and v and not os.path.isabs(v):
+                    holder[k] = os.path.normpath(os.path.join(base, v))
+
     # Auto-detect executables (env var > auto-search); 配置路径失效时回退随包目录
     exe_name = "wiggle.exe" if sys.platform == "win32" else "wiggle"
     if not cfg["wiggle_exe"] or not os.path.isfile(cfg["wiggle_exe"]):
@@ -167,12 +186,17 @@ def load_config(config_path: Optional[str] = None) -> dict:
                                             exe_name=exe_name)
 
     # DAS 安装路径：配置 > 环境变量 > 常见安装位置（随包部署时可省略）
+    das = cfg.get("das_home")
+    if das and not os.path.isdir(das):
+        print(f"[warn] das_home '{das}' does not exist; falling back to auto-detect", file=sys.stderr)
+        cfg["das_home"] = None
     if not cfg.get("das_home"):
         env_das = os.environ.get("DAS_HOME")
         if env_das and os.path.isdir(env_das):
             cfg["das_home"] = env_das
         else:
-            for cand in (r"C:\Program Files\DAS64", r"C:\Infineon\DAS64"):
+            for cand in (r"C:\Program Files\DAS64", r"C:\Infineon\DAS64",
+                         r"D:\Program Files\DAS64"):
                 if os.path.isdir(cand):
                     cfg["das_home"] = cand
                     break
@@ -201,7 +225,11 @@ import threading
 
 
 class WiggleSession:
-    """Long-lived wiggle serve subprocess; JSON-lines request/response."""
+    """Long-lived wiggle serve subprocess; JSON-lines request/response.
+
+    Responses are read on a daemon thread into a queue so request() can time
+    out instead of blocking forever when the backend wedges on hardware access.
+    """
 
     def __init__(self, exe, env=None):
         self.proc = subprocess.Popen(
@@ -210,20 +238,82 @@ class WiggleSession:
         self.lock = threading.Lock()
         self.next_id = 0
         self.dead = False
+        # Cache the stream: kill() may null self.proc before the reader thread
+        # first evaluates self.proc.stdout (race -> AttributeError, no EOF put).
+        self._stdout = self.proc.stdout
+        self._queue: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
 
-    def request(self, cmd, **kw):
+    def _read_loop(self):
+        for line in self._stdout:
+            self._queue.put(line)
+        self._queue.put(None)  # EOF sentinel
+
+    def request(self, cmd, timeout: float = 120, **kw):
         with self.lock:
             if self.dead:
                 raise RuntimeError("session dead")
             self.next_id += 1
             req = dict(cmd=cmd, id=self.next_id, **kw)
-            self.proc.stdin.write(json.dumps(req) + "\n")
-            self.proc.stdin.flush()
-            line = self.proc.stdout.readline()
-            if not line:
+            try:
+                self.proc.stdin.write(json.dumps(req) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                self.dead = True
+                raise RuntimeError("session write failed")
+            try:
+                line = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                # Wedged backend: a late response would desync request ids,
+                # so the session is unusable from here on.
+                self.dead = True
+                raise RuntimeError(f"session timeout after {timeout}s (cmd={cmd})")
+            if line is None or not line.strip():
                 self.dead = True
                 raise RuntimeError("session EOF")
-            return json.loads(line)
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                # Stray non-JSON output would poison the queue for the next
+                # request; the session must not be reused.
+                self.dead = True
+                raise RuntimeError("session received non-JSON line")
+            if not isinstance(resp, dict):
+                # Valid JSON but not a response object (e.g. a stray scalar) —
+                # treat like non-JSON output: the stream is desynchronized.
+                self.dead = True
+                raise RuntimeError("session received non-object JSON line")
+            # Live-verified serve protocol (2026-11-19, signed wiggle.exe):
+            # responses echo the request id (id=7 -> id=7; no id sent -> id=0)
+            # and always carry status; cli responses add exit_code/message.
+            # The conditional check stays safe for both echoing and id-less
+            # peers, and catches real request/response desync.
+            if "id" in resp and resp["id"] != req["id"]:
+                self.dead = True
+                raise RuntimeError(
+                    f"session response id mismatch: expected {req['id']}, got {resp['id']}")
+            return resp
+
+    def kill(self):
+        """Terminate the serve subprocess (never leave orphans on ping failure).
+
+        Waits are short: _kill_session() runs under _session_lock, and a long
+        wait here would stall every other thread in _get_session().
+        """
+        self.dead = True
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
 
 
 _session = None
@@ -238,23 +328,39 @@ def _get_session():
         exe = _config.get("wiggle_exe")
         if not exe:
             return None
+        s = None
         try:
             s = WiggleSession(exe, _spawn_env(_config))
-            if s.request("ping").get("status") != "ok":
+            if s.request("ping", timeout=30).get("status") != "ok":
+                s.kill()
                 return None
-            _session = s
-            return s
         except Exception:
+            if s is not None:
+                s.kill()
             return None
+        _session = s
+        return s
 
 
-def session_request(cmd, **kw):
+def _kill_session():
+    """Tear down the persistent session (releases its MCD hold on the probe so
+    a CLI fallback or TAS access can use the hardware). Rebuilt on next use."""
+    global _session
+    with _session_lock:
+        if _session is not None:
+            _session.kill()
+            _session = None
+
+
+def session_request(cmd, timeout: Optional[float] = None, **kw):
     """Send to persistent serve session; None if unavailable (caller falls back)."""
     s = _get_session()
     if s is None:
         return None
+    # 'or' chain: a config "timeout": null must not become queue.get(None)
+    # (which blocks forever) — always end up with a real number.
     try:
-        return s.request(cmd, **kw)
+        return s.request(cmd, timeout=timeout or _config.get("timeout") or 120, **kw)
     except Exception:
         return None
 
@@ -265,8 +371,29 @@ def run_wiggle(args: list[str], cfg: dict, timeout: Optional[int] = None) -> dic
     if not exe:
         return {"status": "error", "code": -1, "message": "wiggle.exe not found"}
 
-    sr = session_request("cli", args=args)
+    # The persistent session was spawned with the global config; per-call
+    # server/target/device overrides cannot be honored there. Kill it first —
+    # it holds an MCD connection that would fight the CLI process over the
+    # same probe (debug/TAS access is mutually exclusive) — then run via CLI.
+    # The session rebuilds automatically on the next non-override call.
+    # NOTE: pushing the override flags into the session's "cli" request would
+    # avoid the rebuild, but whether serve honors per-request --server/--target/
+    # --device is unverifiable without hardware; if it accepted and ignored
+    # them we would silently operate the DEFAULT target (worse than a rebuild).
+    override = any(cfg.get(k) and cfg.get(k) != _config.get(k)
+                   for k in ("server", "target", "device"))
+    if override:
+        _kill_session()
+        sr = None
+    else:
+        sr = session_request("cli", args=args, timeout=timeout)
     if sr is not None:
+        # Session 'cli' responses are {"exit_code": N, "id": M, "message": ...}
+        # while the CLI path returns {"status": ...}. Normalize so every
+        # consumer (tools, the error shim, _detect_device) sees one dialect.
+        if isinstance(sr, dict) and "status" not in sr and "exit_code" in sr:
+            sr = dict(sr)
+            sr["status"] = "ok" if sr.get("exit_code") == 0 else "error"
         return sr
 
     cmd = [exe] + args + ["--json"]
@@ -279,7 +406,7 @@ def run_wiggle(args: list[str], cfg: dict, timeout: Optional[int] = None) -> dic
     if cfg.get("device"):
         cmd += ["--device", cfg["device"]]
 
-    tout = timeout or cfg.get("timeout", 120)
+    tout = timeout or cfg.get("timeout") or 120  # null config must not mean "wait forever"
 
     try:
         result = subprocess.run(
@@ -331,7 +458,7 @@ def run_flasher(args: list[str], cfg: dict, timeout: Optional[int] = None) -> di
         return {"status": "error", "code": -1, "message": "AURIXFlasher.exe not found"}
 
     cmd = [exe] + args
-    tout = timeout or cfg.get("timeout", 300)
+    tout = timeout or cfg.get("timeout") or 300  # null config must not mean "wait forever"
 
     try:
         result = subprocess.run(
@@ -397,22 +524,25 @@ def _ensure_map_parser():
     proj = _get_project_cfg()
     toolchain = (proj.get("toolchain") or "").lower()
 
-    # Prefer MAP file (TASKING), fall back to LST (GCC)
     map_file = proj.get("map_file")
     lst_file = proj.get("lst_file")
 
-    if map_file and os.path.exists(map_file):
-        if _map_parser is None:
-            _map_parser = TaskingMapParser()
-            _map_parser.parse(map_file)
-        return "tasking", _map_parser
-    elif lst_file and os.path.exists(lst_file):
-        if _lst_parser is None:
-            _lst_parser = GccLstParser()
-            _lst_parser.parse(lst_file)
-        return "gcc", _lst_parser
+    # Explicit toolchain setting forces its parser; otherwise prefer MAP
+    # (TASKING) and fall back to LST (GCC).
+    if toolchain == "gcc":
+        candidates = [(lst_file, "gcc", "_lst_parser"), (map_file, "tasking", "_map_parser")]
     else:
-        return None, None
+        candidates = [(map_file, "tasking", "_map_parser"), (lst_file, "gcc", "_lst_parser")]
+
+    for path, kind, attr in candidates:
+        if path and os.path.exists(path):
+            parser = globals()[attr]
+            if parser is None:
+                parser = GccLstParser() if kind == "gcc" else TaskingMapParser()
+                parser.parse(path)
+                globals()[attr] = parser
+            return kind, parser
+    return None, None
 
 
 def _ensure_elf_parser():
@@ -455,13 +585,52 @@ def _invalidate_parsers():
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("aurix-mcp-server")
+mcp = MCPServer("aurix-mcp-server")
+
+_tool_register = mcp.tool
+
+
+def _payload_is_error(payload: dict) -> bool:
+    """Failure dialects: CLI path {"status": "error"}; session 'cli' responses
+    {"exit_code": N, ...} with no status field (N != 0 means failure)."""
+    if payload.get("status") == "error":
+        return True
+    try:
+        return int(payload.get("exit_code", 0)) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def tool(fn):
+    """Registration shim around mcp.tool.
+
+    Tools report failures as {"status": "error"} or {"exit_code": N!=0}
+    (dict or JSON text). This shim converts those results into ToolError,
+    which the SDK turns into CallToolResult(is_error=True) — the MCP-spec way
+    for clients to surface tool failures — instead of an indistinguishable
+    plain result. Success results pass through unchanged.
+    """
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if isinstance(result, dict):
+            if _payload_is_error(result):
+                raise ToolError(json.dumps(result, ensure_ascii=False))
+        elif isinstance(result, str) and ('"status"' in result or '"exit_code"' in result):
+            try:
+                payload = json.loads(result)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and _payload_is_error(payload):
+                raise ToolError(result)
+        return result
+    return _tool_register()(wrapped)
 
 # Global config - set during startup
 _config: dict = {}
 
 
-@mcp.tool()
+@tool
 def wiggle_status(server: str = "", target: str = "", device: str = "") -> str:
     """Read Flash status register with SVD-driven field decoding.
     Shows busy flags, error status, and register values.
@@ -473,7 +642,7 @@ def wiggle_status(server: str = "", target: str = "", device: str = "") -> str:
     return format_result(run_wiggle(["status"], cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_info(server: str = "", target: str = "", device: str = "") -> str:
     """Display device info, memory layout, and SVD register summary.
     Returns device name, JTAG ID, memory regions, DFlash layout, UCB info.
@@ -485,7 +654,7 @@ def wiggle_info(server: str = "", target: str = "", device: str = "") -> str:
     return format_result(run_wiggle(["info"], cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_list(server: str = "", target: str = "") -> str:
     """List connected TAS targets.
     Returns available targets with device names and identifiers.
@@ -496,7 +665,7 @@ def wiggle_list(server: str = "", target: str = "") -> str:
     return format_result(run_wiggle(["list"], cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_erase(
     erase_all: bool = True,
     address: str = "",
@@ -527,7 +696,7 @@ def wiggle_erase(
     return format_result(run_wiggle(args, cfg, timeout=1800))
 
 
-@mcp.tool()
+@tool
 def wiggle_write(
     file_path: str,
     verify: bool = True,
@@ -550,7 +719,7 @@ def wiggle_write(
     return format_result(run_wiggle(args, cfg, timeout=3600))
 
 
-@mcp.tool()
+@tool
 def wiggle_dump(
     address: str,
     length: str,
@@ -575,7 +744,7 @@ def wiggle_dump(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_reg(
     name_or_addr: str,
     value: str = "",
@@ -608,7 +777,7 @@ def wiggle_reg(
 
 
 # ---------------------------------------------------------------------------
-# Register Metadata Tools (Python-side, no wiggle.exe needed)
+# Register Metadata Tools (Python-side; pass device= to avoid hardware auto-detect)
 # ---------------------------------------------------------------------------
 
 _reg_cache: dict = {}  # device -> parsed JSON
@@ -633,6 +802,24 @@ def _find_register_defs_dir(cfg: dict) -> Optional[str]:
     return None
 
 
+def _available_devices(cfg: dict) -> list:
+    """Device names available in RegisterDefs (hints when auto-detect fails)."""
+    d = _find_register_defs_dir(cfg)
+    if not d:
+        return []
+    return sorted(p.name.split("-full")[0] for p in Path(d).glob("*-full.json"))
+
+
+def _device_required_error(cfg: dict, tool: str) -> str:
+    """Error payload for reg_* tools when device is neither set nor detectable."""
+    avail = _available_devices(cfg)
+    hint = (f" Pass device= explicitly (available: {', '.join(avail)})." if avail
+            else " No RegisterDefs devices found next to wiggle.exe.")
+    return json.dumps({"status": "error",
+                       "message": f"Device not specified and hardware auto-detect failed ({tool})." + hint,
+                       "available_devices": avail})
+
+
 def _detect_device(cfg: dict) -> Optional[str]:
     """Detect device by calling wiggle info, or from config."""
     dev = cfg.get("device")
@@ -642,7 +829,14 @@ def _detect_device(cfg: dict) -> Optional[str]:
     try:
         result = run_wiggle(["info"], cfg, timeout=15)
         if result.get("status") == "ok":
-            out = result.get("stdout", "")
+            # Prefer a structured device field if wiggle provides one
+            dev = result.get("device")
+            if isinstance(dev, str) and dev.upper().startswith("TC"):
+                return dev.split("_")[0]
+            # serve 'cli' responses carry the command output in 'message'
+            # (live-verified); stdout/output kept as legacy fallbacks
+            out = (result.get("message", "") or result.get("stdout", "")
+                   or result.get("output", "") or "")
             # Parse "Device: TC33x" or similar from output
             for line in out.splitlines():
                 if "device" in line.lower() and ":" in line:
@@ -905,7 +1099,7 @@ def _periph_relevance(keyword: str, periph_name: str, periph_desc: str) -> int:
     return score
 
 
-@mcp.tool()
+@tool
 def reg_peripherals(device: str = "") -> str:
     """List all peripherals of the target MCU with register counts.
     Reads from SVD-derived RegisterDefs (no hardware connection needed).
@@ -917,8 +1111,7 @@ def reg_peripherals(device: str = "") -> str:
 
     dev = _detect_device(cfg)
     if not dev:
-        return json.dumps({"status": "error",
-                           "message": "Device not specified and auto-detect failed. Set 'device' in config or pass device parameter."})
+        return _device_required_error(cfg, "reg_peripherals")
 
     data = _load_register_defs(dev, cfg)
     if not data:
@@ -946,7 +1139,7 @@ def reg_peripherals(device: str = "") -> str:
     })
 
 
-@mcp.tool()
+@tool
 def reg_fields(name: str, device: str = "") -> str:
     """Show complete bit-field definition of a register.
     Returns every field with its bit range, access type, description,
@@ -963,31 +1156,41 @@ def reg_fields(name: str, device: str = "") -> str:
 
     dev = _detect_device(cfg)
     if not dev:
-        return json.dumps({"status": "error",
-                           "message": "Device not specified and auto-detect failed."})
+        return _device_required_error(cfg, "reg_fields")
 
     data = _load_register_defs(dev, cfg)
     if not data:
         return json.dumps({"status": "error",
                            "message": f"No RegisterDefs found for {dev}."})
 
-    # Parse name: "DMU.HF.STATUS" or "CLC"
-    parts = name.split(".")
+    # Parse name: "DMU.HF.STATUS" (periph + fullName), "DMU.STATUS" (periph + short
+    # name), or "CLC" (bare name). Middle segments are part of the register's
+    # fullName (e.g. "HF.STATUS") — never dropped.
+    parts = [p for p in name.split(".") if p]
     if len(parts) >= 2:
         target_periph = parts[0].upper()
-        target_reg = parts[-1].upper()
+        target_reg = ".".join(parts[1:]).upper()
     else:
         target_periph = None
-        target_reg = parts[0].upper()
+        target_reg = parts[0].upper() if parts else ""
 
-    # Search for matching register
+    # Pass 1: exact fullName match ("DMU.HF.STATUS" -> fullName "HF.STATUS")
     matches = []
     for p in data.get("peripherals", []):
         if target_periph and p["name"].upper() != target_periph:
             continue
         for r in p.get("registers", []):
-            if r["name"].upper() == target_reg:
+            if r.get("fullName", "").upper() == target_reg:
                 matches.append(r)
+
+    # Pass 2: short-name fallback ("DMU.STATUS" -> name "STATUS")
+    if not matches:
+        for p in data.get("peripherals", []):
+            if target_periph and p["name"].upper() != target_periph:
+                continue
+            for r in p.get("registers", []):
+                if r["name"].upper() == target_reg:
+                    matches.append(r)
 
     if not matches:
         # Fuzzy fallback: try scoring search when exact match fails
@@ -996,7 +1199,7 @@ def reg_fields(name: str, device: str = "") -> str:
             if target_periph and p["name"].upper() != target_periph:
                 continue
             for r in p.get("registers", []):
-                full = f"{p['name']}.{r['name']}"
+                full = f"{p['name']}.{r.get('fullName', r['name'])}"
                 s = _score_match(target_reg, r["name"], r.get("desc", ""))
                 s2 = _score_match(target_reg, full, r.get("desc", ""))
                 best = max(s, s2)
@@ -1007,7 +1210,7 @@ def reg_fields(name: str, device: str = "") -> str:
             suggestions = []
             for sc, p, r in fuzzy_hits[:10]:
                 suggestions.append({
-                    "name": f"{p['name']}.{r['name']}",
+                    "name": f"{p['name']}.{r.get('fullName', r['name'])}",
                     "desc": r.get("desc", ""),
                     "score": sc,
                 })
@@ -1022,12 +1225,15 @@ def reg_fields(name: str, device: str = "") -> str:
                               "message": f"Register '{name}' not found in {dev} RegisterDefs.",
                               "hint": "Use reg_search to find register names."})
 
-    if len(matches) > 1 and not target_periph:
-        # Ambiguous — return list of matches
+    if len(matches) > 1:
+        # Ambiguous — return list of matches so the caller can disambiguate
+        # with a fullName (e.g. "DMU.HF.STATUS" vs "DMU.SF.STATUS").
         options = [{"peripheral": r["peripheral"], "name": r["name"],
-                     "address": r.get("address", "")} for r in matches]
+                    "fullName": r.get("fullName", r["name"]),
+                    "address": r.get("address", "")} for r in matches]
         return format_result({"status": "ambiguous",
-                              "message": f"Register '{name}' found in {len(matches)} peripherals. Specify as PERIPHERAL.{name}.",
+                              "message": f"Register '{name}' matches {len(matches)} registers. "
+                                         f"Specify as PERIPHERAL.FULLNAME (e.g. {options[0]['peripheral']}.{options[0]['fullName']}).",
                               "matches": options[:20]})
 
     reg = matches[0]
@@ -1060,7 +1266,7 @@ def reg_fields(name: str, device: str = "") -> str:
     })
 
 
-@mcp.tool()
+@tool
 def reg_search(keyword: str, device: str = "", max_results: int = 50) -> str:
     """Fuzzy search registers by keyword with relevance scoring.
     Supports AI-friendly terms: 'uart' finds ASCLIN, 'gpio' finds P00/P10,
@@ -1080,8 +1286,7 @@ def reg_search(keyword: str, device: str = "", max_results: int = 50) -> str:
 
     dev = _detect_device(cfg)
     if not dev:
-        return json.dumps({"status": "error",
-                           "message": "Device not specified and auto-detect failed."})
+        return _device_required_error(cfg, "reg_search")
 
     data = _load_register_defs(dev, cfg)
     if not data:
@@ -1100,11 +1305,12 @@ def reg_search(keyword: str, device: str = "", max_results: int = 50) -> str:
         periph_s = _periph_relevance(keyword, periph_name, periph_desc)
         for r in p.get("registers", []):
             reg_name = r["name"]
-            full_name = f"{periph_name}.{reg_name}"
+            full_name = f"{periph_name}.{r.get('fullName', reg_name)}"
             desc = r.get("desc", "")
 
             # Register-level score (name + desc, no synonym peripheral leak)
-            reg_s = _score_match(keyword, full_name, desc)
+            reg_s = max(_score_match(keyword, full_name, desc),
+                        _score_match(keyword, reg_name, desc))
 
             # Combined score
             if reg_s > 0 and periph_s > 0:
@@ -1146,7 +1352,7 @@ def reg_search(keyword: str, device: str = "", max_results: int = 50) -> str:
     })
 
 
-@mcp.tool()
+@tool
 def wiggle_poke(
     address: str,
     value: str,
@@ -1167,7 +1373,7 @@ def wiggle_poke(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_compare(
     file_path: str,
     address: str,
@@ -1192,7 +1398,7 @@ def wiggle_compare(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_search(
     address: str,
     length: str,
@@ -1214,7 +1420,7 @@ def wiggle_search(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_reset(
     halt: bool = False,
     server: str = "",
@@ -1232,7 +1438,7 @@ def wiggle_reset(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def aurix_pflash(
     hex_file: str,
     verify: bool = True,
@@ -1284,7 +1490,7 @@ def aurix_pflash(
     return format_result(run_flasher(args, _config, timeout=300))
 
 
-@mcp.tool()
+@tool
 def wiggle_rewrite(
     file_path: str = "",
     address: str = "",
@@ -1338,7 +1544,7 @@ def wiggle_rewrite(
     return format_result(run_wiggle(args, cfg, timeout=1800))
 
 
-@mcp.tool()
+@tool
 def wiggle_restore(
     file_path: str,
     no_verify: bool = False,
@@ -1365,7 +1571,7 @@ def wiggle_restore(
     return format_result(run_wiggle(args, cfg, timeout=3600))
 
 
-@mcp.tool()
+@tool
 def wiggle_ucb(
     action: str,
     address: str = "",
@@ -1430,7 +1636,7 @@ def wiggle_ucb(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_read(
     address: str,
     length: str,
@@ -1459,11 +1665,69 @@ def wiggle_read(
 # Build Analysis MCP Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+def _derive_clean_command(command: str) -> Optional[list]:
+    """Derive a standalone clean command (argv list) for make/cmake/ninja builds.
+
+    Runs are executed with shell=False, so clean must be its own command —
+    never composed into the build string with '&&'/'&'. Returns None when the
+    builder is unknown; the caller then demands an explicit clean_command.
+    """
+    if isinstance(command, list):
+        tokens = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] == '"' else t for t in command]
+    else:
+        tokens = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] == '"' else t
+                  for t in shlex.split(command, posix=False)]
+    if not tokens:
+        return None
+    exe_name = Path(tokens[0]).name.lower()
+    if exe_name in ("make", "make.exe", "mingw32-make", "mingw32-make.exe"):
+        # make: keep the executable plus leading flags (-C dir, -f file, -l N,
+        # --long[=value]); everything from the first bare token on is a target.
+        out, i = [tokens[0]], 1
+        value_short = {"c", "f", "l"}  # short flags taking a separate value
+        value_long = {"--directory", "--makefile", "--jobs", "--load", "--max-load"}
+        while i < len(tokens) and tokens[i].startswith("-"):
+            t = tokens[i]
+            out.append(t)
+            i += 1
+            if "=" in t:
+                continue  # attached value, e.g. --jobs=4 / -j8 handled by length
+            base = t.split("=", 1)[0].lower()
+            if len(t) == 2 and t[1].lower() == "j":
+                # -j takes an OPTIONAL value: consume it only when numeric, so
+                # "make -j 8 all" keeps 8 while "make -j all" keeps 'all' a target.
+                if i < len(tokens) and tokens[i].isdigit():
+                    out.append(tokens[i])
+                    i += 1
+                continue
+            takes_value = (base in value_long or
+                           (len(t) == 2 and not t.startswith("--") and t[1].lower() in value_short))
+            if takes_value and i < len(tokens):
+                out.append(tokens[i])
+                i += 1
+        out.append("clean")
+        return out
+    if exe_name in ("ninja", "ninja.exe"):
+        # ninja: keep leading -C <dir> pairs, then invoke the clean tool
+        out, i = [tokens[0]], 1
+        while i + 1 < len(tokens) and tokens[i] == "-C":
+            out += tokens[i:i + 2]
+            i += 2
+        return out + ["-t", "clean"]
+    if exe_name in ("cmake", "cmake.exe") and "--build" in tokens:
+        if "--target" in tokens:
+            return None  # explicit target present; refuse to guess
+        return tokens + ["--target", "clean"]
+    return None
+
+
+@tool
 def build_project(clean: bool = False) -> str:
     """Execute the project build command.
     Returns build success/failure, errors, warnings, and detected output files.
-    Set clean=True to run clean before build.
+    Set clean=True to run clean before build (executed as a separate command;
+    for make/cmake/ninja it is derived automatically, otherwise configure
+    'build.clean_command' in mcp_config.json).
     On success, parser caches are automatically invalidated so subsequent
     symbol/address queries reflect the new build.
     The build command and work_dir are configured in mcp_config.json.
@@ -1474,31 +1738,38 @@ def build_project(clean: bool = False) -> str:
         return json.dumps({"status": "error",
                            "message": "No build command configured. Set 'build.command' in mcp_config.json."})
     work_dir = bcfg.get("work_dir")
-    timeout = bcfg.get("timeout", 300)
-
-    if clean:
-        # For GCC/make: append clean target; for batch/ps1: prepend 'clean'
-        if "clean" not in command:
-            if "make" in command or "cmake" in command or "ninja" in command:
-                command = command + " clean"
-            else:
-                # Windows batch or PowerShell scripts
-                clean_cmd = bcfg.get("clean_command", "")
-                if clean_cmd:
-                    command = clean_cmd + " && " + command if sys.platform != "win32" else clean_cmd + " & " + command
+    timeout = bcfg.get("timeout") or 300  # null config must not mean "wait forever"
 
     runner = BuildRunner()
+
+    if clean and "clean" not in command:
+        clean_command = bcfg.get("clean_command") or _derive_clean_command(command)
+        if not clean_command:
+            return json.dumps({"status": "error",
+                               "message": "clean=True, but no 'build.clean_command' is configured and "
+                                          "none could be derived from the build command. "
+                                          "Set 'build.clean_command' in mcp_config.json."})
+        clean_result = runner.run(clean_command, work_dir, timeout)
+        if not clean_result.get("success"):
+            clean_result["status"] = "error"
+            clean_result["stage"] = "clean"
+            return format_result(clean_result)
+
     result = runner.run(command, work_dir, timeout)
+    if not isinstance(result, dict):
+        result = {"success": False, "error": str(result)}
+    ok = bool(result.get("success"))
+    result["status"] = "ok" if ok else "error"
 
     # Invalidate parser cache after successful build
-    if result.get("status") == "ok":
+    if ok:
         _invalidate_parsers()
         result["parser_cache"] = "invalidated"
 
     return format_result(result)
 
 
-@mcp.tool()
+@tool
 def reload_parsers() -> str:
     """Force reload all build analysis parsers (MAP/LST/ELF/MDF).
     Useful after external builds or when files change outside of build_project.
@@ -1520,7 +1791,7 @@ def reload_parsers() -> str:
     return json.dumps({"status": "ok", "message": "Parsers reloaded.", "loaded": results})
 
 
-@mcp.tool()
+@tool
 def parse_symbols(summary: bool = True, search: str = "",
                   max_results: int = 100) -> str:
     """Parse MAP/LST file for symbol-address mappings and memory layout.
@@ -1549,7 +1820,7 @@ def parse_symbols(summary: bool = True, search: str = "",
     return format_result(result)
 
 
-@mcp.tool()
+@tool
 def parse_elf(functions: bool = False, variables: bool = False,
               sections: bool = True, search: str = "",
               max_results: int = 100) -> str:
@@ -1612,7 +1883,7 @@ def _addr_region_info(addr):
     return {"region": "unknown", "wiggle_addr": hex(addr),
             "addr_note": "未识别区域, 原样返回"}
 
-@mcp.tool()
+@tool
 def lookup_symbol(name: str, source: str = "all") -> str:
     """Look up a symbol by name across MAP/LST/ELF files.
     Returns address, size, section, type, and source location.
@@ -1656,7 +1927,7 @@ def lookup_symbol(name: str, source: str = "all") -> str:
     return format_result({"status": "ok", "results": results})
 
 
-@mcp.tool()
+@tool
 def lookup_address(address: str, source: str = "all") -> str:
     """Find the nearest symbol for a given address.
     Returns symbol name, offset, section, and source file location.
@@ -1714,7 +1985,7 @@ def lookup_address(address: str, source: str = "all") -> str:
 # Debugger tools (persistent MCD session first, per-call CLI fallback)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def wiggle_halt(
     cpu: int = 0,
     elf_file: str = "",
@@ -1743,23 +2014,26 @@ def wiggle_halt(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
-def wiggle_go(cpu: int = 0, server: str = "", target: str = "") -> str:
-    """Resume CPU execution (non-destructive MCD run). With an active watch on
-    a frequently-written variable the core may stop again immediately - that
-    is normal watchpoint behavior. Platforms without resume support return
-    error code 27; use wiggle_reset there.
+@tool
+def wiggle_go(cpu: int = 0, server: str = "", target: str = "", global_run: bool = False) -> str:
+    """Resume CPU execution (non-destructive MCD run). global_run=True resumes
+    all cores (multi-core sync). With an active watch on a frequently-written
+    variable the core may stop again immediately - normal watchpoint behavior.
+    Platforms without resume support return error code 27; use wiggle_reset.
     """
-    r = session_request("go", cpu=cpu)
+    r = session_request("go", **{"cpu": cpu, "global": global_run})
     if r is not None:
         return format_result(r)
     cfg = dict(_config)
     if server: cfg["server"] = server
     if target: cfg["target"] = target
-    return format_result(run_wiggle(["go", "--cpu", str(cpu)], cfg))
+    args = ["go", "--cpu", str(cpu)]
+    if global_run:
+        args.append("--global")
+    return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_state(cpu: int = 0) -> str:
     """Core state (1=running 2=halted 3=debug), stop-trigger id, PC and symbol.
     Uses the persistent session; no reconnect, no side effects.
@@ -1770,7 +2044,7 @@ def wiggle_state(cpu: int = 0) -> str:
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_cpu_reg(
     name: str = "",
     value: str = "",
@@ -1806,7 +2080,7 @@ def wiggle_cpu_reg(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_break(
     action: str = "list",
     address: str = "",
@@ -1845,7 +2119,7 @@ def wiggle_break(
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_watch(
     action: str = "list",
     address: str = "",
@@ -1882,7 +2156,7 @@ def wiggle_watch(
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_step(cpu: int = 0, n: int = 1, elf_file: str = "",
                 server: str = "", target: str = "") -> str:
     """Hardware single-step n instructions (MCD). Requires halted CPU.
@@ -1902,7 +2176,7 @@ def wiggle_step(cpu: int = 0, n: int = 1, elf_file: str = "",
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_bt(cpu: int = 0, elf_file: str = "", server: str = "", target: str = "") -> str:
     """Call-stack backtrace via CSA chain (requires halted CPU), read through
     the persistent MCD session. Frames include symbol name + offset when
@@ -1922,7 +2196,7 @@ def wiggle_bt(cpu: int = 0, elf_file: str = "", server: str = "", target: str = 
     return format_result(run_wiggle(args, cfg))
 
 
-@mcp.tool()
+@tool
 def wiggle_mem_read(address: str, length: str, cpu: int = 0) -> str:
     """Continuous memory read (RAM/PFlash/SFR) via persistent MCD session,
     no reconnect per call. Address/length in hex; length up to 0x100000.
@@ -1934,7 +2208,7 @@ def wiggle_mem_read(address: str, length: str, cpu: int = 0) -> str:
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_mem_write(address: str, data: str, cpu: int = 0) -> str:
     """Write bytes to memory (RAM) via persistent MCD session. data is a hex
     string (even length). Non-destructive to flash; use flash tools for PFlash.
@@ -1945,7 +2219,7 @@ def wiggle_mem_write(address: str, data: str, cpu: int = 0) -> str:
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_disasm(address: str, count: int = 10, cpu: int = 0, elf_file: str = "") -> str:
     """Disassemble TriCore instructions at address (hex). Native C++ decoder;
     instruction length validated against hardware single-step. Returns
@@ -1959,7 +2233,7 @@ def wiggle_disasm(address: str, count: int = 10, cpu: int = 0, elf_file: str = "
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_stepover(cpu: int = 0, elf_file: str = "") -> str:
     """Step over: run to PC+insn_len (returns from a call). Requires halted CPU.
     For taken branches the temp BP may not hit (hit=false) and core is re-halted.
@@ -1972,7 +2246,7 @@ def wiggle_stepover(cpu: int = 0, elf_file: str = "") -> str:
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_stepout(cpu: int = 0, elf_file: str = "") -> str:
     """Step out: run until return address (A11). Requires halted CPU."""
     if elf_file:
@@ -1983,7 +2257,7 @@ def wiggle_stepout(cpu: int = 0, elf_file: str = "") -> str:
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_sample(address: str = "", sym: str = "", size: int = 4,
                   interval_ms: int = 100, cpu: int = 0, elf_file: str = "") -> str:
     """Live double-sampling of a variable/counter (torn-read protection).
@@ -2005,7 +2279,7 @@ def wiggle_sample(address: str = "", sym: str = "", size: int = 4,
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_var(
     action: str = "read",
     name: str = "",
@@ -2031,7 +2305,7 @@ def wiggle_var(
     return json.dumps({"status": "error", "message": "serve session unavailable"})
 
 
-@mcp.tool()
+@tool
 def wiggle_sym(
     action: str = "addr",
     arg: str = "",
@@ -2099,9 +2373,7 @@ def main():
 
     if args.transport == "sse":
         print(f"  listen: {args.host}:{args.port}", file=sys.stderr)
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        mcp.run(transport="sse")
+        mcp.run(transport="sse", host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
 

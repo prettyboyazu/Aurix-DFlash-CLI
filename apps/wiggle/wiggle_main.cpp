@@ -4178,13 +4178,14 @@ static int doHalt(int argc, char** argv)
 
 static int doGo(int argc, char** argv)
 {
-    DebugArgs da;
+    DebugArgs da;bool global=false;
     for (int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
-        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle go [--cpu n]\n");return EXIT_OK;}
+        if(!strcmp(argv[i],"--global")){global=true;i++;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle go [--cpu n] [--global]\n");return EXIT_OK;}
         fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
     g_json=da.common.jsonOutput;
     int rc=debugCheckCpu(da);if(rc)return rc;
-    nljson req;req["cmd"]="go";req["cpu"]=da.cpu;
+    nljson req;req["cmd"]="go";req["cpu"]=da.cpu;req["global"]=global;
     return runDebugReq(req);
 }
 
@@ -4271,6 +4272,18 @@ static int doVar(int argc, char** argv)
     rc=debugLoadElf(da);if(rc)return rc;
     nljson req;req["cmd"]="var";req["action"]=action;req["name"]=name;req["cpu"]=da.cpu;
     if(val)req["value"]=strtoull(val,nullptr,16);
+    return runDebugReq(req);
+}
+
+static int doState(int argc, char** argv)
+{
+    DebugArgs da;
+    for(int i=0;i<argc;){int c=parseDebugOption(argc,argv,i,da);if(c>0){i+=c;continue;}
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){printf("Usage: wiggle state [--cpu n]\n");return EXIT_OK;}
+        fprintf(stderr,"ERROR: Unknown option '%s'\n",argv[i]);return EXIT_USAGE_ERROR;}
+    g_json=da.common.jsonOutput;
+    int rc=debugCheckCpu(da);if(rc)return rc;
+    nljson req;req["cmd"]="state";req["cpu"]=da.cpu;
     return runDebugReq(req);
 }
 
@@ -4435,6 +4448,7 @@ static int doShell(int argc, char** argv)
         else if (cmd == "sym") doSym(subArgc, subArgvPtr);
         else if (cmd == "watch") doWatch(subArgc, subArgvPtr);
         else if (cmd == "var") doVar(subArgc, subArgvPtr);
+        else if (cmd == "state") doState(subArgc, subArgvPtr);
         else if (cmd == "disasm") doDisasm(subArgc, subArgvPtr);
         else if (cmd == "stepover" || cmd == "so") doStepOver(subArgc, subArgvPtr);
         else if (cmd == "stepout" || cmd == "su") doStepOut(subArgc, subArgvPtr);
@@ -4678,6 +4692,7 @@ static int dispatchCli(int argc, char** argv)
     if (first == "break" || first == "bp") return doBreak(argc - 1, argv + 1);
     if (first == "watch") return doWatch(argc - 1, argv + 1);
     if (first == "var") return doVar(argc - 1, argv + 1);
+    if (first == "state") return doState(argc - 1, argv + 1);
     if (first == "disasm") return doDisasm(argc - 1, argv + 1);
     if (first == "stepover" || first == "so") return doStepOver(argc - 1, argv + 1);
     if (first == "stepout" || first == "su") return doStepOut(argc - 1, argv + 1);
