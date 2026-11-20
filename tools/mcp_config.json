@@ -16,7 +16,7 @@
         "lst_file": null,
         "mdf_file": null,
         "hex_file": null,
-        "toolchain": null
+        "toolchain": "tasking"
     },
     "das_home": null,
     "hldumptc": null,
