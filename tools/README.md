@@ -60,6 +60,33 @@ Python 需 ≥3.10（`pip install -r requirements.txt`：mcp[cli]、pyelftools�
 
 > 核心调试/烧录**零配置开箱即用**；hldumptc 无 TASKING 时回退原生子集译码。
 
+### 2.1 路径格式与填写示例
+
+路径为 Windows 绝对路径；**JSON 中反斜杠须转义为 `\\`，也可用正斜杠 `/`**。
+`hldumptc`/`tasking_home` 填**目录或 exe 文件**均可（目录自动找 `ctc/bin/hldumptc.exe`）。
+
+```json
+{
+    "wiggle_exe": "D:\\wiggle_MCP\\wiggle\\wiggle.exe",
+    "aurix_flasher_exe": "D:\\wiggle_MCP\\AURIXFlasher\\AURIXFlasher.exe",
+    "server": "localhost",
+    "das_home": "C:\\Program Files\\DAS64",
+    "hldumptc": "D:\\Program Files\\TASKING\\TriCore v6.3r1\\ctc\\bin\\hldumptc.exe",
+    "tasking_home": "D:\\Program Files\\TASKING\\TriCore v6.3r1",
+    "build": { "command": "amk -j8 all", "work_dir": "D:\\workspace\\Tasking\\P_CCU3", "timeout": 300 },
+    "project": {
+        "elf_file": "D:\\workspace\\Tasking\\P_CCU3\\Debug\\P_CCU3.elf",
+        "map_file": "D:\\workspace\\Tasking\\P_CCU3\\Debug\\P_CCU3.map",
+        "mdf_file": "D:\\workspace\\Tasking\\P_CCU3\\Debug\\P_CCU3.mdf",
+        "hex_file": "D:\\workspace\\Tasking\\P_CCU3\\Debug\\P_CCU3.hex",
+        "toolchain": "tasking"
+    }
+}
+```
+
+正斜杠等价写法：`"tasking_home": "D:/Program Files/TASKING/TriCore v6.3r1"`。
+相对路径以 **config 文件所在目录**为基准解析（如 `"wiggle_exe": "wiggle/wiggle.exe"`）。
+
 ---
 
 ## 3. CLI 指令（wiggle\wiggle.exe，具体示例）
