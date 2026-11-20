@@ -267,3 +267,7 @@ Csource/
 
 # Release zip
 TDFlash.zip
+
+# 清理:构建产物/部署副本不入库
+build/
+AURIXFlasher/
