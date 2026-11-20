@@ -202,21 +202,31 @@ def load_config(config_path: Optional[str] = None) -> dict:
                     cfg["das_home"] = cand
                     break
 
-    # hldumptc（完整反汇编，依赖环境不随包）：配置 > env > 常见 TASKING 路径；无则原生回退
-    hl = cfg.get("hldumptc")
-    if hl and not os.path.isfile(hl):
-        cfg["hldumptc"] = None
-    if not cfg.get("hldumptc"):
-        env_hl = os.environ.get("WIGGLE_HLDUMPTC")
-        if env_hl and os.path.isfile(env_hl):
-            cfg["hldumptc"] = env_hl
-        else:
-            for cand in (r"D:\Program Files\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe",
-                         r"C:\Program Files\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe",
-                         r"C:\Program Files (x86)\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe"):
-                if os.path.isfile(cand):
-                    cfg["hldumptc"] = cand
-                    break
+    # hldumptc（完整反汇编，依赖环境不随包）：配置( exe 路径或目录 ) > env > 常见 TASKING 路径；无则原生回退
+    def _resolve_hl(base):
+        if not base:
+            return None
+        if os.path.isfile(base):
+            return base
+        if os.path.isdir(base):
+            for sub in ("hldumptc.exe", os.path.join("ctc", "bin", "hldumptc.exe"),
+                        os.path.join("bin", "hldumptc.exe")):
+                p = os.path.join(base, sub)
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    hl = _resolve_hl(cfg.get("hldumptc")) or _resolve_hl(cfg.get("tasking_home"))
+    if not hl:
+        hl = _resolve_hl(os.environ.get("WIGGLE_HLDUMPTC"))
+    if not hl:
+        for cand in (r"D:\Program Files\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe",
+                     r"C:\Program Files\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe",
+                     r"C:\Program Files (x86)\TASKING\TriCore v6.3r1\ctc\bin\hldumptc.exe"):
+            if os.path.isfile(cand):
+                hl = cand
+                break
+    cfg["hldumptc"] = hl
 
     return cfg
 

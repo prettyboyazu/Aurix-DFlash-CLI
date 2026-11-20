@@ -618,15 +618,24 @@ void DebugSession::cmdInfo(const nljson& req, nljson& resp)
 std::string DebugSession::findHldumptc()
 {
     if (!hldumptc_.empty()) return hldumptc_;
-    auto exists = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) { fclose(f); return true; } return false; };
+    auto isfile = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) { fclose(f); return true; } return false; };
+    // 支持手动指定: 完整 exe 路径 或 目录(自动找 hldumptc.exe / ctc/bin / bin)
+    auto resolve = [&](const std::string& base) -> std::string {
+        if (base.empty()) return "";
+        if (isfile(base)) return base;
+        const char* sub[] = { "hldumptc.exe", "ctc/bin/hldumptc.exe", "bin/hldumptc.exe",
+                              "ctc\\bin\\hldumptc.exe", "bin\\hldumptc.exe" };
+        for (auto s : sub) { std::string p = base + "/" + s; if (isfile(p)) return p; }
+        return "";
+    };
     const char* env = getenv("WIGGLE_HLDUMPTC");
-    if (env && exists(env)) return hldumptc_ = env;
+    if (env) { std::string r = resolve(env); if (!r.empty()) return hldumptc_ = r; }
     const char* cand[] = {
         "D:/Program Files/TASKING/TriCore v6.3r1/ctc/bin/hldumptc.exe",
         "C:/Program Files/TASKING/TriCore v6.3r1/ctc/bin/hldumptc.exe",
         "C:/Program Files (x86)/TASKING/TriCore v6.3r1/ctc/bin/hldumptc.exe",
     };
-    for (auto c : cand) if (exists(c)) return hldumptc_ = c;
+    for (auto c : cand) if (isfile(c)) return hldumptc_ = c;
     return "";
 }
 

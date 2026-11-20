@@ -55,7 +55,8 @@ Python 需 3.10+（mcp SDK）。`pip install -r requirements.txt`。
 - 同一 miniWiggler 只能被一个 TAS server 占用；切换部署前先停旧 server。
 - trace 需带 MCDS 的探针（miniWiggler 不支持）；RTOS 感知为项目特定，未含。
 - **反汇编 hldumptc 依赖环境、不随包**（TASKING 许可，避免再分发风险）：
-  自动探测 `WIGGLE_HLDUMPTC`/常见 TASKING 路径，或配置 `hldumptc`；
+  可手动指定 `hldumptc`/`tasking_home`（**exe 路径或目录**，目录自动找
+  `hldumptc.exe`/`ctc/bin`/`bin`），或 `WIGGLE_HLDUMPTC` env（ likewise 支持目录）；
   无 TASKING 时回退原生子集译码（长度正确、助记符子集）。
 
 ## Windows 11：wiggle.exe 必须签名（Smart App Control）
